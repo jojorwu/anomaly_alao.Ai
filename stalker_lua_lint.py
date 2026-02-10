@@ -78,12 +78,16 @@ from models import Finding
 
 def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: int = 4, experimental: bool = False):
     """Analyze a file with a timeout to prevent hanging on problematic files."""
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(analyze_file, file_path, cache_threshold=cache_threshold, experimental=experimental)
-        try:
-            return future.result(timeout=timeout)
-        except FuturesTimeoutError:
-            raise TimeoutError(f"Analysis timed out for {file_path.name}")
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(analyze_file, file_path, cache_threshold=cache_threshold, experimental=experimental)
+    try:
+        result = future.result(timeout=timeout)
+        executor.shutdown(wait=False)
+        return result
+    except FuturesTimeoutError:
+        future.cancel()
+        executor.shutdown(wait=False)
+        raise TimeoutError(f"Analysis timed out for {file_path.name}")
 
 
 def analyze_file_worker(args_tuple):
@@ -521,7 +525,6 @@ def main():
 
     # handle extract-debug operation
     if args.extract_debug:
-        import zipfile
         
         # group files by mod
         files_by_mod = {}

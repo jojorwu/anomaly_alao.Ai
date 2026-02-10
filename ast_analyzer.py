@@ -25,8 +25,9 @@ from pathlib import Path
 from collections import defaultdict
 import sys
 import io
+import re
 
-from models import Finding
+from models import Finding, detect_file_encoding
 
 
 # Hot callbacks that run frequently
@@ -352,100 +353,27 @@ class ASTAnalyzer:
 
     def reset(self):
         """Reset analyzer state for reuse."""
-        # clear existing collections if they exist, otherwise create new
-        if isinstance(getattr(self, 'findings', None), list):
-            self.findings.clear()
-        else:
-            self.findings: List[Finding] = []
-            
-        if isinstance(getattr(self, 'scopes', None), list):
-            self.scopes.clear()
-        else:
-            self.scopes: List[Scope] = []
-            
+        self.findings: List[Finding] = []
+        self.scopes: List[Scope] = []
         self.current_scope: Optional[Scope] = None
         self.global_scope: Optional[Scope] = None
-
-        if isinstance(getattr(self, 'calls', None), list):
-            self.calls.clear()
-        else:
-            self.calls: List[CallInfo] = []
-            
-        if isinstance(getattr(self, 'assigns', None), list):
-            self.assigns.clear()
-        else:
-            self.assigns: List[AssignInfo] = []
-            
-        if isinstance(getattr(self, 'concats', None), list):
-            self.concats.clear()
-        else:
-            self.concats: List[ConcatInfo] = []
-            
-        if isinstance(getattr(self, 'global_writes', None), list):
-            self.global_writes.clear()
-        else:
-            self.global_writes: List[Tuple[str, int]] = []
+        self.calls: List[CallInfo] = []
+        self.assigns: List[AssignInfo] = []
+        self.concats: List[ConcatInfo] = []
+        self.global_writes: List[Tuple[str, int]] = []
         
-        # nil access tracking
-        if isinstance(getattr(self, 'nil_sources', None), dict):
-            self.nil_sources.clear()
-        else:
-            self.nil_sources: Dict[Tuple[int, str], NilSourceInfo] = {}
-            
-        if isinstance(getattr(self, 'nil_accesses', None), list):
-            self.nil_accesses.clear()
-        else:
-            self.nil_accesses: List[NilAccessInfo] = []
-            
-        if isinstance(getattr(self, 'nil_guards', None), set):
-            self.nil_guards.clear()
-        else:
-            self.nil_guards: Set[Tuple[str, int]] = set()
+        self.nil_sources: Dict[Tuple[int, str], NilSourceInfo] = {}
+        self.nil_accesses: List[NilAccessInfo] = []
+        self.nil_guards: Set[Tuple[str, int]] = set()
         
-        # dead code tracking
-        if isinstance(getattr(self, 'dead_code', None), list):
-            self.dead_code.clear()
-        else:
-            self.dead_code: List[DeadCodeInfo] = []
-            
-        if isinstance(getattr(self, 'local_vars', None), dict):
-            self.local_vars.clear()
-        else:
-            self.local_vars: Dict[Tuple[int, str], LocalVarInfo] = {}
-            
-        if isinstance(getattr(self, 'local_funcs', None), dict):
-            self.local_funcs.clear()
-        else:
-            self.local_funcs: Dict[Tuple[int, str], LocalVarInfo] = {}
-            
-        if isinstance(getattr(self, 'callback_registrations', None), set):
-            self.callback_registrations.clear()
-        else:
-            self.callback_registrations: Set[str] = set()
-        
-        # per-frame callback tracking
-        if isinstance(getattr(self, 'per_frame_callbacks', None), list):
-            self.per_frame_callbacks.clear()
-        else:
-            self.per_frame_callbacks: List[PerFrameCallbackInfo] = []
-        
-        # distance_to comparison tracking
-        if isinstance(getattr(self, 'distance_comparisons', None), list):
-            self.distance_comparisons.clear()
-        else:
-            self.distance_comparisons: List[DistanceComparisonInfo] = []
-        
-        # vector allocation tracking
-        if isinstance(getattr(self, 'vector_allocations', None), list):
-            self.vector_allocations.clear()
-        else:
-            self.vector_allocations: List[VectorAllocationInfo] = []
-        
-        # track Name node IDs that are assignment targets (not reads)
-        if isinstance(getattr(self, 'assignment_target_ids', None), set):
-            self.assignment_target_ids.clear()
-        else:
-            self.assignment_target_ids: Set[int] = set()
+        self.dead_code: List[DeadCodeInfo] = []
+        self.local_vars: Dict[Tuple[int, str], LocalVarInfo] = {}
+        self.local_funcs: Dict[Tuple[int, str], LocalVarInfo] = {}
+        self.callback_registrations: Set[str] = set()
+        self.per_frame_callbacks: List[PerFrameCallbackInfo] = []
+        self.distance_comparisons: List[DistanceComparisonInfo] = []
+        self.vector_allocations: List[VectorAllocationInfo] = []
+        self.assignment_target_ids: Set[int] = set()
 
         self.source_lines: List[str] = []
         self.source: str = ""
@@ -454,7 +382,6 @@ class ASTAnalyzer:
         self.loop_depth: int = 0
         self.function_depth: int = 0
         
-        # if-chain tracking for experimental branch-aware counting
         self.current_if_chain: Optional[Node] = None
         self.current_branch_index: int = -1
 
@@ -465,10 +392,9 @@ class ASTAnalyzer:
         self._ast_tree = None
 
         try:
-            # use latin-1 encoding which maps bytes 0-255 directly to unicode 0-255
-            # this preserves non-UTF-8 characters (like Windows-1252 bullet points)
-            # and allows the Lua parser to work correctly
-            self.source = file_path.read_text(encoding='latin-1')
+            encoding = detect_file_encoding(file_path)
+            self.source = file_path.read_text(encoding=encoding)
+            self._file_encoding = encoding
         except Exception:
             return []
 
@@ -1320,36 +1246,86 @@ class ASTAnalyzer:
             scope = scope.parent
         return None
 
+    @staticmethod
+    def _strip_line_comments_and_strings(text: str) -> str:
+        """Strip comment and string content from a line so regex only matches real code."""
+        result = []
+        i = 0
+        while i < len(text):
+            c = text[i]
+            # line comment
+            if c == '-' and i + 1 < len(text) and text[i + 1] == '-':
+                break
+            # string literal
+            elif c in ('"', "'"):
+                quote = c
+                result.append(c)
+                i += 1
+                while i < len(text):
+                    sc = text[i]
+                    if sc == '\\':
+                        result.append(' ')
+                        i += 1
+                        if i < len(text):
+                            result.append(' ')
+                            i += 1
+                        continue
+                    if sc == quote:
+                        result.append(sc)
+                        i += 1
+                        break
+                    result.append(' ')
+                    i += 1
+                continue
+            # long string [[...]]
+            elif c == '[' and i + 1 < len(text) and text[i + 1] in ('[', '='):
+                eq_count = 0
+                j = i + 1
+                while j < len(text) and text[j] == '=':
+                    eq_count += 1
+                    j += 1
+                if j < len(text) and text[j] == '[':
+                    close = ']' + '=' * eq_count + ']'
+                    end = text.find(close, j + 1)
+                    if end != -1:
+                        result.append(' ' * (end + len(close) - i))
+                        i = end + len(close)
+                        continue
+                result.append(c)
+                i += 1
+                continue
+            else:
+                result.append(c)
+                i += 1
+        return ''.join(result)
+
     def _has_nil_guard(self, var_name: str, assign_line: int, access_line: int) -> bool:
         """Check if there's a nil guard between assignment and access."""
-        import re
-        
         if assign_line >= access_line:
             return False
         
-        # escape var name for regex
         var_escaped = re.escape(var_name)
         
-        # patterns that indicate nil checking
         guard_patterns = [
-            rf'\bif\s+{var_escaped}\s+then\b',           # if var then
-            rf'\bif\s+{var_escaped}\s+and\b',            # if var and ...
-            rf'\bif\s+not\s+{var_escaped}\s+then\b',     # if not var then
-            rf'\bif\s+{var_escaped}\s*~=\s*nil\b',       # if var ~= nil
-            rf'\bif\s+{var_escaped}\s*==\s*nil\s+then\s+return\b',  # if var == nil then return
-            rf'\b{var_escaped}\s+and\s+{var_escaped}[:\.]',  # var and var: or var and var.
-            rf'\bif\s*\(\s*{var_escaped}\s*\)\s*then\b',  # if (var) then
+            rf'\bif\s+{var_escaped}\s+then\b',
+            rf'\bif\s+{var_escaped}\s+and\b',
+            rf'\bif\s+not\s+{var_escaped}\s+then\b',
+            rf'\bif\s+{var_escaped}\s*~=\s*nil\b',
+            rf'\bif\s+{var_escaped}\s*==\s*nil\s+then\s+return\b',
+            rf'\b{var_escaped}\s+and\s+{var_escaped}[:\.]',
+            rf'\bif\s*\(\s*{var_escaped}\s*\)\s*then\b',
         ]
         
         combined_pattern = re.compile('|'.join(guard_patterns), re.IGNORECASE)
         
-        # check lines between assignment and access for nil guard patterns
         for line_num in range(assign_line, access_line):
             if line_num <= 0 or line_num > len(self.source_lines):
                 continue
             line_text = self.source_lines[line_num - 1]
             
-            if combined_pattern.search(line_text):
+            # only match against actual code, not comments or string contents
+            cleaned = self._strip_line_comments_and_strings(line_text)
+            if combined_pattern.search(cleaned):
                 return True
         
         return False
@@ -1734,7 +1710,7 @@ class ASTAnalyzer:
                             pattern_name='math_pow_simple',
                             severity='GREEN',
                             line_num=call.line,
-                            message=f'{full_match} -> math.sqrt({base})',
+                            message=f'{full_match} -> {base}^0.5',
                             details={
                                 'base': base,
                                 'exponent': exp,
@@ -1777,10 +1753,6 @@ class ASTAnalyzer:
         Standard count: 3 uses
         Branch-aware count: max(1, 2) = 2 uses (only one branch executes)
         """
-        # if not self.experimental:
-        #     # standard counting: total calls
-        #     return len(calls)
-        
         # group calls by if-chain (use id(node) as key since nodes aren't hashable)
         if_chains: Dict[Optional[int], Dict[int, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
         calls_outside_if = []

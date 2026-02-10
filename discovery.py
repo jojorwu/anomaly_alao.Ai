@@ -67,11 +67,6 @@ def find_scripts(scripts_dir: Path) -> List[Path]:
     """Find all Lua script files in a directory."""
     scripts = set()
 
-    # .lua and .script are both used - glob root level first
-    for ext in ("*.lua", "*.script"):
-        scripts.update(scripts_dir.glob(ext))
-
-    # also check subdirectories (some mods organize scripts in folders)
     for ext in ("**/*.lua", "**/*.script"):
         scripts.update(scripts_dir.glob(ext))
 

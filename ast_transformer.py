@@ -130,7 +130,7 @@ class ASTTransformer:
                 if not backup_path.exists():
                     shutil.copy2(file_path, backup_path)
 
-            file_path.write_text(new_content, encoding='latin-1')
+            file_path.write_text(new_content, encoding=getattr(self.analyzer, '_file_encoding', 'latin-1'))
 
         return True, new_content, edit_count
 
@@ -368,7 +368,7 @@ class ASTTransformer:
     def _edit_distance_to_comparison(self, finding: Finding):
         """
         Convert distance_to() comparison to distance_to_sqr().
-        Comapred values should be replaced with square.
+        Compared values should be replaced with square.
         
         Example:
             pos:distance_to(target) < 10
@@ -413,13 +413,153 @@ class ASTTransformer:
                 priority=0,
             ))
 
+    @staticmethod
+    def _strip_strings_and_comments(text: str) -> str:
+        """Strip string contents and comments from a line of Lua code.
+        
+        Replaces string bodies with spaces and removes comments,
+        so keyword checks don't match inside string literals.
+        """
+        result = []
+        i = 0
+        while i < len(text):
+            c = text[i]
+            # line comment
+            if c == '-' and i + 1 < len(text) and text[i + 1] == '-':
+                # check for long comment --[[
+                if i + 2 < len(text) and text[i + 2] == '[':
+                    eq_count = 0
+                    j = i + 3
+                    while j < len(text) and text[j] == '=':
+                        eq_count += 1
+                        j += 1
+                    if j < len(text) and text[j] == '[':
+                        # long comment, skip to closing ]=*]
+                        close = ']' + '=' * eq_count + ']'
+                        end = text.find(close, j + 1)
+                        if end != -1:
+                            result.append(' ' * (end + len(close) - i))
+                            i = end + len(close)
+                            continue
+                # regular line comment, rest of line is gone
+                break
+            # string literal
+            elif c in ('"', "'"):
+                quote = c
+                result.append(c)
+                i += 1
+                while i < len(text):
+                    sc = text[i]
+                    if sc == '\\':
+                        result.append(' ')
+                        i += 1
+                        if i < len(text):
+                            result.append(' ')
+                            i += 1
+                        continue
+                    if sc == quote:
+                        result.append(sc)
+                        i += 1
+                        break
+                    result.append(' ')
+                    i += 1
+                continue
+            # long string [[...]]
+            elif c == '[':
+                eq_count = 0
+                j = i + 1
+                while j < len(text) and text[j] == '=':
+                    eq_count += 1
+                    j += 1
+                if j < len(text) and text[j] == '[':
+                    close = ']' + '=' * eq_count + ']'
+                    end = text.find(close, j + 1)
+                    if end != -1:
+                        result.append(' ' * (end + len(close) - i))
+                        i = end + len(close)
+                        continue
+                result.append(c)
+                i += 1
+                continue
+            else:
+                result.append(c)
+                i += 1
+        return ''.join(result)
+
+    def _has_control_flow_keyword(self, text: str) -> bool:
+        """Check if a line of code contains control flow keywords outside of strings/comments."""
+        control_flow_keywords = ['if ', 'then ', 'else', 'elseif ', 'end', 'for ', 'while ',
+                                 'do ', 'repeat', 'until ', 'function ', 'return ']
+        cleaned = self._strip_strings_and_comments(text).lower()
+        for kw in control_flow_keywords:
+            if kw in cleaned:
+                return True
+        return False
+
+    def _is_inside_multiline_comment(self, pos: int) -> bool:
+        """Check if a position in source is inside a multi-line comment.
+        
+        Handles --[[...]], --[=[...]=], --[==[...]==], etc.
+        Scans forward through all long comments to see if pos falls within any.
+        """
+        text = self.source
+        i = 0
+        while i < pos:
+            c = text[i]
+            # skip string literals so we don't match --[[ inside strings
+            if c in ('"', "'"):
+                quote = c
+                i += 1
+                while i < len(text) and text[i] != quote:
+                    if text[i] == '\\':
+                        i += 1
+                    i += 1
+                i += 1
+                continue
+            # check for long string [[ or [=[ (not a comment, but skip it)
+            if c == '[':
+                eq = 0
+                j = i + 1
+                while j < len(text) and text[j] == '=':
+                    eq += 1
+                    j += 1
+                if j < len(text) and text[j] == '[':
+                    close = ']' + '=' * eq + ']'
+                    end = text.find(close, j + 1)
+                    if end != -1:
+                        i = end + len(close)
+                        continue
+            # check for long comment --[[ or --[=[ etc
+            if c == '-' and i + 1 < len(text) and text[i + 1] == '-':
+                if i + 2 < len(text) and text[i + 2] == '[':
+                    eq = 0
+                    j = i + 3
+                    while j < len(text) and text[j] == '=':
+                        eq += 1
+                        j += 1
+                    if j < len(text) and text[j] == '[':
+                        close = ']' + '=' * eq + ']'
+                        end = text.find(close, j + 1)
+                        if end == -1:
+                            # unclosed long comment, everything after is "inside"
+                            return True
+                        comment_end = end + len(close)
+                        if pos < comment_end:
+                            return True
+                        i = comment_end
+                        continue
+                # regular line comment, skip to EOL
+                eol = text.find('\n', i)
+                if eol == -1:
+                    break
+                i = eol + 1
+                continue
+            i += 1
+        return False
+
     def _edit_debug_statement(self, finding: Finding):
         """Comment out debug statement (handles multi-line calls)."""
         node = finding.details.get('node')
-
-        # control flow keywords that shouldn't be commented out
-        control_flow_keywords = ['if ', 'then ', 'else', 'elseif ', 'end', 'for ', 'while ',
-                                 'do ', 'repeat', 'until ', 'function ', 'return ']
 
         if node:
             # use AST node to get full span of call
@@ -456,11 +596,9 @@ class ASTTransformer:
                     if stripped.startswith('--'):
                         continue
 
-                    # check for control flow on ANY line of the multi-line statement
-                    for kw in control_flow_keywords:
-                        if kw in stripped.lower():
-                            has_control_flow = True
-                            break
+                    # check for control flow outside strings/comments
+                    if self._has_control_flow_keyword(stripped):
+                        has_control_flow = True
 
                     lines_to_comment.append((line_num, line_start, line_end, line, stripped))
 
@@ -503,10 +641,9 @@ class ASTTransformer:
         if stripped.startswith('--'):
             return
 
-        # skip lines with control flow
-        for kw in control_flow_keywords:
-            if kw in stripped.lower():
-                return
+        # skip lines with control flow outside strings/comments
+        if self._has_control_flow_keyword(stripped):
+            return
 
         indent = line[:len(line) - len(stripped)]
         new_line = f'{indent}-- {stripped}'
@@ -934,7 +1071,7 @@ class ASTTransformer:
         # get indentation from the actual function body (line after params)
         indent = self._get_indent_at_line(func_body_start_line + 1)
         if not indent:
-            indent = '\t'
+            indent = self._detect_indent_unit()
 
         # build cache block
         cache_block = '\n' + '\n'.join(f'{indent}{line}' for line in cache_lines)
@@ -991,42 +1128,52 @@ class ASTTransformer:
             cache_line = 'local actor = db.actor'
             new_name = 'actor'
             call_pattern = 'db.actor'
+            call_pattern_re = re.compile(r'\bdb\.actor\b')
         elif pattern == 'repeated_time_global':
             cache_line = 'local tg = time_global()'
             new_name = 'tg'
             call_pattern = 'time_global()'
+            call_pattern_re = re.compile(r'\btime_global\s*\(')
         elif pattern == 'repeated_alife':
             cache_line = 'local sim = alife()'
             new_name = 'sim'
             call_pattern = 'alife()'
+            call_pattern_re = re.compile(r'\balife\s*\(')
         elif pattern == 'repeated_system_ini':
             cache_line = 'local ini = system_ini()'
             new_name = 'ini'
             call_pattern = 'system_ini()'
+            call_pattern_re = re.compile(r'\bsystem_ini\s*\(')
         elif pattern == 'repeated_device':
             cache_line = 'local dev = device()'
             new_name = 'dev'
             call_pattern = 'device()'
+            call_pattern_re = re.compile(r'\bdevice\s*\(')
         elif pattern == 'repeated_get_console':
             cache_line = 'local console = get_console()'
             new_name = 'console'
             call_pattern = 'get_console()'
+            call_pattern_re = re.compile(r'\bget_console\s*\(')
         elif pattern == 'repeated_get_hud':
             cache_line = 'local hud = get_hud()'
             new_name = 'hud'
             call_pattern = 'get_hud()'
+            call_pattern_re = re.compile(r'\bget_hud\s*\(')
         elif pattern == 'repeated_game_ini':
             cache_line = 'local g_ini = game_ini()'
             new_name = 'g_ini'
             call_pattern = 'game_ini()'
+            call_pattern_re = re.compile(r'\bgame_ini\s*\(')
         elif pattern == 'repeated_getFS':
             cache_line = 'local fs = getFS()'
             new_name = 'fs'
             call_pattern = 'getFS()'
+            call_pattern_re = re.compile(r'\bgetFS\s*\(')
         elif pattern == 'repeated_level_name':
             cache_line = 'local level_name = level.name()'
             new_name = 'level_name'
             call_pattern = 'level.name()'
+            call_pattern_re = re.compile(r'\blevel\.name\s*\(')
         elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
             # dynamic method caching: repeated_obj_section(), repeated_item_id(), etc
             # extract object name and method from pattern: repeated_obj_section() -> obj, section
@@ -1070,6 +1217,7 @@ class ASTTransformer:
             
             cache_line = f'local {new_name} = {real_obj_name}:{method_name}()'
             call_pattern = f'{real_obj_name}:{method_name}()'
+            call_pattern_re = re.compile(re.escape(real_obj_name) + r'\s*:\s*' + re.escape(method_name) + r'\s*\(')
         else:
             return
 
@@ -1085,7 +1233,7 @@ class ASTTransformer:
 
         if first_line_start is not None:
             first_line = self.source[first_line_start:first_line_end]
-            if re.search(cache_decl_pattern, first_line) and call_pattern in first_line:
+            if re.search(cache_decl_pattern, first_line) and call_pattern_re.search(first_line):
                 is_already_cached = True
                 cache_indent = self._get_indent_at_line(first_call.line)
 
@@ -1097,13 +1245,8 @@ class ASTTransformer:
 
             indent = self._get_indent_at_line(first_call.line)
             
-            # Bug #33 fix: check if insertion point is inside a multi-line comment
-            # scan from start of file to insertion point for --[[ and ]]
-            text_before = self.source[:insert_pos]
-            mlc_open = text_before.rfind('--[[')
-            mlc_close = text_before.rfind(']]')
-            if mlc_open != -1 and (mlc_close == -1 or mlc_close < mlc_open):
-                # we're inside a multi-line comment, skip this optimization
+            # check if insertion point is inside a multi-line comment
+            if self._is_inside_multiline_comment(insert_pos):
                 return
             
             # Check if first call is inside a multi-line if/elseif/while condition
@@ -1168,7 +1311,7 @@ class ASTTransformer:
                         # skip comments
                         if '--' in line_text:
                             line_text = line_text[:line_text.find('--')]
-                        # skip strings (simple approach - just count outside quotes)
+                        # skip strings
                         in_string = False
                         clean_line = ""
                         i = 0
@@ -1176,8 +1319,15 @@ class ASTTransformer:
                             c = line_text[i]
                             if c in ('"', "'") and not in_string:
                                 in_string = c
-                            elif c == in_string and (i == 0 or line_text[i-1] != '\\'):
-                                in_string = False
+                            elif c == in_string:
+                                # count preceding backslashes
+                                num_bs = 0
+                                j = i - 1
+                                while j >= 0 and line_text[j] == '\\':
+                                    num_bs += 1
+                                    j -= 1
+                                if num_bs % 2 == 0:
+                                    in_string = False
                             elif not in_string:
                                 clean_line += c
                             i += 1
@@ -1272,12 +1422,8 @@ class ASTTransformer:
                     if new_insert_pos is None:
                         return
                     
-                    # Bug #33 fix: check if new insertion point is inside a multi-line comment
-                    text_before_new = self.source[:new_insert_pos]
-                    mlc_open_new = text_before_new.rfind('--[[')
-                    mlc_close_new = text_before_new.rfind(']]')
-                    if mlc_open_new != -1 and (mlc_close_new == -1 or mlc_close_new < mlc_open_new):
-                        # new position is inside a multi-line comment, skip this optimization
+                    # check if new insertion point is inside a multi-line comment
+                    if self._is_inside_multiline_comment(new_insert_pos):
                         return
                     
                     insert_pos = new_insert_pos
@@ -1287,12 +1433,12 @@ class ASTTransformer:
                     if call_indent and len(call_indent) > 0:
                         # detect indent char (tab or spaces)
                         if call_indent[0] == '\t':
-                            indent = '\t'  # one tab for function body
+                            indent = self._detect_indent_unit()
                         else:
                             # count spaces per indent level (usually 4 or 2)
                             indent = call_indent[:len(call_indent)//2] if len(call_indent) >= 2 else call_indent
                     else:
-                        indent = '\t'
+                        indent = self._detect_indent_unit()
 
             self.edits.append(SourceEdit(
                 start_char=insert_pos,
@@ -1307,7 +1453,7 @@ class ASTTransformer:
             if line_start is not None:
                 line = self.source[line_start:line_end]
                 # only skip if this is THE cache declaration (local obj = pattern)
-                if re.search(cache_decl_pattern, line) and call_pattern in line:
+                if re.search(cache_decl_pattern, line) and call_pattern_re.search(line):
                     continue
 
             # if cache already existed (we didn't insert it), check if we're in same scope
@@ -1579,39 +1725,94 @@ class ASTTransformer:
         stripped = line.lstrip()
         return line[:len(line) - len(stripped)]
 
+    def _detect_indent_unit(self) -> str:
+        """Detect the file's indent style (tab or N spaces). Cached per transform."""
+        if hasattr(self, '_cached_indent_unit'):
+            return self._cached_indent_unit
+        
+        tab_lines = 0
+        space_widths = []
+        
+        for line in self.source.split('\n')[:200]:
+            if not line or not line[0] in (' ', '\t'):
+                continue
+            stripped = line.lstrip()
+            if not stripped:
+                continue
+            indent = line[:len(line) - len(stripped)]
+            if '\t' in indent:
+                tab_lines += 1
+            else:
+                w = len(indent)
+                if w > 0:
+                    space_widths.append(w)
+        
+        if tab_lines > len(space_widths):
+            self._cached_indent_unit = '\t'
+        elif space_widths:
+            # find most common indent width (likely the base unit)
+            from collections import Counter
+            diffs = []
+            sorted_widths = sorted(set(space_widths))
+            for i in range(1, len(sorted_widths)):
+                d = sorted_widths[i] - sorted_widths[i - 1]
+                if d > 0:
+                    diffs.append(d)
+            if diffs:
+                unit = Counter(diffs).most_common(1)[0][0]
+            else:
+                unit = sorted_widths[0] if sorted_widths else 4
+            self._cached_indent_unit = ' ' * unit
+        else:
+            self._cached_indent_unit = '\t'
+        
+        return self._cached_indent_unit
+
     def _apply_edits(self) -> str:
         """Apply all edits and return new source."""
         if not self.edits:
             return self.source
 
+        from bisect import bisect_left, bisect_right
+
         # sort by priority descending, then position descending
         self.edits.sort(key=lambda e: (-e.priority, -e.start_char))
 
-        # remove overlapping and duplicate edits (keep higher priority / earlier in sort)
         filtered = []
-        covered_ranges: List[Tuple[int, int]] = []
-        seen_insertions: set = set()  # track (position, replacement) for pure insertions
+        # sorted list of (start, end) for accepted non-insertion edits
+        covered_starts: List[int] = []
+        covered_ends: List[int] = []
+        seen_insertions: set = set()
 
         for edit in self.edits:
-            overlaps = False
-            
             # check for duplicate insertions at same position
             if edit.start_char == edit.end_char:
                 insertion_key = (edit.start_char, edit.replacement)
                 if insertion_key in seen_insertions:
-                    continue  # skip duplicate insertion
+                    continue
                 seen_insertions.add(insertion_key)
             
-            for start, end in covered_ranges:
-                # check for overlap
-                if edit.start_char < end and edit.end_char > start:
+            # check overlap against sorted non-overlapping accepted ranges
+            overlaps = False
+            if covered_starts:
+                s, e = edit.start_char, edit.end_char
+                # check interval whose start is largest <= s
+                i = bisect_right(covered_starts, s) - 1
+                if i >= 0 and covered_ends[i] > s:
                     overlaps = True
-                    break
+                # check interval whose start is smallest >= s  
+                if not overlaps:
+                    j = bisect_left(covered_starts, s)
+                    if j < len(covered_starts) and covered_starts[j] < e:
+                        overlaps = True
 
             if not overlaps:
                 filtered.append(edit)
-                if edit.start_char != edit.end_char:  # don't track insertions as covered
-                    covered_ranges.append((edit.start_char, edit.end_char))
+                if edit.start_char != edit.end_char:
+                    # insert into sorted position
+                    idx = bisect_left(covered_starts, edit.start_char)
+                    covered_starts.insert(idx, edit.start_char)
+                    covered_ends.insert(idx, edit.end_char)
 
         # apply edits from end to start (so positions don't shift)
         result = self.source
