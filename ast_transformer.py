@@ -863,6 +863,25 @@ class ASTTransformer:
         
         parts_var = f'_{var}_parts'
         
+        # SAFETY: check if the variable is referenced on any lines between init and loop_end
+        # that aren't the concat_lines we're converting. If so, the optimization would
+        # break those references (since local var = "" becomes local _var_parts = {})
+        concat_set = set(concat_lines)
+        var_pattern = re.compile(rf'\b{re.escape(var)}\b')
+        for check_ln in range(init_line + 1, loop_end + 1):
+            if check_ln in concat_set:
+                continue
+            ls, le = self._get_line_span(check_ln)
+            if ls is None:
+                continue
+            line_text = self.source[ls:le]
+            # strip comments
+            comment_pos = line_text.find('--')
+            if comment_pos >= 0:
+                line_text = line_text[:comment_pos]
+            if var_pattern.search(line_text):
+                return  # variable used outside concat lines, not safe to transform
+        
         # VALIDATION PHASE: check all lines can be transformed before making any edits
         
         # validate init line
