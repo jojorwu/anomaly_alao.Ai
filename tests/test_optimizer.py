@@ -6,6 +6,8 @@ from ast_analyzer import ASTAnalyzer
 from ast_transformer import ASTTransformer
 from whole_program_analyzer import WholeProgramAnalyzer
 from discovery import discover_mods, get_mod_info
+from utils import node_to_string, set_parents
+import luaparser.astnodes as ln
 
 class TestOptimizer(unittest.TestCase):
     def setUp(self):
@@ -70,6 +72,25 @@ class TestOptimizer(unittest.TestCase):
         self.assertIn('global_func', analysis.definitions)
         self.assertIn('global_func', analysis.usages)
 
+    def test_utils_node_to_string(self):
+        node = ln.Name("test_var")
+        self.assertEqual(node_to_string(node), "test_var")
+
+        num = ln.Number(42)
+        self.assertEqual(node_to_string(num), "42")
+
+    def test_whole_program_analyzer_complex(self):
+        script1 = self.test_dir / "m1.script"
+        script1.write_text("function f1() end\nf1()")
+        script2 = self.test_dir / "m2.script"
+        script2.write_text("f1()")
+
+        analyzer = WholeProgramAnalyzer()
+        analysis = analyzer.analyze_files([script1, script2])
+
+        self.assertEqual(len(analysis.usages['f1']), 2)
+        self.assertFalse(analysis.get_unused_globals())
+
     def test_analyzer_string_find_plain(self):
         script_path = self.test_dir / "test_find.lua"
         script_path.write_text('string.find(s, "plain")')
@@ -114,6 +135,15 @@ class TestOptimizer(unittest.TestCase):
         analyzer = ASTAnalyzer()
         findings = analyzer.analyze_file(script_path)
         self.assertTrue(any(f.pattern_name == 'table_insert_front' for f in findings))
+
+    def test_transformer_table_remove_last(self):
+        script_path = self.test_dir / "test_remove_fix.lua"
+        content = 'table.remove(my_table)'
+        script_path.write_text(content)
+        transformer = ASTTransformer()
+        modified, new_content, _ = transformer.transform_file(script_path, backup=False)
+        self.assertTrue(modified)
+        self.assertEqual(new_content.strip(), 'my_table[#my_table] = nil')
 
     def test_discovery_standard(self):
         mod_dir = self.test_dir / "my_mod"

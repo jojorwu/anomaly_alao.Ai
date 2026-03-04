@@ -172,9 +172,34 @@ class ASTTransformer:
             self._edit_distance_to_comparison(finding)
         elif pattern == 'string_find_plain':
             self._edit_string_find_plain(finding)
+        elif pattern == 'table_remove_last':
+            if finding.severity == 'GREEN':
+                self._edit_table_remove_last(finding)
 
 
     # Edit methods using AST positions
+
+    def _edit_table_remove_last(self, finding: Finding):
+        """Convert table.remove(t) to t[#t] = nil."""
+        node = finding.details.get('node')
+        if not node:
+            return
+
+        table_name = finding.details.get('table', '')
+        if not table_name:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'{table_name}[#{table_name}] = nil'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+        ))
 
     def _edit_table_insert(self, finding: Finding):
         """Convert table.insert(t, v) to t[#t+1] = v."""

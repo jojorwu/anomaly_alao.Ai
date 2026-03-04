@@ -28,6 +28,7 @@ import io
 import re
 
 from models import Finding, detect_file_encoding
+from utils import node_to_string, iter_children
 
 
 # Hot callbacks that run frequently
@@ -642,6 +643,11 @@ class ASTAnalyzer:
         if node is None:
             return
 
+        # track parent node for logic analysis
+        for child in iter_children(node):
+            if isinstance(child, Node):
+                child.parent = node
+
         handler = getattr(self, f'_visit_{type(node).__name__}', None)
         if handler:
             handler(node)
@@ -650,7 +656,7 @@ class ASTAnalyzer:
 
     def _visit_children(self, node: Node):
         """Visit all children of a node using optimized traversal."""
-        for child in self._iter_children(node):
+        for child in iter_children(node):
             if isinstance(child, Node):
                 self._visit(child)
 
@@ -783,32 +789,6 @@ class ASTAnalyzer:
                             pass
         return self._get_line(node)
 
-    def _iter_children(self, node):
-        """Iterate over all child nodes of an AST node."""
-        if node is None:
-            return
-        
-        # Handle lists
-        if isinstance(node, list):
-            for item in node:
-                yield item
-            return
-        
-        # For AST nodes, iterate over known child attributes
-        child_attrs = [
-            'body', 'test', 'orelse', 'targets', 'values', 'iter',
-            'func', 'args', 'value', 'idx', 'key', 'left', 'right',
-            'operand', 'fields', 'keys', 'source', 'step', 'start', 'stop',
-        ]
-        
-        for attr in child_attrs:
-            child = getattr(node, attr, None)
-            if child is not None:
-                if isinstance(child, list):
-                    for item in child:
-                        yield item
-                else:
-                    yield child
 
     def _visit_Forin(self, node: Forin):
         """Handle for-in loop."""
@@ -1566,6 +1546,7 @@ class ASTAnalyzer:
     def _analyze_patterns(self):
         """Analyze collected data and generate findings."""
         self._analyze_table_insert()
+        self._analyze_table_remove()
         self._analyze_deprecated_funcs()
         self._analyze_math_pow()
         self._analyze_uncached_globals()
@@ -1677,6 +1658,38 @@ class ASTAnalyzer:
                             },
                             source_line=self._get_source_line(call.line),
                         ))
+
+    def _analyze_table_remove(self):
+        """Find table.remove(t) patterns that can be t[#t] = nil."""
+        for call in self.calls:
+            if call.full_name == 'table.remove' and len(call.args) == 1:
+                # SAFETY: only safe to auto-fix if return value is NOT used
+                # We check this by seeing if the call is part of an assignment or other expression
+                # This is a bit complex without full data-flow, so we'll just check if it's
+                # a standalone statement in a block.
+
+                is_standalone = False
+                parent = getattr(call.node, 'parent', None)
+                if isinstance(parent, Block):
+                    is_standalone = True
+
+                # Severity YELLOW if potentially unsafe, GREEN if standalone
+                severity = 'GREEN' if is_standalone else 'YELLOW'
+
+                table_name = self._node_to_string(call.args[0])
+                self.findings.append(Finding(
+                    pattern_name='table_remove_last',
+                    severity=severity,
+                    line_num=call.line,
+                    message=f'table.remove({table_name}) -> {table_name}[#{table_name}] = nil',
+                    details={
+                        'table': table_name,
+                        'full_match': f'table.remove({table_name})',
+                        'node': call.node,
+                        'is_standalone': is_standalone,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
 
     def _analyze_deprecated_funcs(self):
         """Find deprecated functions: table.getn, string.len."""
@@ -2374,7 +2387,7 @@ class ASTAnalyzer:
                 check_if_node(node)
             
             # Recurse into children
-            for child in self._iter_children(node):
+            for child in iter_children(node):
                 walk(child)
         
         walk(self._ast_tree)
@@ -2469,7 +2482,7 @@ class ASTAnalyzer:
                 check_condition(node.test, 'while', line)
             
             # Recurse into children
-            for child in self._iter_children(node):
+            for child in iter_children(node):
                 walk(child)
         
         walk(self._ast_tree)

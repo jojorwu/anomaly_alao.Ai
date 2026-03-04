@@ -74,6 +74,7 @@ from ast_analyzer import analyze_file
 from ast_transformer import transform_file
 from reporter import Reporter
 from models import Finding
+from whole_program_analyzer import WholeProgramAnalyzer
 
 
 def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: int = 4, experimental: bool = False):
@@ -193,7 +194,7 @@ def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False)
         return None
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Anomaly Lua Auto Optimizer (ALAO)"
@@ -342,6 +343,11 @@ def parse_args():
         default=None,
         help="Path to file containing mod names to exclude (one per line)"
     )
+    parser.add_argument(
+        "--cross-file",
+        action="store_true",
+        help="Perform whole-program (cross-file) analysis to detect unused global functions/variables"
+    )
 
     args = parser.parse_args()
 
@@ -351,7 +357,7 @@ def parse_args():
         args.cache_threshold = 2
     return args
 
-def get_files_to_process(args):
+def get_files_to_process(args: argparse.Namespace) -> Tuple[Path, Dict[str, List[Path]]]:
     """Discover and filter mods/scripts based on arguments."""
     # try get path interactively if not provided
     if args.path:
@@ -464,7 +470,7 @@ def get_files_to_process(args):
         print(f"Found {len(mods)} mods with {total_scripts} script files\n")
     return mods_path, mods
 
-def run_parallel(work_items, worker_func, num_workers, quiet=False, desc="Processing"):
+def run_parallel(work_items: List[Any], worker_func: Any, num_workers: int, quiet: bool = False, desc: str = "Processing") -> Tuple[List[Tuple[Any, Optional[Exception]]], bool, bool, int]:
     """Generic helper to run tasks in parallel with progress tracking."""
     completed = 0
     results = []
@@ -503,7 +509,7 @@ def run_parallel(work_items, worker_func, num_workers, quiet=False, desc="Proces
 
     return results, pool_crashed, interrupted, completed
 
-def print_final_stats(args, reporter, files_analyzed, files_with_issues, files_skipped, parse_errors, files_modified, total_edits):
+def print_final_stats(args: argparse.Namespace, reporter: Reporter, files_analyzed: int, files_with_issues: int, files_skipped: int, parse_errors: int, files_modified: int, total_edits: int) -> None:
     """Print final statistics and usage tips."""
     print(f"\n{'=' * 55}")
     print(f"Files analyzed: {files_analyzed}")
@@ -836,6 +842,30 @@ def main():
     # clear progress line
     if not args.quiet:
         print("\r" + " " * 80 + "\r", end="")
+
+    # perform cross-file analysis if requested
+    if args.cross_file:
+        if not args.quiet:
+            print("Performing whole-program (cross-file) analysis...")
+
+        try:
+            wp_analyzer = WholeProgramAnalyzer()
+            wp_analyzer.analyze_files([s for _, s in all_files])
+
+            # map findings back to their respective mods
+            file_to_mod = {s: m for m, s in all_files}
+
+            wp_findings = wp_analyzer.get_findings()
+            for file_path, finding in wp_findings:
+                mod_name = file_to_mod.get(file_path, "(unknown)")
+                reporter.add_finding(mod_name, file_path, finding)
+
+            if not args.quiet:
+                print(f"  Found {len(wp_findings)} unused global symbols.\n")
+        except Exception as e:
+            print(f"Warning: Cross-file analysis failed: {e}")
+            if args.verbose:
+                traceback.print_exc()
 
     # apply fixes if requested
     files_modified = 0
