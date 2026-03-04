@@ -1562,6 +1562,9 @@ class ASTAnalyzer:
         self._analyze_vector_allocations_in_loops()
         self._analyze_plain_string_find()
         self._analyze_pairs_on_array()
+        self._analyze_ipairs_hot_loop()
+        self._analyze_math_min_max()
+        self._analyze_redundant_tostring()
 
     def _analyze_plain_string_find(self):
         """Find string.find() with plain strings that can use plain=true flag."""
@@ -1604,6 +1607,69 @@ class ASTAnalyzer:
                     },
                     source_line=self._get_source_line(call.line),
                 ))
+
+    def _analyze_ipairs_hot_loop(self):
+        """Find ipairs() used in hot callbacks where numeric loops are faster."""
+        for call in self.calls:
+            if call.full_name == 'ipairs' and call.scope.is_hot_callback:
+                table_name = self._node_to_string(call.args[0]) if call.args else "table"
+                self.findings.append(Finding(
+                    pattern_name='ipairs_hot_loop',
+                    severity='YELLOW',
+                    line_num=call.line,
+                    message=f'ipairs({table_name}) in hot callback -> for i=1, #{table_name} do is faster in LuaJIT',
+                    details={
+                        'table': table_name,
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_math_min_max(self):
+        """Find math.min(a, b) and math.max(a, b) with simple arguments."""
+        for call in self.calls:
+            if call.full_name in ('math.min', 'math.max') and len(call.args) == 2:
+                arg1 = call.args[0]
+                arg2 = call.args[1]
+
+                if self._is_simple_expr(arg1) and self._is_simple_expr(arg2):
+                    a_str = self._node_to_string(arg1)
+                    b_str = self._node_to_string(arg2)
+                    op = '<' if call.full_name == 'math.min' else '>'
+
+                    self.findings.append(Finding(
+                        pattern_name='math_min_max_inline',
+                        severity='YELLOW',
+                        line_num=call.line,
+                        message=f'{call.full_name}({a_str}, {b_str}) -> {a_str} {op} {b_str} and {a_str} or {b_str}',
+                        details={
+                            'func': call.full_name,
+                            'arg1': a_str,
+                            'arg2': b_str,
+                            'op': op,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_redundant_tostring(self):
+        """Find tostring(s) where s is already a string literal."""
+        for call in self.calls:
+            if call.full_name == 'tostring' and len(call.args) == 1:
+                arg = call.args[0]
+                if isinstance(arg, String):
+                    s_val = self._node_to_string(arg)
+                    self.findings.append(Finding(
+                        pattern_name='redundant_tostring',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'redundant tostring({s_val})',
+                        details={
+                            'value': s_val,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
 
     def _analyze_string_format_in_loop(self):
         """Find string.format() used in loops (can be expensive)."""
