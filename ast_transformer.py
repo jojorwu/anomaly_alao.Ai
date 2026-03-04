@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Set
 import shutil
 
+from luaparser.astnodes import Name, Index, Call, Invoke
 from ast_analyzer import analyze_file, ASTAnalyzer, Scope
 from models import Finding
 
@@ -145,7 +146,7 @@ class ASTTransformer:
         """Generate source edits for a finding."""
         pattern = finding.pattern_name
 
-        if pattern == 'table_insert_append':
+        if pattern in ('table_insert_append', 'table_insert_append_len'):
             self._edit_table_insert(finding)
         elif pattern == 'table_getn':
             self._edit_table_getn(finding)
@@ -177,6 +178,23 @@ class ASTTransformer:
                 self._edit_table_remove_last(finding)
         elif pattern == 'redundant_boolean_comp':
             self._edit_redundant_boolean_comp(finding)
+        elif pattern == 'math_random_1':
+            self._edit_math_random_1(finding)
+        elif pattern == 'math_abs_positive':
+            self._edit_math_abs_positive(finding)
+        elif pattern == 'string_format_to_concat':
+            self._edit_string_format_to_concat(finding)
+        elif pattern == 'redundant_return_bool':
+            self._edit_redundant_return_bool(finding)
+        elif pattern == 'table_concat_literal':
+            self._edit_table_concat_literal(finding)
+        elif pattern == 'ipairs_hot_loop':
+            if finding.severity == 'GREEN':
+                self._edit_ipairs_hot_loop(finding)
+        elif pattern == 'math_min_max_inline':
+            self._edit_math_min_max_inline(finding)
+        elif pattern == 'string_sub_to_byte':
+            self._edit_string_sub_to_byte(finding)
 
 
     # Edit methods using AST positions
@@ -211,7 +229,6 @@ class ASTTransformer:
             # check if target_str needs parens for 'not'
             # if it's just a Name or Index or Call, it's safe
             # if it contains operators, wrap it
-            from luaparser.astnodes import Name, Index, Call, Invoke
             if isinstance(target_node, (Name, Index, Call, Invoke)):
                 replacement = f'not {target_str}'
             else:
@@ -245,8 +262,224 @@ class ASTTransformer:
             replacement=replacement,
         ))
 
+    def _edit_math_random_1(self, finding: Finding):
+        """Convert math.random(1, N) to math.random(N)."""
+        node = finding.details.get('node')
+        n_str = finding.details.get('n_str', '')
+        if not node or not n_str:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'math.random({n_str})'
+        ))
+
+    def _edit_math_min_max_inline(self, finding: Finding):
+        """Convert math.min(a, b) to a < b and a or b."""
+        node = finding.details.get('node')
+        arg1 = finding.details.get('arg1', '')
+        arg2 = finding.details.get('arg2', '')
+        op = finding.details.get('op', '')
+
+        if not node or not arg1 or not arg2 or not op:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Optimization: use small-ternary
+        replacement = f'{arg1} {op} {arg2} and {arg1} or {arg2}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_string_sub_to_byte(self, finding: Finding):
+        """Convert string.sub(s, n, n) == "c" to string.byte(s, n) == code."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str', '')
+        n_str = finding.details.get('n_str', '')
+        op = finding.details.get('op', '')
+        byte_val = finding.details.get('byte_val')
+
+        if not node or not s_str or not n_str or not op or byte_val is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'string.byte({s_str}, {n_str}) {op} {byte_val}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_table_concat_literal(self, finding: Finding):
+        """Convert table.concat({a, b}) to a .. b."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement', '')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_ipairs_hot_loop(self, finding: Finding):
+        """Convert for k, v in ipairs(t) do to for k=1, #t do local v = t[k]."""
+        loop_node = finding.details.get('loop_node')
+        table_name = finding.details.get('table', '')
+        k_var = finding.details.get('k_var', '')
+        v_var = finding.details.get('v_var', '')
+
+        if not loop_node or not table_name or not k_var or not v_var:
+            return
+
+        # 1. Replace the loop header
+        # get positions for "for k, v in ipairs(t) do"
+        # we can't easily get the header span, but we can replace from "for" to "do"
+        # actually, it's easier to just replace the whole node and reconstruct it
+        # but that loses formatting.
+        # Let's try replacing pieces.
+
+        # Iter span: ipairs(t)
+        iter_start = None
+        iter_end = None
+        for it in loop_node.iter:
+            s, e = self._get_node_span(it)
+            if iter_start is None or (s is not None and s < iter_start):
+                iter_start = s
+            if iter_end is None or (e is not None and e > iter_end):
+                iter_end = e
+
+        if iter_start is None or iter_end is None:
+            return
+
+        # Instead of finding targets span (which can be None in luaparser),
+        # we look backwards from iter_start to find 'for' and 'in'.
+
+        # Header text should look like: for k, v in ipairs(t) do
+        line_num = self.analyzer._get_line(loop_node)
+        header_start, header_end = self._get_line_span(line_num)
+        if header_start is None:
+            return
+
+        line_text = self.source[header_start:header_end]
+
+        # Find 'for' and 'do' positions in the header line
+        for_match = re.search(r'\bfor\b', line_text)
+        do_match = re.search(r'\bdo\b', line_text)
+
+        if not for_match or not do_match:
+            return
+
+        # Replace everything between 'for' and 'do'
+        replace_start = header_start + for_match.end()
+        replace_end = header_start + do_match.start()
+
+        self.edits.append(SourceEdit(
+            start_char=replace_start,
+            end_char=replace_end,
+            replacement=f' {k_var} = 1, #{table_name} ',
+            priority=10
+        ))
+
+        # 2. Insert "local v = table[k]" at the beginning of the body
+        if hasattr(loop_node, 'body') and hasattr(loop_node.body, 'body'):
+            body_first_stmt = loop_node.body.body[0] if loop_node.body.body else None
+            if body_first_stmt:
+                insert_pos = self._get_line_start(self.analyzer._get_line(body_first_stmt))
+                indent = self._get_indent_at_line(self.analyzer._get_line(body_first_stmt))
+            else:
+                # empty body? just before 'end'
+                insert_pos = self._get_line_start(self.analyzer._get_end_line(loop_node))
+                indent = self._get_indent_at_line(self.analyzer._get_line(loop_node)) + self._detect_indent_unit()
+
+            if insert_pos is not None:
+                self.edits.append(SourceEdit(
+                    start_char=insert_pos,
+                    end_char=insert_pos,
+                    replacement=f'{indent}local {v_var} = {table_name}[{k_var}]\n',
+                    priority=5
+                ))
+
+    def _edit_redundant_return_bool(self, finding: Finding):
+        """Convert if cond then return true else return false end to return cond."""
+        node = finding.details.get('node')
+        cond_str = finding.details.get('cond_str', '')
+        if not node or not cond_str:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Use !! idiom to guarantee boolean result if original wasn't
+        # but if it's a comparison, it's already boolean
+        if any(op in cond_str for op in ('==', '~=', '>', '<', '>=', '<=', ' and ', ' or ', 'not ')):
+            replacement = f'return {cond_str}'
+        else:
+            replacement = f'return not not ({cond_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_string_format_to_concat(self, finding: Finding):
+        """Convert string.format("%s", a) to a."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement', '')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_math_abs_positive(self, finding: Finding):
+        """Remove redundant math.abs() call."""
+        node = finding.details.get('node')
+        arg_str = finding.details.get('arg_str', '')
+        if not node or not arg_str:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=arg_str
+        ))
+
     def _edit_table_insert(self, finding: Finding):
-        """Convert table.insert(t, v) to t[#t+1] = v."""
+        """Convert table.insert(t, v) or table.insert(t, #t+1, v) to t[#t+1] = v."""
         node = finding.details.get('node')
         if not node:
             return
@@ -261,8 +494,13 @@ class ASTTransformer:
             return
 
         # extract value from source
-        call_text = self.source[start:end]
-        value = self._extract_table_insert_value(call_text, table_name)
+        if finding.pattern_name == 'table_insert_append':
+            call_text = self.source[start:end]
+            value = self._extract_table_insert_value(call_text, table_name)
+        else:
+            # table_insert_append_len
+            value = finding.details.get('value', '')
+
         if not value:
             return
 

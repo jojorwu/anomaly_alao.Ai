@@ -1053,6 +1053,17 @@ class ASTAnalyzer:
 
     # visitor pass-through for other nodes
     def _visit_Index(self, node: Index):
+        # track index access for optimization
+        line = self._get_line(node)
+        is_write = False
+        # check if this is a write
+        parent = getattr(node, 'parent', None)
+        if isinstance(parent, (Assign, LocalAssign)):
+            if node in parent.targets:
+                is_write = True
+
+        self.index_accesses.append((node, line, self.current_scope, is_write))
+
         self._visit(node.value)
         self._visit(node.idx)
 
@@ -1216,6 +1227,15 @@ class ASTAnalyzer:
         self._analyze_slow_loop_funcs()
         self._analyze_luajit_nyi()
         self._analyze_redundant_boolean_comp()
+        self._analyze_math_random_1()
+        self._analyze_redundant_return_bool()
+        self._analyze_string_format_to_concat()
+        self._analyze_table_concat_literal()
+        self._analyze_string_sub_to_byte()
+        self._analyze_string_lower_case()
+        self._analyze_math_abs_positive()
+        self._analyze_table_new_in_loop()
+        self._analyze_repeated_member_access_in_loop()
 
     def _analyze_plain_string_find(self):
         """Find string.find() with plain strings that can use plain=true flag."""
@@ -1264,17 +1284,50 @@ class ASTAnalyzer:
         for call in self.calls:
             if call.full_name == 'ipairs' and call.scope.is_hot_callback:
                 table_name = node_to_string(call.args[0]) if call.args else "table"
-                self.findings.append(Finding(
-                    pattern_name='ipairs_hot_loop',
-                    severity='YELLOW',
-                    line_num=call.line,
-                    message=f'ipairs({table_name}) in hot callback -> for i=1, #{table_name} do is faster in LuaJIT',
-                    details={
-                        'table': table_name,
-                        'node': call.node,
-                    },
-                    source_line=self._get_source_line(call.line),
-                ))
+
+                # check if it's used in a Forin loop
+                parent_loop = None
+                curr = call.node
+                while hasattr(curr, 'parent'):
+                    curr = curr.parent
+                    if isinstance(curr, Forin):
+                        parent_loop = curr
+                        break
+
+                if parent_loop and len(parent_loop.targets) == 2:
+                    k_var = node_to_string(parent_loop.targets[0])
+                    v_var = node_to_string(parent_loop.targets[1])
+
+                    # only auto-fix if table is a simple variable (to avoid double evaluation)
+                    is_simple_table = self._is_simple_expr(call.args[0]) if call.args else False
+                    severity = 'GREEN' if is_simple_table else 'YELLOW'
+
+                    self.findings.append(Finding(
+                        pattern_name='ipairs_hot_loop',
+                        severity=severity,
+                        line_num=call.line,
+                        message=f'ipairs({table_name}) in hot callback -> for i=1, #{table_name} do is faster in LuaJIT',
+                        details={
+                            'table': table_name,
+                            'k_var': k_var,
+                            'v_var': v_var,
+                            'node': call.node,
+                            'loop_node': parent_loop,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                else:
+                    self.findings.append(Finding(
+                        pattern_name='ipairs_hot_loop',
+                        severity='YELLOW',
+                        line_num=call.line,
+                        message=f'ipairs({table_name}) in hot callback -> for i=1, #{table_name} do is faster in LuaJIT',
+                        details={
+                            'table': table_name,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
 
     def _analyze_math_min_max(self):
         """Find math.min(a, b) and math.max(a, b) with simple arguments."""
@@ -1324,6 +1377,100 @@ class ASTAnalyzer:
                         source_line=self._get_source_line(call.line)
                     ))
 
+    def _analyze_string_sub_to_byte(self):
+        """Find string.sub(s, n, n) == "c" that can be string.byte(s, n) == code."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                call = None
+                const_str = None
+
+                if isinstance(node.left, Call) and isinstance(node.right, String):
+                    call = node.left
+                    const_str = node.right.s
+                elif isinstance(node.right, Call) and isinstance(node.left, String):
+                    call = node.right
+                    const_str = node.left.s
+
+                if call and const_str and len(const_str) == 1:
+                    _, _, full_name = self._get_call_name(call)
+                    if full_name == 'string.sub' and len(call.args) >= 2:
+                        # check if it's string.sub(s, n, n)
+                        s_str = node_to_string(call.args[0])
+                        n_str = node_to_string(call.args[1])
+                        m_str = node_to_string(call.args[2]) if len(call.args) > 2 else None
+
+                        if n_str == m_str or (m_str is None and n_str == "1"):
+                            byte_val = ord(const_str)
+                            op = '==' if isinstance(node, EqToOp) else '~='
+
+                            self.findings.append(Finding(
+                                pattern_name='string_sub_to_byte',
+                                severity='YELLOW',
+                                line_num=self._get_line(node),
+                                message=f'string.sub({s_str}, {n_str}) {op} "{const_str}" -> string.byte({s_str}, {n_str}) {op} {byte_val}',
+                                details={
+                                    's_str': s_str,
+                                    'n_str': n_str,
+                                    'op': op,
+                                    'byte_val': byte_val,
+                                    'node': node,
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
+    def _analyze_table_new_in_loop(self):
+        """Find table re-initialization in loops."""
+        for assign in self.assigns:
+            if assign.in_loop and assign.value_type == 'other' and isinstance(assign.node, Table):
+                # check if the table is empty
+                if not assign.node.fields:
+                    self.findings.append(Finding(
+                        pattern_name='table_new_in_loop',
+                        severity='YELLOW',
+                        line_num=assign.line,
+                        message=f'Table re-initialization {assign.target} = {{}} in loop -> use table.clear()',
+                        details={
+                            'target': assign.target,
+                            'node': assign.node,
+                        },
+                        source_line=self._get_source_line(assign.line),
+                    ))
+
+    def _analyze_repeated_member_access_in_loop(self):
+        """Find repeated member access (e.g., self.object) in loops."""
+        # track access counts per loop scope
+        loop_accesses = defaultdict(lambda: defaultdict(list))
+
+        for node, line, scope, is_write in self.index_accesses:
+            if not is_write:
+                # check if it's a member access like self.xxx
+                if isinstance(node, Index) and isinstance(node.value, Name) and node.value.id == 'self':
+                    # find enclosing loop
+                    curr = scope
+                    while curr and curr.scope_type != 'loop':
+                        curr = curr.parent
+
+                    if curr:
+                        member_name = node_to_string(node)
+                        loop_accesses[id(curr)][member_name].append((node, line))
+
+        for loop_id, members in loop_accesses.items():
+            for member, accesses in members.items():
+                if len(accesses) >= 3:
+                    first_node, first_line = accesses[0]
+                    self.findings.append(Finding(
+                        pattern_name='repeated_member_access_in_loop',
+                        severity='YELLOW',
+                        line_num=first_line,
+                        message=f'Repeated access to {member} in loop ({len(accesses)}x) -> localize it',
+                        details={
+                            'member': member,
+                            'count': len(accesses),
+                            'lines': [a[1] for a in accesses],
+                        },
+                        source_line=self._get_source_line(first_line),
+                    ))
+
     def _analyze_luajit_nyi(self):
         """Find LuaJIT NYI functions in hot callbacks or loops."""
         for call in self.calls:
@@ -1354,6 +1501,116 @@ class ASTAnalyzer:
                         details={'func': call.full_name},
                         source_line=self._get_source_line(call.line)
                     ))
+
+    def _analyze_string_lower_case(self):
+        """Find string.lower(s) == "UPPER" which is always false."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                call = None
+                const_str = None
+
+                left = node.left
+                right = node.right
+
+                if isinstance(left, Call) and isinstance(right, String):
+                    call = left
+                    const_str = right.s
+                elif isinstance(right, Call) and isinstance(left, String):
+                    call = right
+                    const_str = left.s
+
+                if call and const_str:
+                    if isinstance(const_str, bytes):
+                        const_str = const_str.decode('utf-8', errors='replace')
+
+                    _, _, full_name = self._get_call_name(call)
+                    if full_name == 'string.lower':
+                        if any(c.isupper() for c in const_str):
+                            is_eq = isinstance(node, EqToOp)
+                            severity = 'RED' if is_eq else 'YELLOW'
+                            msg = f'string.lower() comparison with uppercase string "{const_str}" is always {"false" if is_eq else "true"}'
+                            self.findings.append(Finding(
+                                pattern_name='always_false_comparison',
+                                severity=severity,
+                                line_num=self._get_line(node),
+                                message=msg,
+                                details={'const': const_str},
+                                source_line=self._get_source_line(self._get_line(node))
+                            ))
+
+    def _analyze_string_format_to_concat(self):
+        """Find string.format("%s...", ...) that can be concatenation."""
+        for call in self.calls:
+            if call.full_name == 'string.format' and len(call.args) >= 2:
+                fmt_node = call.args[0]
+                if isinstance(fmt_node, String):
+                    fmt = fmt_node.s
+                    if isinstance(fmt, bytes):
+                        fmt = fmt.decode('utf-8', errors='replace')
+
+                    # only handle simple %s and constant text
+                    placeholders = re.findall(r'%[0-9.]*[a-zA-Z%]', fmt)
+                    if placeholders and all(p == '%s' for p in placeholders) and len(placeholders) == len(call.args) - 1:
+                        # build concatenation string
+                        parts = fmt.split('%s')
+                        concat_parts = []
+                        arg_idx = 1
+                        for i, part in enumerate(parts):
+                            if part:
+                                # escape quotes if needed, but for now just use it
+                                concat_parts.append(f'"{part}"')
+                            if i < len(parts) - 1:
+                                arg_node = call.args[arg_idx]
+                                arg_str = node_to_string(arg_node)
+                                # numbers are safe to concat directly in Lua
+                                if not isinstance(arg_node, (Number, String, Name, Index)):
+                                    arg_str = f'({arg_str})'
+
+                                # to match string.format, we should technically use tostring()
+                                # but usually %s is used on things that are already strings or numbers
+                                concat_parts.append(arg_str)
+                                arg_idx += 1
+
+                        replacement = ' .. '.join(concat_parts)
+                        self.findings.append(Finding(
+                            pattern_name='string_format_to_concat',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.format("{fmt}", ...) -> concatenation: {replacement}',
+                            details={
+                                'replacement': replacement,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+    def _analyze_redundant_return_bool(self):
+        """Find if cond then return true else return false end."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, If) and node.orelse and isinstance(node.orelse, Block):
+                # check if body is 'return true' and orelse is 'return false'
+                if len(node.body.body) == 1 and len(node.orelse.body) == 1:
+                    stmt1 = node.body.body[0]
+                    stmt2 = node.orelse.body[0]
+
+                    if isinstance(stmt1, Return) and isinstance(stmt2, Return):
+                        if len(stmt1.values) == 1 and len(stmt2.values) == 1:
+                            val1 = stmt1.values[0]
+                            val2 = stmt2.values[0]
+
+                            if isinstance(val1, TrueExpr) and isinstance(val2, FalseExpr):
+                                cond_str = node_to_string(node.test)
+                                self.findings.append(Finding(
+                                    pattern_name='redundant_return_bool',
+                                    severity='YELLOW',
+                                    line_num=self._get_line(node),
+                                    message=f'if {cond_str} then return true else return false end -> return {cond_str}',
+                                    details={
+                                        'cond_str': cond_str,
+                                        'node': node,
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
 
     def _analyze_redundant_boolean_comp(self):
         """Find redundant boolean comparisons like x == true or x == false."""
@@ -1432,6 +1689,32 @@ class ASTAnalyzer:
         """Find table.insert(t, v) and table.insert(t, 1, v) patterns."""
         for call in self.calls:
             if call.full_name == 'table.insert':
+                if len(call.args) == 3:
+                    # check for table.insert(t, #t+1, v)
+                    pos_node = call.args[1]
+                    table_node = call.args[0]
+                    table_name = node_to_string(table_node)
+
+                    if isinstance(pos_node, AddOp):
+                        # check if it's #t + 1
+                        left = pos_node.left
+                        right = pos_node.right
+                        if isinstance(left, ULengthOP) and isinstance(right, Number) and right.n == 1:
+                            if node_to_string(left.operand) == table_name:
+                                self.findings.append(Finding(
+                                    pattern_name='table_insert_append_len',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'table.insert({table_name}, #{table_name}+1, v) -> {table_name}[#{table_name}+1] = v',
+                                    details={
+                                        'table': table_name,
+                                        'value': node_to_string(call.args[2]),
+                                        'node': call.node,
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
+                                continue
+
                 if len(call.args) == 2:
                     # 2-arg form: table.insert(t, v)
                     table_name = node_to_string(call.args[0])
@@ -1531,6 +1814,103 @@ class ASTAnalyzer:
                     },
                     source_line=self._get_source_line(call.line),
                 ))
+
+    def _analyze_math_random_1(self):
+        """Find math.random(1, N) that can be math.random(N)."""
+        for call in self.calls:
+            if call.full_name == 'math.random' and len(call.args) == 2:
+                arg1 = call.args[0]
+                if isinstance(arg1, Number) and arg1.n == 1:
+                    n_str = node_to_string(call.args[1])
+                    self.findings.append(Finding(
+                        pattern_name='math_random_1',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.random(1, {n_str}) -> math.random({n_str})',
+                        details={
+                            'n_str': n_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_math_abs_positive(self):
+        """Find math.abs() on values that are always positive."""
+        positive_funcs = {'time_global', 'device().time_global', 'level.get_time_days',
+                         'math.random', 'math.sqrt', 'math.exp'}
+        for call in self.calls:
+            if call.full_name == 'math.abs' and len(call.args) == 1:
+                arg = call.args[0]
+                is_positive = False
+                if isinstance(arg, Number) and arg.n >= 0:
+                    is_positive = True
+                elif isinstance(arg, ULengthOP):
+                    is_positive = True
+                elif isinstance(arg, Call):
+                    _, _, full_name = self._get_call_name(arg)
+                    if full_name in positive_funcs:
+                        is_positive = True
+
+                if is_positive:
+                    arg_str = node_to_string(arg)
+                    self.findings.append(Finding(
+                        pattern_name='math_abs_positive',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.abs({arg_str}) is redundant',
+                        details={
+                            'arg_str': arg_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_table_concat_literal(self):
+        """Find table.concat({a, b}) that can be a .. b."""
+        for call in self.calls:
+            if call.full_name == 'table.concat' and len(call.args) >= 1:
+                arg1 = call.args[0]
+                if isinstance(arg1, Table) and len(arg1.fields) >= 2 and len(arg1.fields) <= 4:
+                    # check if all fields are simple values (no complex expressions)
+                    all_simple = True
+                    parts = []
+                    for field in arg1.fields:
+                        if field.key: # named key {k=v} - not handled by concat on array
+                            all_simple = False
+                            break
+                        if not self._is_simple_expr(field.value) and not isinstance(field.value, (Call, Invoke)):
+                            # expressions like a+b might need parens, skip for now
+                            all_simple = False
+                            break
+                        parts.append(node_to_string(field.value))
+
+                    if all_simple:
+                        sep = '""'
+                        if len(call.args) >= 2:
+                            if isinstance(call.args[1], String):
+                                sep = node_to_string(call.args[1])
+                            else:
+                                all_simple = False # complex separator
+
+                        if all_simple:
+                            # if separator is "", just join with ..
+                            # otherwise join with .. sep ..
+                            if sep in ('""', "''"):
+                                replacement = ' .. '.join(parts)
+                            else:
+                                replacement = f' .. {sep} .. '.join(parts)
+
+                            self.findings.append(Finding(
+                                pattern_name='table_concat_literal',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'table.concat({{...}}) -> concatenation: {replacement}',
+                                details={
+                                    'replacement': replacement,
+                                    'node': call.node,
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
 
     def _analyze_math_pow(self):
         """Find math.pow that can be simplified."""
