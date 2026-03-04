@@ -464,6 +464,45 @@ def get_files_to_process(args):
         print(f"Found {len(mods)} mods with {total_scripts} script files\n")
     return mods_path, mods
 
+def run_parallel(work_items, worker_func, num_workers, quiet=False, desc="Processing"):
+    """Generic helper to run tasks in parallel with progress tracking."""
+    completed = 0
+    results = []
+    start_time = datetime.now()
+    total = len(work_items)
+    pool_crashed = False
+    interrupted = False
+
+    if not work_items:
+        return [], False, False, 0
+
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(worker_func, item): item for item in work_items}
+
+            for future in as_completed(futures):
+                completed += 1
+                if not quiet:
+                    progress = (completed / total * 100)
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    rate = completed / elapsed if elapsed > 0.01 else 0
+                    remaining = total - completed
+                    eta = remaining / rate if rate > 0 and remaining > 0 else 0
+                    print(f"\r[{progress:5.1f}%] {desc} {completed}/{total} | ETA: {eta:.0f}s  ", end="", flush=True)
+
+                try:
+                    result = future.result()
+                    results.append((result, None))
+                except Exception as e:
+                    results.append((None, e))
+    except BrokenExecutor:
+        pool_crashed = True
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"\n\nInterrupted!")
+
+    return results, pool_crashed, interrupted, completed
+
 def main():
     args = parse_args()
     mods_path, mods = get_files_to_process(args)
@@ -695,66 +734,30 @@ def main():
         for mod_name, script_path in all_files
     ]
 
-    completed = 0
-    pool_crashed = False
-    interrupted = False
-    processed_paths = set()  # track which files were processed
+    processed_paths = set()
+    results, pool_crashed, interrupted, completed = run_parallel(work_items, analyze_file_worker, num_workers, args.quiet, "Analyzing")
 
-    try:
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(analyze_file_worker, item): item for item in work_items}
+    for i, (res, err) in enumerate(results):
+        mod_name, script_path, findings, error = res if res else (work_items[i][0], work_items[i][1], [], str(err))
+        processed_paths.add(script_path)
 
-            for future in as_completed(futures):
-                item = futures[future]
-                
-                try:
-                    mod_name, script_path, findings, error = future.result()
-                    processed_paths.add(script_path)
-                    completed += 1
-                except BrokenExecutor:
-                    pool_crashed = True
-                    break
-                except Exception as e:
-                    processed_paths.add(item[1])
-                    completed += 1
-                    files_skipped += 1
-                    if args.verbose:
-                        print(f"\n  [ERROR] {item[1].name}: {e}")
-                    continue
-
-                if not args.quiet:
-                    total = len(all_files)
-                    progress = (completed / total * 100) if total > 0 else 100
-                    elapsed = (datetime.now() - start_time).total_seconds()
-                    rate = completed / elapsed if elapsed > 0.01 else 0
-                    remaining = total - completed
-                    eta = remaining / rate if rate > 0 and remaining > 0 else 0
-                    print(
-                        f"\r[{progress:5.1f}%] {completed}/{total} | ETA: {eta:.0f}s  ", end="", flush=True)
-
-                if error:
-                    if 'SyntaxError' in error or 'parse' in error.lower() or 'TimeoutError' in error:
-                        parse_errors += 1
-                        if args.verbose:
-                            print(f"\n  [PARSE ERROR] {script_path.name}")
-                    else:
-                        files_skipped += 1
-                        if args.verbose:
-                            print(f"\n  [ERROR] {script_path.name}: {error}")
-                else:
-                    files_analyzed += 1
-                    if findings:
-                        files_with_issues += 1
-                        for finding in findings:
-                            reporter.add_finding(mod_name, script_path, finding)
-
-                        if args.verbose and not args.quiet:
-                            print(f"\n  [{len(findings):3d} issues] {script_path.name}")
-    except BrokenExecutor:
-        pool_crashed = True
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\n\nInterrupted! Finishing current tasks...")
+        if error:
+            if 'SyntaxError' in error or 'parse' in error.lower() or 'TimeoutError' in error:
+                parse_errors += 1
+                if args.verbose:
+                    print(f"\n  [PARSE ERROR] {script_path.name}")
+            else:
+                files_skipped += 1
+                if args.verbose:
+                    print(f"\n  [ERROR] {script_path.name}: {error}")
+        else:
+            files_analyzed += 1
+            if findings:
+                files_with_issues += 1
+                for finding in findings:
+                    reporter.add_finding(mod_name, script_path, finding)
+                if args.verbose and not args.quiet:
+                    print(f"\n  [{len(findings):3d} issues] {script_path.name}")
 
     if interrupted:
         print(f"Processed {completed}/{len(all_files)} files before interruption.")
@@ -861,49 +864,21 @@ def main():
             if not args.quiet:
                 print()
         else:
-            completed = 0
-            pool_crashed = False
-            transform_interrupted = False
             processed_paths = set()
+            results, pool_crashed, transform_interrupted, transform_completed = run_parallel(work_items, transform_file_worker, num_workers, args.quiet, "Fixing")
 
-            try:
-                with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                    futures = {
-                        executor.submit(
-                            transform_file_worker,
-                            item): item for item in work_items}
+            for i, (res, err) in enumerate(results):
+                script_path, modified, edit_count, error = res if res else (work_items[i][0], False, 0, str(err))
+                processed_paths.add(script_path)
 
-                    for future in as_completed(futures):
-                        completed += 1
-                        if not args.quiet:
-                            progress = (completed / len(work_items) * 100) if work_items else 100
-                            print(
-                                f"\r[{progress:5.1f}%] Fixing {completed}/{len(work_items)}...", end="", flush=True)
-
-                        try:
-                            script_path, modified, edit_count, error = future.result()
-                            processed_paths.add(futures[future][0])
-                        except BrokenExecutor:
-                            pool_crashed = True
-                            break
-                        except Exception as e:
-                            if args.verbose:
-                                print(f"\n  [ERROR] {e}")
-                            continue
-
-                        if error:
-                            if args.verbose:
-                                print(f"\n  [FIX ERROR] {script_path.name}: {error}")
-                        elif modified:
-                            files_modified += 1
-                            total_edits += edit_count
-                            if args.verbose:
-                                print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
-            except BrokenExecutor:
-                pool_crashed = True
-            except KeyboardInterrupt:
-                transform_interrupted = True
-                print("\n\nInterrupted during fixes! Some files may have been modified.")
+                if error:
+                    if args.verbose:
+                        print(f"\n  [FIX ERROR] {script_path.name}: {error}")
+                elif modified:
+                    files_modified += 1
+                    total_edits += edit_count
+                    if args.verbose:
+                        print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
 
             if pool_crashed and not transform_interrupted:
                 if not args.quiet:

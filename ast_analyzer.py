@@ -610,6 +610,26 @@ class ASTAnalyzer:
             scope = scope.parent
         return None
 
+    def _register_local(self, var_name: str, line: int, is_param: bool = False, is_loop_var: bool = False):
+        """Centralized helper to register a local variable or parameter."""
+        if not self.current_scope:
+            return
+
+        self.current_scope.locals.add(var_name)
+
+        # Track for diagnostics (shadowing and unused detection)
+        if not var_name.startswith('_'):
+            key = (id(self.current_scope), var_name)
+            self.local_vars[key] = LocalVarInfo(
+                name=var_name,
+                assign_line=line,
+                scope=self.current_scope,
+                is_read=False,
+                is_function=False,
+                is_loop_var=is_loop_var,
+                is_param=is_param,
+            )
+
     def _visit(self, node: Node):
         """Visit a node and dispatch to specific handler."""
         if node is None:
@@ -622,21 +642,10 @@ class ASTAnalyzer:
             self._visit_children(node)
 
     def _visit_children(self, node: Node):
-        """Visit all children of a node."""
-        try:
-            node_dict = vars(node) if hasattr(node, '__dict__') else {}
-        except TypeError:
-            node_dict = {}
-
-        for key, value in node_dict.items():
-            if key.startswith('_'):
-                continue
-            if isinstance(value, Node):
-                self._visit(value)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, Node):
-                        self._visit(item)
+        """Visit all children of a node using optimized traversal."""
+        for child in self._iter_children(node):
+            if isinstance(child, Node):
+                self._visit(child)
 
     def _visit_Chunk(self, node: Chunk):
         self._visit(node.body)
@@ -669,7 +678,7 @@ class ASTAnalyzer:
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
                 if isinstance(arg, Name):
-                    self.current_scope.locals.add(arg.id)
+                    self._register_local(arg.id, line, is_param=True)
 
         self._visit(node.body)
 
@@ -714,7 +723,7 @@ class ASTAnalyzer:
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
                 if isinstance(arg, Name):
-                    self.current_scope.locals.add(arg.id)
+                    self._register_local(arg.id, line, is_param=True)
 
         self._visit(node.body)
 
@@ -738,12 +747,12 @@ class ASTAnalyzer:
         self._enter_scope(func_name, line, 'function', is_hot)
 
         # 'self' is implicit first param
-        self.current_scope.locals.add('self')
+        self._register_local('self', line, is_param=True)
 
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
                 if isinstance(arg, Name):
-                    self.current_scope.locals.add(arg.id)
+                    self._register_local(arg.id, line, is_param=True)
 
         self._visit(node.body)
 
@@ -809,22 +818,10 @@ class ASTAnalyzer:
         for target in node.targets:
             if isinstance(target, Name):
                 var_name = target.id
-                self.current_scope.locals.add(var_name)
+                self._register_local(var_name, line, is_loop_var=True)
                 
                 # Mark as assignment target (not a read)
                 self.assignment_target_ids.add(id(target))
-                
-                # Track for unused variable detection (skip _ prefixed)
-                if not var_name.startswith('_'):
-                    key = (id(self.current_scope), var_name)
-                    self.local_vars[key] = LocalVarInfo(
-                        name=var_name,
-                        assign_line=line,
-                        scope=self.current_scope,
-                        is_read=False,
-                        is_function=False,
-                        is_loop_var=True,
-                    )
 
         self._visit(node.body)
 
@@ -847,22 +844,10 @@ class ASTAnalyzer:
 
         if isinstance(node.target, Name):
             var_name = node.target.id
-            self.current_scope.locals.add(var_name)
+            self._register_local(var_name, line, is_loop_var=True)
             
             # Mark as assignment target (not a read)
             self.assignment_target_ids.add(id(node.target))
-            
-            # Track for unused variable detection (skip _ prefixed)
-            if not var_name.startswith('_'):
-                key = (id(self.current_scope), var_name)
-                self.local_vars[key] = LocalVarInfo(
-                    name=var_name,
-                    assign_line=line,
-                    scope=self.current_scope,
-                    is_read=False,
-                    is_function=False,
-                    is_loop_var=True,
-                )
 
         self._visit(node.body)
 
@@ -950,21 +935,10 @@ class ASTAnalyzer:
         for target in node.targets:
             if isinstance(target, Name):
                 var_name = target.id
-                self.current_scope.locals.add(var_name)
+                self._register_local(var_name, line)
                 
                 # Mark this Name node as an assignment target (not a read)
                 self.assignment_target_ids.add(id(target))
-                
-                # Track for unused variable detection (skip _ prefixed)
-                if not var_name.startswith('_'):
-                    key = (id(self.current_scope), var_name)
-                    self.local_vars[key] = LocalVarInfo(
-                        name=var_name,
-                        assign_line=line,
-                        scope=self.current_scope,
-                        is_read=False,
-                        is_function=False,
-                    )
 
         # check for caching pattern: local xyz = module.func
         is_new_alias = False
@@ -1590,6 +1564,7 @@ class ASTAnalyzer:
         self._analyze_uncached_globals()
         self._analyze_repeated_calls_in_scope()
         self._analyze_string_concat_in_loop()
+        self._analyze_string_format_in_loop()
         self._analyze_debug_statements()
         self._analyze_global_writes()
         self._analyze_nil_access()
@@ -1642,27 +1617,59 @@ class ASTAnalyzer:
                     source_line=self._get_source_line(call.line),
                 ))
 
-    def _analyze_table_insert(self):
-        """Find table.insert(t, v) that can be t[#t+1] = v."""
+    def _analyze_string_format_in_loop(self):
+        """Find string.format() used in loops (can be expensive)."""
         for call in self.calls:
-            if call.full_name == 'table.insert' and len(call.args) == 2:
-                # 2-arg form: table.insert(t, v)
-                table_name = self._node_to_string(call.args[0])
-                value = self._node_to_string(call.args[1])
-
+            if call.full_name == 'string.format' and call.in_loop:
                 self.findings.append(Finding(
-                    pattern_name='table_insert_append',
-                    severity='GREEN',
+                    pattern_name='string_format_in_loop',
+                    severity='YELLOW',
                     line_num=call.line,
-                    message=f'table.insert({table_name}, v) -> {table_name}[#{table_name}+1] = v',
+                    message='string.format() in loop -> consider simple concatenation or pre-calculating',
                     details={
-                        'table': table_name,
-                        'value': value,
-                        'full_match': f'table.insert({table_name}, {value})',
-                        'node': call.node,
+                        'loop_depth': call.loop_depth,
                     },
                     source_line=self._get_source_line(call.line),
                 ))
+
+    def _analyze_table_insert(self):
+        """Find table.insert(t, v) and table.insert(t, 1, v) patterns."""
+        for call in self.calls:
+            if call.full_name == 'table.insert':
+                if len(call.args) == 2:
+                    # 2-arg form: table.insert(t, v)
+                    table_name = self._node_to_string(call.args[0])
+                    value = self._node_to_string(call.args[1])
+
+                    self.findings.append(Finding(
+                        pattern_name='table_insert_append',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'table.insert({table_name}, v) -> {table_name}[#{table_name}+1] = v',
+                        details={
+                            'table': table_name,
+                            'value': value,
+                            'full_match': f'table.insert({table_name}, {value})',
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                elif len(call.args) == 3:
+                    # 3-arg form: table.insert(t, pos, v)
+                    pos_node = call.args[1]
+                    if isinstance(pos_node, Number) and pos_node.n == 1:
+                        table_name = self._node_to_string(call.args[0])
+                        self.findings.append(Finding(
+                            pattern_name='table_insert_front',
+                            severity='YELLOW',
+                            line_num=call.line,
+                            message=f'table.insert({table_name}, 1, v) is O(n) -> avoid inserting at front of large tables',
+                            details={
+                                'table': table_name,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
 
     def _analyze_deprecated_funcs(self):
         """Find deprecated functions: table.getn, string.len."""
@@ -2480,16 +2487,21 @@ class ASTAnalyzer:
                 # Get scope name for better error message
                 scope_name = info.scope.name if info.scope else '<unknown>'
                 
+                # Distinguish between parameters and regular locals
+                pattern = 'unused_parameter' if info.is_param else 'unused_local_variable'
+                msg_prefix = "Parameter" if info.is_param else "Local variable"
+
                 self.findings.append(Finding(
-                    pattern_name='unused_local_variable',
+                    pattern_name=pattern,
                     severity='YELLOW',  # warning only, don't auto-fix
                     line_num=info.assign_line,
-                    message=f"Local variable '{name}' is assigned but never used in {scope_name}",
+                    message=f"{msg_prefix} '{name}' is assigned but never used in {scope_name}",
                     details={
                         'var_name': name,
                         'assign_line': info.assign_line,
                         'scope_name': scope_name,
                         'is_safe_to_remove': False,  # not safe - might be intentional
+                        'is_param': info.is_param,
                     },
                     source_line=self._get_source_line(info.assign_line),
                 ))

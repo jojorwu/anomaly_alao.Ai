@@ -93,6 +93,28 @@ class TestOptimizer(unittest.TestCase):
         self.assertTrue(modified)
         self.assertIn('string.find(str, "key", 1, true)', new_content)
 
+    def test_analyzer_unused_parameter(self):
+        script_path = self.test_dir / "test_param.lua"
+        script_path.write_text('function my_func(used, unused) return used end')
+        analyzer = ASTAnalyzer()
+        findings = analyzer.analyze_file(script_path)
+        self.assertTrue(any(f.pattern_name == 'unused_parameter' and f.details.get('var_name') == 'unused' for f in findings))
+        self.assertFalse(any(f.pattern_name == 'unused_parameter' and f.details.get('var_name') == 'used' for f in findings))
+
+    def test_analyzer_string_format_loop(self):
+        script_path = self.test_dir / "test_format_loop.lua"
+        script_path.write_text('for i=1,10 do string.format("%d", i) end')
+        analyzer = ASTAnalyzer()
+        findings = analyzer.analyze_file(script_path)
+        self.assertTrue(any(f.pattern_name == 'string_format_in_loop' for f in findings))
+
+    def test_analyzer_table_insert_front(self):
+        script_path = self.test_dir / "test_insert_front.lua"
+        script_path.write_text('table.insert(my_table, 1, "first")')
+        analyzer = ASTAnalyzer()
+        findings = analyzer.analyze_file(script_path)
+        self.assertTrue(any(f.pattern_name == 'table_insert_front' for f in findings))
+
     def test_discovery_standard(self):
         mod_dir = self.test_dir / "my_mod"
         scripts_dir = mod_dir / "gamedata" / "scripts"
