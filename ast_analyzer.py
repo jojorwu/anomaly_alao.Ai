@@ -1597,6 +1597,50 @@ class ASTAnalyzer:
         self._analyze_per_frame_callbacks()
         self._analyze_distance_to_comparisons()
         self._analyze_vector_allocations_in_loops()
+        self._analyze_plain_string_find()
+        self._analyze_pairs_on_array()
+
+    def _analyze_plain_string_find(self):
+        """Find string.find() with plain strings that can use plain=true flag."""
+        lua_regex_chars = set('^$()%.[]*+-?')
+        for call in self.calls:
+            if call.full_name == 'string.find' and len(call.args) == 2:
+                pattern_node = call.args[1]
+                if isinstance(pattern_node, String):
+                    pattern_text = pattern_node.s
+                    if isinstance(pattern_text, bytes):
+                        pattern_text = pattern_text.decode('utf-8', errors='replace')
+
+                    if not any(c in lua_regex_chars for c in pattern_text):
+                        self.findings.append(Finding(
+                            pattern_name='string_find_plain',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.find("{pattern_text}") -> use plain=true for performance',
+                            details={
+                                'pattern': pattern_text,
+                                'full_match': f'string.find({self._node_to_string(call.args[0])}, "{pattern_text}")',
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+    def _analyze_pairs_on_array(self):
+        """Find pairs() used in hot callbacks where ipairs() or numeric loops might be faster."""
+        for call in self.calls:
+            if call.full_name == 'pairs' and call.scope.is_hot_callback:
+                table_name = self._node_to_string(call.args[0]) if call.args else "table"
+                self.findings.append(Finding(
+                    pattern_name='pairs_on_array',
+                    severity='YELLOW',
+                    line_num=call.line,
+                    message=f'pairs({table_name}) in hot callback -> check if ipairs() or numeric loop is possible',
+                    details={
+                        'table': table_name,
+                        'function': call.scope.name,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
 
     def _analyze_table_insert(self):
         """Find table.insert(t, v) that can be t[#t+1] = v."""

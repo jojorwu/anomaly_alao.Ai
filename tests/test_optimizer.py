@@ -70,6 +70,29 @@ class TestOptimizer(unittest.TestCase):
         self.assertIn('global_func', analysis.definitions)
         self.assertIn('global_func', analysis.usages)
 
+    def test_analyzer_string_find_plain(self):
+        script_path = self.test_dir / "test_find.lua"
+        script_path.write_text('string.find(s, "plain")')
+        analyzer = ASTAnalyzer()
+        findings = analyzer.analyze_file(script_path)
+        self.assertTrue(any(f.pattern_name == 'string_find_plain' for f in findings))
+
+    def test_analyzer_pairs_hot_callback(self):
+        script_path = self.test_dir / "test_pairs.lua"
+        script_path.write_text('function actor_on_update()\n  for k,v in pairs(t) do end\nend')
+        analyzer = ASTAnalyzer()
+        findings = analyzer.analyze_file(script_path)
+        self.assertTrue(any(f.pattern_name == 'pairs_on_array' for f in findings))
+
+    def test_transformer_string_find_plain(self):
+        script_path = self.test_dir / "test_find_fix.lua"
+        content = 'string.find(str, "key")'
+        script_path.write_text(content)
+        transformer = ASTTransformer()
+        modified, new_content, _ = transformer.transform_file(script_path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn('string.find(str, "key", 1, true)', new_content)
+
     def test_discovery_standard(self):
         mod_dir = self.test_dir / "my_mod"
         scripts_dir = mod_dir / "gamedata" / "scripts"

@@ -163,6 +163,8 @@ class ASTTransformer:
             self._edit_repeated_calls(finding)
         elif pattern == 'distance_to_comparison':
             self._edit_distance_to_comparison(finding)
+        elif pattern == 'string_find_plain':
+            self._edit_string_find_plain(finding)
 
 
     # Edit methods using AST positions
@@ -295,6 +297,30 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=f'#{str_name}',
+        ))
+
+    def _edit_string_find_plain(self, finding: Finding):
+        """Convert string.find(s, p) to string.find(s, p, 1, true)."""
+        node = finding.details.get('node')
+        if not node:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        call_text = self.source[start:end]
+        match_end = self._find_matching_paren(call_text, call_text.find('('))
+        if match_end == -1:
+            return
+
+        # replace the closing paren with ", 1, true)"
+        replacement = call_text[:match_end - 1] + ", 1, true)"
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
         ))
 
     def _edit_math_pow(self, finding: Finding):
