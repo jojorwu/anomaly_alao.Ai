@@ -484,9 +484,11 @@ def run_parallel(work_items: List[Any], worker_func: Any, num_workers: int, quie
 
     try:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Map futures to their corresponding work items
             futures = {executor.submit(worker_func, item): item for item in work_items}
 
             for future in as_completed(futures):
+                item = futures[future]
                 completed += 1
                 if not quiet:
                     progress = (completed / total * 100)
@@ -498,9 +500,9 @@ def run_parallel(work_items: List[Any], worker_func: Any, num_workers: int, quie
 
                 try:
                     result = future.result()
-                    results.append((result, None))
+                    results.append((result, None, item))
                 except Exception as e:
-                    results.append((None, e))
+                    results.append((None, e, item))
     except BrokenExecutor:
         pool_crashed = True
     except KeyboardInterrupt:
@@ -787,8 +789,8 @@ def main():
     processed_paths = set()
     results, pool_crashed, interrupted, completed = run_parallel(work_items, analyze_file_worker, num_workers, args.quiet, "Analyzing")
 
-    for i, (res, err) in enumerate(results):
-        mod_name, script_path, findings, error = res if res else (work_items[i][0], work_items[i][1], [], str(err))
+    for res, err, item in results:
+        mod_name, script_path, findings, error = res if res else (item[0], item[1], [], str(err))
         processed_paths.add(script_path)
 
         if error:
@@ -941,8 +943,8 @@ def main():
             processed_paths = set()
             results, pool_crashed, transform_interrupted, transform_completed = run_parallel(work_items, transform_file_worker, num_workers, args.quiet, "Fixing")
 
-            for i, (res, err) in enumerate(results):
-                script_path, modified, edit_count, error = res if res else (work_items[i][0], False, 0, str(err))
+            for res, err, item in results:
+                script_path, modified, edit_count, error = res if res else (item[0], False, 0, str(err))
                 processed_paths.add(script_path)
 
                 if error:

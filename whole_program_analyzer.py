@@ -223,33 +223,6 @@ class WholeProgramAnalyzer:
                             pass
         return 0
     
-    def _node_to_string(self, node: Node) -> str:
-        """Convert AST node to string representation."""
-        if isinstance(node, Name):
-            return node.id
-        if isinstance(node, Index):
-            return self._format_index(node)
-        if isinstance(node, String):
-            return self._format_string(node)
-        return ""
-
-    def _format_string(self, node: String) -> str:
-        """Helper to format String nodes."""
-        s = node.s
-        if isinstance(s, bytes):
-            s = s.decode('utf-8', errors='replace')
-        return s
-
-    def _format_index(self, node: Index) -> str:
-        """Helper to format Index nodes."""
-        value = self._node_to_string(node.value)
-        idx = self._node_to_string(node.idx)
-        idx_token = getattr(node.idx, 'first_token', None)
-        if idx_token is not None and str(idx_token) != 'None':
-            return f"{value}[{idx}]"
-        return f"{value}.{idx}"
-
-    def _visit_for_definitions(self, node: Node, file_path: Path):
         """Visit AST to collect definitions."""
         if node is None:
             return
@@ -287,7 +260,7 @@ class WholeProgramAnalyzer:
                 self.analysis.registered_callbacks.add(name)
 
         elif isinstance(node.name, Index):
-            full_name = self._node_to_string(node.name)
+            full_name = node_to_string(node.name)
             line = self._get_line(node)
 
             self.analysis.definitions[full_name].append(SymbolDefinition(
@@ -317,7 +290,7 @@ class WholeProgramAnalyzer:
 
     def _define_method(self, node: Method, file_path: Path):
         """Handle Method definition."""
-        source = self._node_to_string(node.source)
+        source = node_to_string(node.source)
         method = node.name.id if isinstance(node.name, Name) else ""
         full_name = f"{source}:{method}"
         line = self._get_line(node)
@@ -365,7 +338,7 @@ class WholeProgramAnalyzer:
                             scope='global',
                         ))
             elif isinstance(target, Index):
-                full_name = self._node_to_string(target)
+                full_name = node_to_string(target)
                 line = self._get_line(node)
 
                 self.analysis.definitions[full_name].append(SymbolDefinition(
@@ -399,7 +372,7 @@ class WholeProgramAnalyzer:
 
     def _usage_call(self, node: Call, file_path: Path):
         """Handle Call usage."""
-        func_name = self._node_to_string(node.func)
+        func_name = node_to_string(node.func)
         line = self._get_line(node)
 
         if func_name:
@@ -411,8 +384,8 @@ class WholeProgramAnalyzer:
             ))
 
         if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
-            callback_name = self._node_to_string(node.args[0])
-            callback_func = self._node_to_string(node.args[1])
+            callback_name = node_to_string(node.args[0])
+            callback_func = node_to_string(node.args[1])
             if callback_name:
                 self.analysis.registered_callbacks.add(callback_name)
             if callback_func:
@@ -426,7 +399,7 @@ class WholeProgramAnalyzer:
 
     def _usage_invoke(self, node: Invoke, file_path: Path):
         """Handle Invoke usage."""
-        obj_name = self._node_to_string(node.source)
+        obj_name = node_to_string(node.source)
         line = self._get_line(node)
         if obj_name:
             self.analysis.usages[obj_name].append(SymbolUsage(
@@ -467,7 +440,7 @@ class WholeProgramAnalyzer:
 
     def _usage_index(self, node: Index, file_path: Path):
         """Handle Index usage."""
-        full_name = self._node_to_string(node)
+        full_name = node_to_string(node)
         line = self._get_line(node)
         if full_name:
             self.analysis.usages[full_name].append(SymbolUsage(

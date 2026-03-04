@@ -20,329 +20,25 @@ from luaparser.astnodes import (
     SemiColon, Comment,
 )
 from typing import List, Dict, Set, Optional, Tuple, Any
-from dataclasses import dataclass, field
 from pathlib import Path
 from collections import defaultdict
 import sys
 import io
 import re
 
-from models import Finding, detect_file_encoding
+from models import (
+    Finding, detect_file_encoding, Scope, CallInfo, AssignInfo,
+    ConcatInfo, NilSourceInfo, NilAccessInfo, DeadCodeInfo,
+    LocalVarInfo, PerFrameCallbackInfo, DistanceComparisonInfo,
+    VectorAllocationInfo
+)
 from utils import node_to_string, iter_children
-
-
-# Hot callbacks that run frequently
-HOT_CALLBACKS = frozenset({
-    'actor_on_update', 'actor_on_first_update',
-    'npc_on_update', 'monster_on_update',
-    'on_key_press', 'on_key_release', 'on_key_hold',
-    'actor_on_weapon_fired', 'actor_on_hud_animation_end',
-    'on_before_hit', 'on_hit',
-    'physic_object_on_hit_callback',
-    'npc_on_before_hit', 'monster_on_before_hit',
-    'npc_on_hit_callback', 'monster_on_hit_callback',
-    'actor_on_feel_touch',
-    'actor_on_item_take', 'actor_on_item_drop',
-    'actor_on_item_use',
-})
-
-# Per-frame callbacks detection
-PER_FRAME_CALLBACKS = frozenset({
-    'actor_on_update',
-    'npc_on_update',
-    'monster_on_update',
-    'physic_object_on_update',
-})
-
-# Bare globals that benefit from caching
-CACHEABLE_BARE_GLOBALS = frozenset({
-    'pairs', 'ipairs', 'next', 'type', 'tostring', 'tonumber',
-    'unpack', 'select', 'rawget', 'rawset',
-})
-
-# these are less beneficial to cache (error handling, output)
-BARE_GLOBALS_UNSAFE_TO_CACHE = frozenset({
-    'pcall', 'xpcall', 'error', 'assert', 'print',
-})
-
-# Module functions that benefit from caching
-CACHEABLE_MODULE_FUNCS = {
-    'math': frozenset({
-        'floor', 'ceil', 'abs', 'min', 'max', 'sqrt', 'sin', 'cos', 'tan',
-        'random', 'pow', 'log', 'exp', 'atan2', 'atan', 'asin', 'acos',
-        'deg', 'rad', 'fmod', 'modf', 'huge',
-    }),
-    'string': frozenset({
-        'find', 'sub', 'gsub', 'match', 'gmatch', 'format',
-        'lower', 'upper', 'len', 'rep', 'byte', 'char', 'reverse',
-    }),
-    'table': frozenset({
-        'insert', 'remove', 'concat', 'sort', 'getn', 'unpack',
-    }),
-    'bit': frozenset({
-        'band', 'bor', 'bxor', 'bnot', 'lshift', 'rshift', 'arshift', 'rol', 'ror',
-    }),
-}
-
-# Debug/logging function patterns
-DEBUG_FUNCTIONS = frozenset({
-    'print', 'printf', 'printe', 'printd', 'log',
-    'log1', 'log2', 'log3',
-    'DebugLog', 'debug_log', 'trace', 'dump',
-})
-
-# functions that have direct replacement patterns (not cached)
-DIRECT_REPLACEMENT_FUNCS = frozenset({
-    'table.insert', 'table.getn', 'string.len',
-})
-
-# Functions/properties that can return nil - calling methods on these without
-# nil checks can cause CTD (crash to desktop)
-# Format: full_name -> description of when it returns nil
-NIL_RETURNING_FUNCTIONS = {
-    # level functions
-    'level.object_by_id': 'object is offline or does not exist',
-    'level.get_target_obj': 'nothing under crosshair',
-    'level.get_target_element': 'nothing under crosshair',
-    'level.get_target_pos': 'nothing under crosshair',
-    'level.vertex_position': 'invalid vertex ID',
-    'level.get_view_entity': 'no view entity set',
-    
-    # alife functions
-    'alife': 'called from main menu or during loading',
-    'alife().object': 'object does not exist in simulation',
-    'alife():object': 'object does not exist in simulation',
-    'alife().story_object': 'no object with that story_id',
-    'alife():story_object': 'no object with that story_id',
-    'alife().actor': 'actor not spawned yet',
-    'alife():actor': 'actor not spawned yet',
-    
-    # game object methods that can return nil
-    ':parent': 'object has no parent (not in inventory)',
-    ':best_enemy': 'no enemy detected',
-    ':best_item': 'no item of interest found',
-    ':best_danger': 'no danger detected',
-    ':best_weapon': 'no weapon available',
-    ':best_cover': 'no cover available',
-    ':active_item': 'no weapon/item currently equipped',
-    ':active_detector': 'no detector currently active',
-    ':object': 'item not in inventory or index out of bounds',
-    ':get_enemy': 'no current enemy target',
-    ':get_corpse': 'no corpse being investigated',
-    ':get_current_outfit': 'no outfit equipped',
-    ':item_in_slot': 'slot is empty',
-    ':get_helicopter': 'not a helicopter or no helicopter',
-    ':get_car': 'not in a vehicle',
-    ':get_campfire': 'not a campfire zone',
-    ':get_artefact': 'not an artefact',
-    ':get_physics_shell': 'object has no physics shell',
-    ':spawn_ini': 'no spawn ini defined',
-    ':motivation_action_manager': 'not an NPC with action manager',
-    ':get_current_holder': 'not in a vehicle/turret',
-    ':get_old_holder': 'was not in a vehicle/turret',
-    ':memory_position': 'object never seen',
-    ':get_dest_enemy': 'no destination enemy',
-    ':bone_id': 'bone name does not exist',
-    ':bone_position': 'bone does not exist',
-    ':bone_direction': 'bone does not exist',
-    
-    # common patterns
-    'db.actor': 'called from main menu or during loading',
-    'db.storage': 'storage not initialized',  # db.storage[id] can be nil
-    
-    # story object helpers
-    'get_story_object': 'no object with that story_id',
-    'get_object_by_name': 'object not found or offline',
-}
-
-# Method patterns that indicate the variable is being nil-checked
-# These patterns mean the variable is safe to use after the check
-NIL_CHECK_PATTERNS = {
-    'if {var} then',
-    'if {var} and',
-    'if not {var} then return',
-    'if not {var} then return end',
-    'if {var} == nil then return',
-    'if {var} == nil then return end', 
-    'if {var} ~= nil then',
-    '{var} and {var}:',
-    '{var} and {var}.',
-}
-
-# Callback parameters that are guaranteed non-nil by the engine
-# Format: (callback_name, param_index) - 0-indexed
-SAFE_CALLBACK_PARAMS = {
-    'actor_on_item_take': {0},      # item
-    'actor_on_item_drop': {0},      # item
-    'actor_on_item_use': {0},       # item
-    'actor_on_trade': {0, 1},       # item, sell_buy  
-    'npc_on_death_callback': {0, 1}, # npc, killer
-    'monster_on_death_callback': {0, 1}, # monster, killer
-    'npc_on_hit_callback': {0},     # npc
-    'monster_on_hit_callback': {0}, # monster
-    'on_before_hit': {0, 1, 2},     # obj, shit, bone_id
-    'physic_object_on_hit_callback': {0}, # obj
-    'actor_on_before_death': {0, 1}, # who, flags
-    'save_state': {0},              # m_data
-    'load_state': {0},              # m_data
-}
-
-
-@dataclass
-class Scope:
-    """Represents a variable scope (function, loop, block)."""
-    name: str
-    start_line: int
-    end_line: int = -1
-    parent: Optional['Scope'] = None
-    scope_type: str = 'block'  # 'function', 'loop', 'block'
-    is_hot_callback: bool = False
-
-    # variables declared in this scope
-    locals: Set[str] = field(default_factory=set)
-
-    # cached globals in this scope
-    cached_globals: Set[str] = field(default_factory=set)
-
-    # function aliases: local_name -> canonical_name (e.g., "tinsert" -> "table.insert")
-    func_aliases: Dict[str, str] = field(default_factory=dict)
-
-    def __hash__(self):
-        # use object's actual id for hashing
-        return id(self)
-
-    def __eq__(self, other):
-        if isinstance(other, Scope):
-            return self is other
-        return False
-
-
-@dataclass
-class CallInfo:
-    """Information about a function call."""
-    full_name: str          # "table.insert", "db.actor", "pairs"
-    module: Optional[str]   # "table", "db", None
-    func: str               # "insert", "actor", "pairs"
-    args: List[Any]         # AST nodes of arguments
-    line: int
-    node: Node
-    scope: Scope
-    in_loop: bool = False
-    loop_depth: int = 0
-    parent_if_node: Optional[Node] = None  # which If statement contains this call
-    branch_index: int = -1  # 0=main if, 1=elseif[0], 2=elseif[1], etc., -1=else or not in if
-
-
-@dataclass
-class AssignInfo:
-    """Information about an assignment."""
-    target: str             # variable name
-    value_type: str         # 'call', 'index', 'concat', 'literal', 'other'
-    value_repr: str         # string representation
-    line: int
-    node: Node
-    scope: Scope
-    is_local: bool = False
-    in_loop: bool = False
-
-
-@dataclass
-class ConcatInfo:
-    """Information about string concatenation."""
-    target: Optional[str]   # variable being assigned to
-    left_var: Optional[str]  # left operand if it's a variable
-    line: int
-    scope: Scope
-    in_loop: bool = False
-    loop_depth: int = 0
-    loop_scope: Optional[Scope] = None  # the innermost loop scope
-    right_expr: Optional[str] = None    # string repr of right side of concat
-
-
-@dataclass
-class NilSourceInfo:
-    """Information about a variable assigned from a nil-returning function."""
-    var_name: str           # variable name
-    source_call: str        # the call that might return nil (e.g. "level.object_by_id(id)")
-    source_func: str        # just the function name (e.g. "level.object_by_id")
-    assign_line: int        # line where assignment happened
-    scope: Scope            # scope of the variable
-    is_local: bool          # whether it's a local variable
-    is_guarded: bool = False  # whether a nil check was found after assignment
-
-
-@dataclass 
-class NilAccessInfo:
-    """Information about accessing a potentially nil variable."""
-    var_name: str           # the variable being accessed
-    access_type: str        # 'method' or 'index'
-    access_call: str        # full call (e.g. "obj:section()")
-    access_line: int
-    nil_source: NilSourceInfo  # the nil source info
-    is_safe_to_fix: bool = False  # whether this can be auto-fixed
-
-
-@dataclass
-class DeadCodeInfo:
-    """Information about dead/unreachable code."""
-    dead_type: str          # 'after_return', 'after_break', 'if_false', 'while_false', 'unused_local_var', 'unused_local_func'
-    start_line: int
-    end_line: int
-    scope_name: str
-    description: str
-    is_safe_to_remove: bool = False  # True only for 100% safe cases
-    code_preview: str = ""
-    node: Optional[Node] = None
-
-
-@dataclass
-class LocalVarInfo:
-    """Information about a local variable for dead code analysis."""
-    name: str
-    assign_line: int
-    scope: Scope
-    is_read: bool = False       # has the variable been read?
-    is_function: bool = False   # is it a local function?
-    read_lines: List[int] = field(default_factory=list)
-    is_loop_var: bool = False   # is it a for loop variable?
-    is_param: bool = False      # is it a function parameter?
-
-
-@dataclass
-class PerFrameCallbackInfo:
-    """Information about a per-frame callback function for performance analysis."""
-    name: str
-    start_line: int
-    end_line: int
-    scope: Scope
-    # Collected during analysis pass
-    expensive_calls: List[CallInfo] = field(default_factory=list)
-    loop_count: int = 0
-    uncached_globals: List[str] = field(default_factory=list)
-
-
-@dataclass
-class DistanceComparisonInfo:
-    """Information about distance_to() used in comparison (can be optimized to distance_to_sqr())."""
-    line: int
-    source_obj: str          # the object calling distance_to (e.g., "pos", "actor:position()")
-    target_obj: str          # the argument to distance_to (e.g., "target_pos")
-    comparison_op: str       # '<', '<=', '>', '>='
-    threshold_value: float   # the numeric threshold (e.g., 10)
-    threshold_node: Node     # the AST node for the threshold (for replacement)
-    full_node: Node          # the full comparison node
-    invoke_node: Node        # the distance_to invoke node
-
-
-@dataclass
-class VectorAllocationInfo:
-    """Information about vector() allocation in a loop."""
-    line: int
-    call_node: Node
-    loop_depth: int
-    scope: Scope
-    in_per_frame_callback: bool = False
-
+from constants import (
+    HOT_CALLBACKS, PER_FRAME_CALLBACKS, CACHEABLE_BARE_GLOBALS,
+    BARE_GLOBALS_UNSAFE_TO_CACHE, CACHEABLE_MODULE_FUNCS,
+    DEBUG_FUNCTIONS, DIRECT_REPLACEMENT_FUNCS, NIL_RETURNING_FUNCTIONS,
+    NIL_CHECK_PATTERNS, SAFE_CALLBACK_PARAMS
+)
 
 class ASTAnalyzer:
     """
@@ -464,94 +160,6 @@ class ASTAnalyzer:
             return self.source_lines[line - 1].strip()
         return ""
 
-    def _node_to_string(self, node: Node) -> str:
-        """Convert an AST node to its string representation."""
-        if isinstance(node, Name):
-            return node.id
-        if isinstance(node, Number):
-            return str(node.n)
-        if isinstance(node, String):
-            return self._format_string(node)
-        if isinstance(node, (TrueExpr,)):
-            return "true"
-        if isinstance(node, (FalseExpr,)):
-            return "false"
-        if isinstance(node, (Nil,)):
-            return "nil"
-        if isinstance(node, Index):
-            return self._format_index(node)
-        if isinstance(node, (Call, Invoke)):
-            return self._format_call(node)
-        if isinstance(node, (ULengthOP, UMinusOp, ULNotOp, UBNotOp)):
-            return self._format_unary_op(node)
-        if isinstance(node, (Concat, OrLoOp, AndLoOp, AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp,
-                            EqToOp, NotEqToOp, LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp)):
-            return self._format_binary_op(node)
-        if isinstance(node, Table):
-            return "{...}"
-        return f"<{type(node).__name__}>"
-
-    def _format_string(self, node: String) -> str:
-        """Helper to format String nodes with proper escaping."""
-        s = node.s
-        if isinstance(s, bytes):
-            s = s.decode('utf-8', errors='replace')
-        # Escape special characters for Lua string literal
-        escaped = s.replace('\\', '\\\\')
-        escaped = escaped.replace('\a', '\\a').replace('\b', '\\b').replace('\f', '\\f')
-        escaped = escaped.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-        escaped = escaped.replace('\v', '\\v').replace('\0', '\\0')
-        if '"' in escaped and "'" not in escaped:
-            escaped = escaped.replace("'", "\\'")
-            return f"'{escaped}'"
-        escaped = escaped.replace('"', '\\"')
-        return f'"{escaped}"'
-
-    def _format_index(self, node: Index) -> str:
-        """Helper to format Index nodes."""
-        value = self._node_to_string(node.value)
-        idx = self._node_to_string(node.idx)
-        idx_token = getattr(node.idx, 'first_token', None)
-        if idx_token is not None and str(idx_token) != 'None':
-            return f"{value}[{idx}]"
-        return f"{value}.{idx}"
-
-    def _format_call(self, node: Node) -> str:
-        """Helper to format Call and Invoke nodes."""
-        if isinstance(node, Call):
-            func = self._node_to_string(node.func)
-            args = ", ".join(self._node_to_string(a) for a in node.args)
-            return f"{func}({args})"
-        if isinstance(node, Invoke):
-            source = self._node_to_string(node.source)
-            func = self._node_to_string(node.func)
-            args = ", ".join(self._node_to_string(a) for a in node.args)
-            return f"{source}:{func}({args})"
-        return ""
-
-    def _format_unary_op(self, node: Node) -> str:
-        """Helper to format unary operator nodes."""
-        operand = self._node_to_string(node.operand)
-        if isinstance(node, ULengthOP): return f"#{operand}"
-        if isinstance(node, UMinusOp): return f"-{operand}"
-        if isinstance(node, ULNotOp): return f"not {operand}"
-        if isinstance(node, UBNotOp): return f"~{operand}"
-        return ""
-
-    def _format_binary_op(self, node: Node) -> str:
-        """Helper to format binary operator nodes."""
-        left = self._node_to_string(node.left)
-        right = self._node_to_string(node.right)
-        ops = {
-            Concat: "..", OrLoOp: "or", AndLoOp: "and", AddOp: "+", SubOp: "-",
-            MultOp: "*", FloatDivOp: "/", ModOp: "%", ExpoOp: "^", EqToOp: "==",
-            NotEqToOp: "~=", LessThanOp: "<", GreaterThanOp: ">", LessOrEqThanOp: "<=",
-            GreaterOrEqThanOp: ">="
-        }
-        op_str = ops.get(type(node), "?")
-        if isinstance(node, (OrLoOp, AndLoOp)):
-            return f"({left} {op_str} {right})"
-        return f"{left} {op_str} {right}"
 
     def _get_call_name(self, node: Call) -> Tuple[Optional[str], str, str]:
         """Get module, function, and full name from a Call node."""
@@ -670,7 +278,7 @@ class ASTAnalyzer:
     def _visit_Function(self, node: Function):
         """Handle global function definition."""
         line = self._get_line(node)
-        func_name = self._node_to_string(node.name) if node.name else '<anon>'
+        func_name = node_to_string(node.name) if node.name else '<anon>'
 
         is_hot = func_name in HOT_CALLBACKS
         is_per_frame = func_name in PER_FRAME_CALLBACKS
@@ -750,9 +358,9 @@ class ASTAnalyzer:
 
         # get method name
         if isinstance(node.name, Index):
-            func_name = self._node_to_string(node.name)
+            func_name = node_to_string(node.name)
         else:
-            func_name = self._node_to_string(node.name) if node.name else '<method>'
+            func_name = node_to_string(node.name) if node.name else '<method>'
 
         is_hot = func_name in HOT_CALLBACKS
 
@@ -1025,13 +633,13 @@ class ASTAnalyzer:
         """Record an assignment for analysis."""
         if isinstance(value, Call):
             value_type = 'call'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
         elif isinstance(value, Index):
             value_type = 'index'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
         elif isinstance(value, Concat):
             value_type = 'concat'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
 
             # record concat info
             left_var = None
@@ -1039,7 +647,7 @@ class ASTAnalyzer:
                 left_var = value.left.id
             
             # get the right side expression
-            right_expr = self._node_to_string(value.right)
+            right_expr = node_to_string(value.right)
             
             # find innermost loop scope
             loop_scope = None
@@ -1064,10 +672,10 @@ class ASTAnalyzer:
             ))
         elif isinstance(value, (Number, String, TrueExpr, FalseExpr, Nil)):
             value_type = 'literal'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
         else:
             value_type = 'other'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
 
         self.assigns.append(AssignInfo(
             target=target,
@@ -1103,7 +711,7 @@ class ASTAnalyzer:
         
         # Check for index access - e.g., db.actor, alife():object(id)
         elif isinstance(value, Index):
-            full_name = self._node_to_string(value)
+            full_name = node_to_string(value)
             # check direct matches like db.actor
             if full_name in NIL_RETURNING_FUNCTIONS:
                 source_func = full_name
@@ -1328,7 +936,7 @@ class ASTAnalyzer:
             
             # Track RegisterScriptCallback for unused variable/function detection
             if full_name == 'RegisterScriptCallback' and len(node.args) >= 2:
-                callback_func = self._node_to_string(node.args[1])
+                callback_func = node_to_string(node.args[1])
                 if callback_func:
                     self.callback_registrations.add(callback_func)
             
@@ -1361,8 +969,8 @@ class ASTAnalyzer:
         line = self._get_line(node)
 
         # record as call
-        source = self._node_to_string(node.source)
-        func = node.func.id if isinstance(node.func, Name) else self._node_to_string(node.func)
+        source = node_to_string(node.source)
+        func = node.func.id if isinstance(node.func, Name) else node_to_string(node.func)
         full_name = f"{source}:{func}"
 
         self.calls.append(CallInfo(
@@ -1490,8 +1098,8 @@ class ASTAnalyzer:
         threshold_value = threshold_node.n
         
         # extract source and target
-        source_obj = self._node_to_string(invoke_node.source)
-        target_obj = self._node_to_string(invoke_node.args[0]) if invoke_node.args else ""
+        source_obj = node_to_string(invoke_node.source)
+        target_obj = node_to_string(invoke_node.args[0]) if invoke_node.args else ""
         
         self.distance_comparisons.append(DistanceComparisonInfo(
             line=self._get_line(node),
@@ -1585,7 +1193,7 @@ class ASTAnalyzer:
                             message=f'string.find("{pattern_text}") -> use plain=true for performance',
                             details={
                                 'pattern': pattern_text,
-                                'full_match': f'string.find({self._node_to_string(call.args[0])}, "{pattern_text}")',
+                                'full_match': f'string.find({node_to_string(call.args[0])}, "{pattern_text}")',
                                 'node': call.node,
                             },
                             source_line=self._get_source_line(call.line),
@@ -1595,7 +1203,7 @@ class ASTAnalyzer:
         """Find pairs() used in hot callbacks where ipairs() or numeric loops might be faster."""
         for call in self.calls:
             if call.full_name == 'pairs' and call.scope.is_hot_callback:
-                table_name = self._node_to_string(call.args[0]) if call.args else "table"
+                table_name = node_to_string(call.args[0]) if call.args else "table"
                 self.findings.append(Finding(
                     pattern_name='pairs_on_array',
                     severity='YELLOW',
@@ -1612,7 +1220,7 @@ class ASTAnalyzer:
         """Find ipairs() used in hot callbacks where numeric loops are faster."""
         for call in self.calls:
             if call.full_name == 'ipairs' and call.scope.is_hot_callback:
-                table_name = self._node_to_string(call.args[0]) if call.args else "table"
+                table_name = node_to_string(call.args[0]) if call.args else "table"
                 self.findings.append(Finding(
                     pattern_name='ipairs_hot_loop',
                     severity='YELLOW',
@@ -1633,8 +1241,8 @@ class ASTAnalyzer:
                 arg2 = call.args[1]
 
                 if self._is_simple_expr(arg1) and self._is_simple_expr(arg2):
-                    a_str = self._node_to_string(arg1)
-                    b_str = self._node_to_string(arg2)
+                    a_str = node_to_string(arg1)
+                    b_str = node_to_string(arg2)
                     op = '<' if call.full_name == 'math.min' else '>'
 
                     self.findings.append(Finding(
@@ -1658,7 +1266,7 @@ class ASTAnalyzer:
             if call.full_name == 'tostring' and len(call.args) == 1:
                 arg = call.args[0]
                 if isinstance(arg, String):
-                    s_val = self._node_to_string(arg)
+                    s_val = node_to_string(arg)
                     self.findings.append(Finding(
                         pattern_name='redundant_tostring',
                         severity='GREEN',
@@ -1692,8 +1300,8 @@ class ASTAnalyzer:
             if call.full_name == 'table.insert':
                 if len(call.args) == 2:
                     # 2-arg form: table.insert(t, v)
-                    table_name = self._node_to_string(call.args[0])
-                    value = self._node_to_string(call.args[1])
+                    table_name = node_to_string(call.args[0])
+                    value = node_to_string(call.args[1])
 
                     self.findings.append(Finding(
                         pattern_name='table_insert_append',
@@ -1712,7 +1320,7 @@ class ASTAnalyzer:
                     # 3-arg form: table.insert(t, pos, v)
                     pos_node = call.args[1]
                     if isinstance(pos_node, Number) and pos_node.n == 1:
-                        table_name = self._node_to_string(call.args[0])
+                        table_name = node_to_string(call.args[0])
                         self.findings.append(Finding(
                             pattern_name='table_insert_front',
                             severity='YELLOW',
@@ -1742,7 +1350,7 @@ class ASTAnalyzer:
                 # Severity YELLOW if potentially unsafe, GREEN if standalone
                 severity = 'GREEN' if is_standalone else 'YELLOW'
 
-                table_name = self._node_to_string(call.args[0])
+                table_name = node_to_string(call.args[0])
                 self.findings.append(Finding(
                     pattern_name='table_remove_last',
                     severity=severity,
@@ -1761,7 +1369,7 @@ class ASTAnalyzer:
         """Find deprecated functions: table.getn, string.len."""
         for call in self.calls:
             if call.full_name == 'table.getn' and len(call.args) == 1:
-                arg = self._node_to_string(call.args[0])
+                arg = node_to_string(call.args[0])
                 self.findings.append(Finding(
                     pattern_name='table_getn',
                     severity='GREEN',
@@ -1776,7 +1384,7 @@ class ASTAnalyzer:
                 ))
 
             elif call.full_name == 'string.len' and len(call.args) == 1:
-                arg = self._node_to_string(call.args[0])
+                arg = node_to_string(call.args[0])
                 self.findings.append(Finding(
                     pattern_name='string_len',
                     severity='GREEN',
@@ -1794,7 +1402,7 @@ class ASTAnalyzer:
         """Find math.pow that can be simplified."""
         for call in self.calls:
             if call.full_name == 'math.pow' and len(call.args) == 2:
-                base = self._node_to_string(call.args[0])
+                base = node_to_string(call.args[0])
                 exp_node = call.args[1]
 
                 # check for simple cases
@@ -2294,11 +1902,11 @@ class ASTAnalyzer:
     def _get_func_name(self, node: Node) -> str:
         """Get function name from function node."""
         if isinstance(node, Function):
-            return self._node_to_string(node.name) if node.name else '<anon>'
+            return node_to_string(node.name) if node.name else '<anon>'
         elif isinstance(node, LocalFunction):
             return node.name.id if isinstance(node.name, Name) else '<anon>'
         elif isinstance(node, Method):
-            source = self._node_to_string(node.source)
+            source = node_to_string(node.source)
             method = node.name.id if isinstance(node.name, Name) else ""
             return f"{source}:{method}"
         return '<unknown>'
