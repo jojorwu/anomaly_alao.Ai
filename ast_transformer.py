@@ -175,9 +175,53 @@ class ASTTransformer:
         elif pattern == 'table_remove_last':
             if finding.severity == 'GREEN':
                 self._edit_table_remove_last(finding)
+        elif pattern == 'redundant_boolean_comp':
+            self._edit_redundant_boolean_comp(finding)
 
 
     # Edit methods using AST positions
+
+    def _edit_redundant_boolean_comp(self, finding: Finding):
+        """Convert x == true to x, x == false to not x, etc."""
+        node = finding.details.get('full_node')
+        target_node = finding.details.get('target_node')
+        bool_val = finding.details.get('bool_val')
+        op = finding.details.get('op')
+
+        if not node or not target_node:
+            return
+
+        start, end = self._get_node_span(node)
+        target_start, target_end = self._get_node_span(target_node)
+
+        if start is None or target_start is None:
+            return
+
+        target_str = self.source[target_start:target_end]
+
+        # Simplify logic:
+        # (x == true)  -> x
+        # (x ~= true)  -> not x
+        # (x == false) -> not x
+        # (x ~= false) -> x
+
+        if (op == '==' and bool_val is True) or (op == '~=' and bool_val is False):
+            replacement = target_str
+        else:
+            # check if target_str needs parens for 'not'
+            # if it's just a Name or Index or Call, it's safe
+            # if it contains operators, wrap it
+            from luaparser.astnodes import Name, Index, Call, Invoke
+            if isinstance(target_node, (Name, Index, Call, Invoke)):
+                replacement = f'not {target_str}'
+            else:
+                replacement = f'not ({target_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
 
     def _edit_table_remove_last(self, finding: Finding):
         """Convert table.remove(t) to t[#t] = nil."""
@@ -373,7 +417,7 @@ class ASTTransformer:
             return
 
         if pow_type == 'sqrt':
-            replacement = f'{base}^0.5'
+            replacement = f'math.sqrt({base})'
         elif pow_type == 'power' and isinstance(exp, int):
             replacement = '*'.join([base] * exp)
         else:

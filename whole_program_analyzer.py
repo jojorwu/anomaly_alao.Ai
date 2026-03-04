@@ -222,7 +222,8 @@ class WholeProgramAnalyzer:
                         except ValueError:
                             pass
         return 0
-    
+
+    def _visit_for_definitions(self, node: Optional[Node], file_path: Path):
         """Visit AST to collect definitions."""
         if node is None:
             return

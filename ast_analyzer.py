@@ -30,14 +30,14 @@ from models import (
     Finding, detect_file_encoding, Scope, CallInfo, AssignInfo,
     ConcatInfo, NilSourceInfo, NilAccessInfo, DeadCodeInfo,
     LocalVarInfo, PerFrameCallbackInfo, DistanceComparisonInfo,
-    VectorAllocationInfo
+    VectorAllocationInfo, Assignment
 )
 from utils import node_to_string, iter_children
 from constants import (
     HOT_CALLBACKS, PER_FRAME_CALLBACKS, CACHEABLE_BARE_GLOBALS,
     BARE_GLOBALS_UNSAFE_TO_CACHE, CACHEABLE_MODULE_FUNCS,
     DEBUG_FUNCTIONS, DIRECT_REPLACEMENT_FUNCS, NIL_RETURNING_FUNCTIONS,
-    NIL_CHECK_PATTERNS, SAFE_CALLBACK_PARAMS
+    NIL_CHECK_PATTERNS, SAFE_CALLBACK_PARAMS, LUAJIT_NYI_FUNCS
 )
 
 class ASTAnalyzer:
@@ -58,6 +58,10 @@ class ASTAnalyzer:
     def reset(self):
         """Reset analyzer state for reuse."""
         self.findings: List[Finding] = []
+        self.comparisons: List[Tuple[Node, int]] = []
+        self.exposures: List[Tuple[Node, int]] = []
+        self.index_accesses: List[Tuple[Node, int, Scope, bool]] = []
+        self.active_assignments: Dict[Tuple[int, str], Any] = {}
         self.scopes: List[Scope] = []
         self.current_scope: Optional[Scope] = None
         self.global_scope: Optional[Scope] = None
@@ -226,6 +230,16 @@ class ASTAnalyzer:
             scope = scope.parent
         return None
 
+    def _find_local_key(self, name: str) -> Optional[Tuple[int, str]]:
+        """Find the key (scope_id, name) for a local variable in scope chain."""
+        scope = self.current_scope
+        while scope:
+            key = (id(scope), name)
+            if key in self.local_vars:
+                return key
+            scope = scope.parent
+        return None
+
     def _register_local(self, var_name: str, line: int, is_param: bool = False, is_loop_var: bool = False):
         """Centralized helper to register a local variable or parameter."""
         if not self.current_scope:
@@ -236,7 +250,7 @@ class ASTAnalyzer:
         # Track for diagnostics (shadowing and unused detection)
         if not var_name.startswith('_'):
             key = (id(self.current_scope), var_name)
-            self.local_vars[key] = LocalVarInfo(
+            info = LocalVarInfo(
                 name=var_name,
                 assign_line=line,
                 scope=self.current_scope,
@@ -244,7 +258,13 @@ class ASTAnalyzer:
                 is_function=False,
                 is_loop_var=is_loop_var,
                 is_param=is_param,
+                assignments=[]
             )
+            # Initial assignment (declaration)
+            assign = Assignment(line=line, node=None)
+            info.assignments.append(assign)
+            self.active_assignments[key] = assign
+            self.local_vars[key] = info
 
     def _visit(self, node: Node):
         """Visit a node and dispatch to specific handler."""
@@ -631,6 +651,21 @@ class ASTAnalyzer:
 
     def _record_assignment(self, target: str, value: Node, line: int, is_local: bool):
         """Record an assignment for analysis."""
+        # Track dead assignments
+        key = self._find_local_key(target)
+        if key:
+            # If there was a previous assignment that was never used
+            if key in self.active_assignments:
+                prev_assign = self.active_assignments[key]
+                if not prev_assign.is_used and not self.loop_depth > 0:
+                    # Ignore assignments in loops for now as they are complex
+                    # (might be used in next iteration)
+                    pass
+
+            new_assign = Assignment(line=line, node=value)
+            self.local_vars[key].assignments.append(new_assign)
+            self.active_assignments[key] = new_assign
+
         if isinstance(value, Call):
             value_type = 'call'
             value_repr = node_to_string(value)
@@ -1124,6 +1159,11 @@ class ASTAnalyzer:
         # Only count as read if NOT an assignment target
         if id(node) not in self.assignment_target_ids:
             var_name = node.id
+            # Mark active assignment as used
+            key = self._find_local_key(var_name)
+            if key and key in self.active_assignments:
+                self.active_assignments[key].is_used = True
+
             # Find which scope this variable belongs to (walk up scope chain)
             scope = self.current_scope
             while scope:
@@ -1173,6 +1213,9 @@ class ASTAnalyzer:
         self._analyze_ipairs_hot_loop()
         self._analyze_math_min_max()
         self._analyze_redundant_tostring()
+        self._analyze_slow_loop_funcs()
+        self._analyze_luajit_nyi()
+        self._analyze_redundant_boolean_comp()
 
     def _analyze_plain_string_find(self):
         """Find string.find() with plain strings that can use plain=true flag."""
@@ -1258,6 +1301,97 @@ class ASTAnalyzer:
                             'node': call.node,
                         },
                         source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_slow_loop_funcs(self):
+        """Find potentially slow operations in hot loops."""
+        for call in self.calls:
+            if call.in_loop and call.full_name in ('table.insert', 'table.remove'):
+                is_slow = False
+                if call.full_name == 'table.insert' and len(call.args) == 3:
+                    is_slow = True
+                elif call.full_name == 'table.remove' and len(call.args) >= 2:
+                    is_slow = True
+
+                if is_slow:
+                    severity = 'RED' if call.scope.is_hot_callback else 'YELLOW'
+                    self.findings.append(Finding(
+                        pattern_name='slow_loop_operation',
+                        severity=severity,
+                        line_num=call.line,
+                        message=f'Potentially slow operation {call.full_name}() in loop (O(N))',
+                        details={'func': call.full_name},
+                        source_line=self._get_source_line(call.line)
+                    ))
+
+    def _analyze_luajit_nyi(self):
+        """Find LuaJIT NYI functions in hot callbacks or loops."""
+        for call in self.calls:
+            is_nyi = False
+            if call.full_name in LUAJIT_NYI_FUNCS:
+                # Some functions are only NYI with specific arguments
+                if call.full_name == 'table.insert' and len(call.args) < 3:
+                    is_nyi = False # table.insert(t, v) is NOT NYI
+                elif call.full_name == 'table.remove' and len(call.args) < 2:
+                    is_nyi = False # table.remove(t) is NOT NYI
+                else:
+                    is_nyi = True
+
+            if is_nyi:
+                is_hot = call.scope.is_hot_callback
+                in_loop = call.in_loop
+
+                if is_hot or in_loop:
+                    severity = 'RED' if is_hot and in_loop else 'YELLOW'
+                    context = "hot callback" if is_hot else "loop"
+                    if is_hot and in_loop: context = "hot loop"
+
+                    self.findings.append(Finding(
+                        pattern_name='luajit_nyi_warning',
+                        severity=severity,
+                        line_num=call.line,
+                        message=f'LuaJIT NYI: {call.full_name}() in {context} aborts JIT compilation',
+                        details={'func': call.full_name},
+                        source_line=self._get_source_line(call.line)
+                    ))
+
+    def _analyze_redundant_boolean_comp(self):
+        """Find redundant boolean comparisons like x == true or x == false."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                left = node.left
+                right = node.right
+
+                target_node = None
+                bool_val = None
+
+                if isinstance(right, (TrueExpr, FalseExpr)):
+                    target_node = left
+                    bool_val = isinstance(right, TrueExpr)
+                elif isinstance(left, (TrueExpr, FalseExpr)):
+                    target_node = right
+                    bool_val = isinstance(left, TrueExpr)
+
+                if target_node:
+                    op = '==' if isinstance(node, EqToOp) else '~='
+                    target_str = node_to_string(target_node)
+
+                    # Result is true if (val == true) or (val ~= false)
+                    # Result is false if (val == false) or (val ~= true)
+                    # We want to simplify this.
+
+                    self.findings.append(Finding(
+                        pattern_name='redundant_boolean_comp',
+                        severity='GREEN',
+                        line_num=self._get_line(node),
+                        message=f'Redundant boolean comparison: {target_str} {op} {str(bool_val).lower()}',
+                        details={
+                            'target_node': target_node,
+                            'bool_val': bool_val,
+                            'op': op,
+                            'full_node': node
+                        },
+                        source_line=self._get_source_line(self._get_line(node))
                     ))
 
     def _analyze_redundant_tostring(self):
@@ -1415,7 +1549,7 @@ class ASTAnalyzer:
                             pattern_name='math_pow_simple',
                             severity='GREEN',
                             line_num=call.line,
-                            message=f'{full_match} -> {base}^0.5',
+                            message=f'{full_match} -> math.sqrt({base})',
                             details={
                                 'base': base,
                                 'exponent': exp,
@@ -1781,6 +1915,28 @@ class ASTAnalyzer:
         # Phase 2: Warning patterns (not auto-fixable)
         self._detect_unused_local_vars()
         self._detect_unused_local_funcs()
+        self._detect_dead_assignments()
+
+    def _detect_dead_assignments(self):
+        """Detect variables assigned a value that is never read."""
+        for (scope_id, name), info in self.local_vars.items():
+            if info.is_loop_var:
+                continue
+
+            for assign in info.assignments:
+                if not assign.is_used and assign.node is not None:
+                    # node is None for initial declaration "local x"
+                    self.findings.append(Finding(
+                        pattern_name='dead_assignment',
+                        severity='YELLOW',
+                        line_num=assign.line,
+                        message=f'Value assigned to "{name}" is never read',
+                        details={
+                            'name': name,
+                            'line': assign.line,
+                        },
+                        source_line=self._get_source_line(assign.line),
+                    ))
 
     def _detect_code_after_return(self):
         """Detect unreachable code after unconditional return statements."""

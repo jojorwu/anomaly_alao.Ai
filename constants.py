@@ -155,3 +155,36 @@ SAFE_CALLBACK_PARAMS: Dict[str, Set[int]] = {
     'save_state': {0},              # m_data
     'load_state': {0},              # m_data
 }
+
+# LuaJIT NYI (Not Yet Implemented) functions that abort JIT compilation
+# These should be avoided in hot paths (HOT_CALLBACKS)
+LUAJIT_NYI_FUNCS: Set[str] = frozenset({
+    'pairs',           # NYI in some versions, prefers next or numeric loop
+    'string.format',   # NYI (very common)
+    'string.gsub',     # NYI
+    'string.match',    # NYI
+    'string.gmatch',   # NYI
+    'string.dump',     # NYI
+    'table.concat',    # NYI
+    'table.insert',    # NYI (when used with 3 args)
+    'table.remove',    # NYI (when used with 2 args)
+    'table.sort',      # NYI
+    'unpack',          # NYI
+    'pcall',           # NYI
+    'xpcall',          # NYI
+    'load',            # NYI
+    'loadstring',      # NYI
+    'next',            # NYI in some contexts
+    'math.sinh',       # NYI
+    'math.cosh',       # NYI
+    'math.tanh',       # NYI
+    'math.log10',      # NYI
+    'io.open', 'io.read', 'io.write', 'io.close', 'io.flush', 'io.lines',
+    'os.execute', 'os.rename', 'os.remove', 'os.getenv', 'os.date', 'os.time', 'os.clock',
+})
+
+# Functions that are O(N) and should be avoided in loops
+SLOW_LOOP_FUNCS: Set[str] = frozenset({
+    'table.insert', # with 3 args (insert at index)
+    'table.remove', # with 2 args (remove at index)
+})

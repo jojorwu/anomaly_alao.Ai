@@ -153,6 +153,14 @@ class DeadCodeInfo:
 
 
 @dataclass
+class Assignment:
+    """Tracks a single assignment to a variable."""
+    line: int
+    node: Node
+    is_used: bool = False
+
+
+@dataclass
 class LocalVarInfo:
     """Information about a local variable for dead code analysis."""
     name: str
@@ -163,6 +171,7 @@ class LocalVarInfo:
     read_lines: List[int] = field(default_factory=list)
     is_loop_var: bool = False   # is it a for loop variable?
     is_param: bool = False      # is it a function parameter?
+    assignments: List[Assignment] = field(default_factory=list)
 
 
 @dataclass
