@@ -193,7 +193,8 @@ def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False)
         return None
 
 
-def main():
+def parse_args():
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Anomaly Lua Auto Optimizer (ALAO)"
     )
@@ -348,7 +349,10 @@ def main():
     if args.cache_threshold < 2:
         print(f"Warning: Invalid cache threshold ({args.cache_threshold}), using minimum value of 2")
         args.cache_threshold = 2
+    return args
 
+def get_files_to_process(args):
+    """Discover and filter mods/scripts based on arguments."""
     # try get path interactively if not provided
     if args.path:
         # clean path: strip quotes, trailing slashes, and fix common issues
@@ -458,6 +462,11 @@ def main():
         print(f"Found {total_scripts} script files (direct mode)\n")
     else:
         print(f"Found {len(mods)} mods with {total_scripts} script files\n")
+    return mods_path, mods
+
+def main():
+    args = parse_args()
+    mods_path, mods = get_files_to_process(args)
 
     # handle backup operations (only ALAO-created .alao-bak files)
     if args.list_backups or args.revert or args.clean_backups:

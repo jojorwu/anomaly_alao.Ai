@@ -460,130 +460,90 @@ class ASTAnalyzer:
         """Convert an AST node to its string representation."""
         if isinstance(node, Name):
             return node.id
-        elif isinstance(node, Number):
+        if isinstance(node, Number):
             return str(node.n)
-        elif isinstance(node, String):
-            s = node.s
-            if isinstance(s, bytes):
-                s = s.decode('utf-8', errors='replace')
-            # Escape special characters for Lua string literal
-            # Must re-escape because luaparser stores decoded values
-            escaped = s.replace('\\', '\\\\')  # backslash first!
-            escaped = escaped.replace('\a', '\\a')  # bell
-            escaped = escaped.replace('\b', '\\b')  # backspace
-            escaped = escaped.replace('\f', '\\f')  # form feed
-            escaped = escaped.replace('\n', '\\n')  # newline
-            escaped = escaped.replace('\r', '\\r')  # carriage return
-            escaped = escaped.replace('\t', '\\t')  # tab
-            escaped = escaped.replace('\v', '\\v')  # vertical tab
-            escaped = escaped.replace('\0', '\\0')  # null
-            # Choose quote style and escape the chosen quote
-            if '"' in escaped and "'" not in escaped:
-                escaped = escaped.replace("'", "\\'")
-                return f"'{escaped}'"
-            else:
-                escaped = escaped.replace('"', '\\"')
-                return f'"{escaped}"'
-        elif isinstance(node, (TrueExpr,)):
+        if isinstance(node, String):
+            return self._format_string(node)
+        if isinstance(node, (TrueExpr,)):
             return "true"
-        elif isinstance(node, (FalseExpr,)):
+        if isinstance(node, (FalseExpr,)):
             return "false"
-        elif isinstance(node, (Nil,)):
+        if isinstance(node, (Nil,)):
             return "nil"
-        elif isinstance(node, Index):
-            value = self._node_to_string(node.value)
-            idx = self._node_to_string(node.idx)
-            # determine bracket vs dot notation:
-            # - dot notation (t.field): idx.first_token is None
-            # - bracket notation (t[key]): idx.first_token has a value
-            idx_token = getattr(node.idx, 'first_token', None)
-            if idx_token is not None and str(idx_token) != 'None':
-                # bracket notation: t[key]
-                return f"{value}[{idx}]"
-            else:
-                # dot notation: t.field
-                return f"{value}.{idx}"
-        elif isinstance(node, Call):
+        if isinstance(node, Index):
+            return self._format_index(node)
+        if isinstance(node, (Call, Invoke)):
+            return self._format_call(node)
+        if isinstance(node, (ULengthOP, UMinusOp, ULNotOp, UBNotOp)):
+            return self._format_unary_op(node)
+        if isinstance(node, (Concat, OrLoOp, AndLoOp, AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp,
+                            EqToOp, NotEqToOp, LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp)):
+            return self._format_binary_op(node)
+        if isinstance(node, Table):
+            return "{...}"
+        return f"<{type(node).__name__}>"
+
+    def _format_string(self, node: String) -> str:
+        """Helper to format String nodes with proper escaping."""
+        s = node.s
+        if isinstance(s, bytes):
+            s = s.decode('utf-8', errors='replace')
+        # Escape special characters for Lua string literal
+        escaped = s.replace('\\', '\\\\')
+        escaped = escaped.replace('\a', '\\a').replace('\b', '\\b').replace('\f', '\\f')
+        escaped = escaped.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        escaped = escaped.replace('\v', '\\v').replace('\0', '\\0')
+        if '"' in escaped and "'" not in escaped:
+            escaped = escaped.replace("'", "\\'")
+            return f"'{escaped}'"
+        escaped = escaped.replace('"', '\\"')
+        return f'"{escaped}"'
+
+    def _format_index(self, node: Index) -> str:
+        """Helper to format Index nodes."""
+        value = self._node_to_string(node.value)
+        idx = self._node_to_string(node.idx)
+        idx_token = getattr(node.idx, 'first_token', None)
+        if idx_token is not None and str(idx_token) != 'None':
+            return f"{value}[{idx}]"
+        return f"{value}.{idx}"
+
+    def _format_call(self, node: Node) -> str:
+        """Helper to format Call and Invoke nodes."""
+        if isinstance(node, Call):
             func = self._node_to_string(node.func)
             args = ", ".join(self._node_to_string(a) for a in node.args)
             return f"{func}({args})"
-        elif isinstance(node, Invoke):
+        if isinstance(node, Invoke):
             source = self._node_to_string(node.source)
             func = self._node_to_string(node.func)
             args = ", ".join(self._node_to_string(a) for a in node.args)
             return f"{source}:{func}({args})"
-        elif isinstance(node, ULengthOP):
-            return f"#{self._node_to_string(node.operand)}"
-        elif isinstance(node, UMinusOp):
-            return f"-{self._node_to_string(node.operand)}"
-        elif isinstance(node, ULNotOp):
-            return f"not {self._node_to_string(node.operand)}"
-        elif isinstance(node, UBNotOp):
-            return f"~{self._node_to_string(node.operand)}"
-        elif isinstance(node, Concat):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} .. {right}"
-        elif isinstance(node, OrLoOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"({left} or {right})"
-        elif isinstance(node, AndLoOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"({left} and {right})"
-        elif isinstance(node, AddOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} + {right}"
-        elif isinstance(node, SubOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} - {right}"
-        elif isinstance(node, MultOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} * {right}"
-        elif isinstance(node, FloatDivOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} / {right}"
-        elif isinstance(node, ModOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} % {right}"
-        elif isinstance(node, ExpoOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} ^ {right}"
-        elif isinstance(node, EqToOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} == {right}"
-        elif isinstance(node, NotEqToOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} ~= {right}"
-        elif isinstance(node, LessThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} < {right}"
-        elif isinstance(node, GreaterThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} > {right}"
-        elif isinstance(node, LessOrEqThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} <= {right}"
-        elif isinstance(node, GreaterOrEqThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} >= {right}"
-        elif isinstance(node, Table):
-            return "{...}"
-        else:
-            return f"<{type(node).__name__}>"
+        return ""
+
+    def _format_unary_op(self, node: Node) -> str:
+        """Helper to format unary operator nodes."""
+        operand = self._node_to_string(node.operand)
+        if isinstance(node, ULengthOP): return f"#{operand}"
+        if isinstance(node, UMinusOp): return f"-{operand}"
+        if isinstance(node, ULNotOp): return f"not {operand}"
+        if isinstance(node, UBNotOp): return f"~{operand}"
+        return ""
+
+    def _format_binary_op(self, node: Node) -> str:
+        """Helper to format binary operator nodes."""
+        left = self._node_to_string(node.left)
+        right = self._node_to_string(node.right)
+        ops = {
+            Concat: "..", OrLoOp: "or", AndLoOp: "and", AddOp: "+", SubOp: "-",
+            MultOp: "*", FloatDivOp: "/", ModOp: "%", ExpoOp: "^", EqToOp: "==",
+            NotEqToOp: "~=", LessThanOp: "<", GreaterThanOp: ">", LessOrEqThanOp: "<=",
+            GreaterOrEqThanOp: ">="
+        }
+        op_str = ops.get(type(node), "?")
+        if isinstance(node, (OrLoOp, AndLoOp)):
+            return f"({left} {op_str} {right})"
+        return f"{left} {op_str} {right}"
 
     def _get_call_name(self, node: Call) -> Tuple[Optional[str], str, str]:
         """Get module, function, and full name from a Call node."""
@@ -1506,33 +1466,33 @@ class ASTAnalyzer:
             self._visit(val)
 
     # binary ops
-    def _visit_AddOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_SubOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_MultOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_FloatDivOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_ModOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_ExpoOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_AndLoOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_OrLoOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_EqToOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_NotEqToOp(self, node): self._visit(node.left); self._visit(node.right)
+    def _visit_AddOp(self, node: AddOp): self._visit(node.left); self._visit(node.right)
+    def _visit_SubOp(self, node: SubOp): self._visit(node.left); self._visit(node.right)
+    def _visit_MultOp(self, node: MultOp): self._visit(node.left); self._visit(node.right)
+    def _visit_FloatDivOp(self, node: FloatDivOp): self._visit(node.left); self._visit(node.right)
+    def _visit_ModOp(self, node: ModOp): self._visit(node.left); self._visit(node.right)
+    def _visit_ExpoOp(self, node: ExpoOp): self._visit(node.left); self._visit(node.right)
+    def _visit_AndLoOp(self, node: AndLoOp): self._visit(node.left); self._visit(node.right)
+    def _visit_OrLoOp(self, node: OrLoOp): self._visit(node.left); self._visit(node.right)
+    def _visit_EqToOp(self, node: EqToOp): self._visit(node.left); self._visit(node.right)
+    def _visit_NotEqToOp(self, node: NotEqToOp): self._visit(node.left); self._visit(node.right)
     
-    def _visit_LessThanOp(self, node):
+    def _visit_LessThanOp(self, node: LessThanOp):
         self._check_distance_comparison(node, '<')
         self._visit(node.left)
         self._visit(node.right)
-    
-    def _visit_GreaterThanOp(self, node):
+
+    def _visit_GreaterThanOp(self, node: GreaterThanOp):
         self._check_distance_comparison(node, '>')
         self._visit(node.left)
         self._visit(node.right)
-    
-    def _visit_LessOrEqThanOp(self, node):
+
+    def _visit_LessOrEqThanOp(self, node: LessOrEqThanOp):
         self._check_distance_comparison(node, '<=')
         self._visit(node.left)
         self._visit(node.right)
-    
-    def _visit_GreaterOrEqThanOp(self, node):
+
+    def _visit_GreaterOrEqThanOp(self, node: GreaterOrEqThanOp):
         self._check_distance_comparison(node, '>=')
         self._visit(node.left)
         self._visit(node.right)
@@ -1584,13 +1544,13 @@ class ASTAnalyzer:
         ))
 
     # unary ops
-    def _visit_UMinusOp(self, node): self._visit(node.operand)
-    def _visit_UBNotOp(self, node): self._visit(node.operand)
-    def _visit_ULNotOp(self, node): self._visit(node.operand)
-    def _visit_ULengthOP(self, node): self._visit(node.operand)
+    def _visit_UMinusOp(self, node: UMinusOp): self._visit(node.operand)
+    def _visit_UBNotOp(self, node: UBNotOp): self._visit(node.operand)
+    def _visit_ULNotOp(self, node: ULNotOp): self._visit(node.operand)
+    def _visit_ULengthOP(self, node: ULengthOP): self._visit(node.operand)
 
     # terminal nodes - no children
-    def _visit_Name(self, node):
+    def _visit_Name(self, node: Name):
         """Handle Name node - track variable reads for unused detection."""
         # Only count as read if NOT an assignment target
         if id(node) not in self.assignment_target_ids:

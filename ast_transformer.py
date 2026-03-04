@@ -196,104 +196,66 @@ class ASTTransformer:
             replacement=replacement,
         ))
 
-    def _extract_table_insert_value(self, call_text: str, table_name: str) -> Optional[str]:
-        """Extract the value argument from table.insert(t, v) call text.
-        
-        Handles:
-        - Regular strings: "..." and '...'
-        - Long strings: [[...]] and [=[...]=] (with any number of =)
-        - Nested parentheses, braces, and brackets
-        """
-        # find opening paren
-        paren_start = call_text.find('(')
-        if paren_start == -1:
-            return None
-
-        # find comma after table name
-        comma_pos = call_text.find(',', paren_start)
-        if comma_pos == -1:
-            return None
-
-        value_start = comma_pos + 1
-
-        # find matching closing paren with proper tracking
+    def _find_matching_paren(self, text: str, start_pos: int) -> int:
+        """Find the index of the matching closing parenthesis in Lua code."""
         depth = 1
-        brace_depth = 0
         in_string = False
         string_char = None
         in_long_string = False
-        long_string_level = 0  # number of = signs in long string delimiter
-        i = paren_start + 1
+        long_string_level = 0
+        i = start_pos + 1
 
-        while i < len(call_text) and depth > 0:
-            c = call_text[i]
-
+        while i < len(text) and depth > 0:
+            c = text[i]
             if in_long_string:
-                # Look for closing long string delimiter: ]=*]
                 if c == ']':
-                    # Check if this is the closing delimiter
-                    # Need to match the same number of = signs
-                    if i + 1 + long_string_level < len(call_text):
-                        expected_close = ']' + '=' * long_string_level + ']'
-                        if call_text[i:i + len(expected_close)] == expected_close:
-                            in_long_string = False
-                            i += len(expected_close)
-                            continue
+                    expected_close = ']' + '=' * long_string_level + ']'
+                    if text[i:i + len(expected_close)] == expected_close:
+                        in_long_string = False
+                        i += len(expected_close)
+                        continue
                 i += 1
                 continue
-            
             if in_string:
-                # Check for escaped quote or end of string
                 if c == string_char:
-                    # Check if escaped (count preceding backslashes)
                     num_backslashes = 0
                     j = i - 1
-                    while j >= 0 and call_text[j] == '\\':
+                    while j >= 0 and text[j] == '\\':
                         num_backslashes += 1
                         j -= 1
-                    # If even number of backslashes, quote is not escaped
                     if num_backslashes % 2 == 0:
                         in_string = False
                 i += 1
                 continue
-
-            # Not in any string - check what we have
             if c in ('"', "'"):
                 in_string = True
                 string_char = c
             elif c == '[':
-                # Check for long string start: [=*[
-                # Count = signs
                 eq_count = 0
                 j = i + 1
-                while j < len(call_text) and call_text[j] == '=':
+                while j < len(text) and text[j] == '=':
                     eq_count += 1
                     j += 1
-                # Check if followed by [
-                if j < len(call_text) and call_text[j] == '[':
-                    # This is a long string
+                if j < len(text) and text[j] == '[':
                     in_long_string = True
                     long_string_level = eq_count
-                    i = j + 1  # skip past the opening [[
+                    i = j + 1
                     continue
-                # Otherwise it's a regular bracket (for indexing)
-                # Don't track bracket depth - it's handled by context
-            elif c == '(':
-                depth += 1
-            elif c == ')':
-                depth -= 1
-            elif c == '{':
-                brace_depth += 1
-            elif c == '}':
-                brace_depth -= 1
-
+            elif c == '(': depth += 1
+            elif c == ')': depth -= 1
             i += 1
+        return i if depth == 0 else -1
 
-        if depth != 0:
-            return None
-
-        value = call_text[value_start:i - 1].strip()
-        return value
+    def _extract_table_insert_value(self, call_text: str, table_name: str) -> Optional[str]:
+        """Extract the value argument from table.insert(t, v) call text."""
+        paren_start = call_text.find('(')
+        if paren_start == -1: return None
+        comma_pos = call_text.find(',', paren_start)
+        if comma_pos == -1: return None
+        value_start = comma_pos + 1
+        match_end = self._find_matching_paren(call_text, paren_start)
+        if match_end == -1: return None
+        return call_text[value_start:match_end - 1].strip()
 
     def _edit_table_getn(self, finding: Finding):
         """Convert table.getn(t) to #t."""
