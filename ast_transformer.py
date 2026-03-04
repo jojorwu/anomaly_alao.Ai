@@ -23,7 +23,14 @@ class SourceEdit:
 
 
 class ASTTransformer:
-    """Transform Lua source using AST-based analysis."""
+    """
+    Transform Lua source using AST-based analysis.
+
+    This class takes findings from an ASTAnalyzer and applies corresponding
+    transformations to the source code. It uses character-based offsets from the
+    AST to perform precise search-and-replace operations while maintaining code
+    integrity and formatting as much as possible.
+    """
 
     def __init__(self):
         self.source: str = ""

@@ -206,6 +206,33 @@ class Reporter:
                         counts[f.severity] += 1
         return counts
 
+    def get_findings_summary(self) -> str:
+        """Return a formatted string representing the findings summary."""
+        green = self.count_by_severity("GREEN")
+        yellow = self.count_by_severity("YELLOW")
+        red = self.count_by_severity("RED")
+        debug = self.count_by_severity("DEBUG")
+
+        # count nil access findings
+        nil_count = sum(1 for f in self.all_findings if f.pattern_name == 'potential_nil_access')
+        nil_fixable = sum(1 for f in self.all_findings
+                         if f.pattern_name == 'potential_nil_access' and f.details.get('is_safe_to_fix'))
+
+        # count dead code findings
+        dead_code_count = sum(1 for f in self.all_findings if f.pattern_name.startswith('dead_code_'))
+        dead_code_fixable = sum(1 for f in self.all_findings
+                               if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
+        unused_count = sum(1 for f in self.all_findings if f.pattern_name.startswith('unused_'))
+
+        summary = f"{green} GREEN (auto-fixable), {yellow} YELLOW (review), {red} RED (info)"
+        if debug > 0:
+            summary += f", {debug} DEBUG (logging)"
+        if nil_count > 0:
+            summary += f", {nil_count} NIL ({nil_fixable} fixable)"
+        if dead_code_count > 0 or unused_count > 0:
+            summary += f", {dead_code_count + unused_count} DEAD-CODE ({dead_code_fixable} removable)"
+        return summary
+
     def print_summary(self):
         """Print a summary to stdout."""
         print("\n" + "=" * 60)

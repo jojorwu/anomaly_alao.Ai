@@ -503,6 +503,50 @@ def run_parallel(work_items, worker_func, num_workers, quiet=False, desc="Proces
 
     return results, pool_crashed, interrupted, completed
 
+def print_final_stats(args, reporter, files_analyzed, files_with_issues, files_skipped, parse_errors, files_modified, total_edits):
+    """Print final statistics and usage tips."""
+    print(f"\n{'=' * 55}")
+    print(f"Files analyzed: {files_analyzed}")
+    print(f"Files with issues: {files_with_issues}")
+    if files_skipped > 0:
+        print(f"Files skipped (timeout/error): {files_skipped}")
+    if parse_errors > 0:
+        print(f"Files with parse errors: {parse_errors}")
+
+    fix_flags_set = (args.fix or args.fix_debug or args.fix_yellow or
+                     args.experimental or args.fix_nil or args.remove_dead_code)
+
+    if fix_flags_set:
+        print(f"Files modified: {files_modified}")
+        print(f"Total edits applied: {total_edits}")
+
+    print(f"\nFindings: {reporter.get_findings_summary()}")
+
+    green_count = reporter.count_by_severity("GREEN")
+    yellow_count = reporter.count_by_severity("YELLOW")
+    debug_count = reporter.count_by_severity("DEBUG")
+
+    # count fixable findings for tips
+    nil_fixable = sum(1 for f in reporter.all_findings
+                     if f.pattern_name == 'potential_nil_access' and f.details.get('is_safe_to_fix'))
+    dead_code_fixable = sum(1 for f in reporter.all_findings
+                           if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
+
+    if green_count > 0 and not args.fix:
+        print("\nTip: Run with --fix to automatically apply GREEN fixes")
+    if yellow_count > 0 and not args.fix_yellow:
+        print("Tip: Run with --fix-yellow to also apply YELLOW fixes (unsafe)")
+    if debug_count > 0 and not args.fix_debug:
+        print("Tip: Run with --fix-debug to comment out DEBUG statements")
+    if yellow_count > 0 and not args.experimental:
+        print("Tip: Run with --experimental to fix string concat in loops (experimental)")
+    if nil_fixable > 0 and not args.fix_nil:
+        print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
+    if dead_code_fixable > 0 and not args.remove_dead_code:
+        print("Tip: Run with --remove-dead-code to remove safe unreachable code")
+    if fix_flags_set:
+        print("Tip: Run with --revert to undo all changes using .alao-bak files")
+
 def main():
     args = parse_args()
     mods_path, mods = get_files_to_process(args)
@@ -932,57 +976,7 @@ def main():
         reporter.save(report_path, verbose=not args.quiet)
         print(f"Report saved to: {report_path}")
 
-    # final stats
-    print(f"\n{'=' * 55}")
-    print(f"Files analyzed: {files_analyzed}")
-    print(f"Files with issues: {files_with_issues}")
-    if files_skipped > 0:
-        print(f"Files skipped (timeout/error): {files_skipped}")
-    if parse_errors > 0:
-        print(f"Files with parse errors: {parse_errors}")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
-        print(f"Files modified: {files_modified}")
-        print(f"Total edits applied: {total_edits}")
-
-    green_count = reporter.count_by_severity("GREEN")
-    yellow_count = reporter.count_by_severity("YELLOW")
-    red_count = reporter.count_by_severity("RED")
-    debug_count = reporter.count_by_severity("DEBUG")
-    
-    # count nil access findings
-    nil_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'potential_nil_access')
-    nil_fixable = sum(1 for f in reporter.all_findings 
-                     if f.pattern_name == 'potential_nil_access' and f.details.get('is_safe_to_fix'))
-    
-    # count dead code findings
-    dead_code_count = sum(1 for f in reporter.all_findings if f.pattern_name.startswith('dead_code_'))
-    dead_code_fixable = sum(1 for f in reporter.all_findings
-                           if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
-    unused_count = sum(1 for f in reporter.all_findings if f.pattern_name.startswith('unused_'))
-
-    findings_str = f"{green_count} GREEN (auto-fixable), {yellow_count} YELLOW (review), {red_count} RED (info)"
-    if debug_count > 0:
-        findings_str += f", {debug_count} DEBUG (logging)"
-    if nil_count > 0:
-        findings_str += f", {nil_count} NIL ({nil_fixable} fixable)"
-    if dead_code_count > 0 or unused_count > 0:
-        findings_str += f", {dead_code_count + unused_count} DEAD-CODE ({dead_code_fixable} removable)"
-    print(f"\nFindings: {findings_str}")
-
-    if green_count > 0 and not args.fix:
-        print("\nTip: Run with --fix to automatically apply GREEN fixes")
-    if yellow_count > 0 and not args.fix_yellow: 
-        print("Tip: Run with --fix-yellow to also apply YELLOW fixes (unsafe)")
-    if debug_count > 0 and not args.fix_debug:
-        print("Tip: Run with --fix-debug to comment out DEBUG statements")
-    if yellow_count > 0 and not args.experimental:
-        print("Tip: Run with --experimental to fix string concat in loops (experimental)")
-    if nil_fixable > 0 and not args.fix_nil:
-        print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
-    if dead_code_fixable > 0 and not args.remove_dead_code:
-        print("Tip: Run with --remove-dead-code to remove safe unreachable code")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
-        print("Tip: Run with --revert to undo all changes using .alao-bak files")
+    print_final_stats(args, reporter, files_analyzed, files_with_issues, files_skipped, parse_errors, files_modified, total_edits)
 
 
 if __name__ == "__main__":

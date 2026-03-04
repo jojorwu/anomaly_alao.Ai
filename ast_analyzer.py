@@ -344,7 +344,14 @@ class VectorAllocationInfo:
 
 
 class ASTAnalyzer:
-    """AST-based Lua code analyzer."""
+    """
+    AST-based Lua code analyzer.
+
+    This class parses Lua source code into an Abstract Syntax Tree (AST) and
+    identifies various patterns that can be optimized or that indicate potential
+    bugs (like nil access or dead code). It uses the visitor pattern to traverse
+    the AST and collect information about function calls, assignments, and variable scopes.
+    """
 
     def __init__(self, cache_threshold: int = 4, experimental: bool = False):
         self.cache_threshold = cache_threshold
