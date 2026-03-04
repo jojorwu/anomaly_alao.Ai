@@ -144,7 +144,7 @@ class Reporter:
                 )
                 self._jinja_env.filters['basename'] = lambda p: Path(p).name
 
-    def add_finding(self, mod_name: str, file_path: Path, finding: Finding):
+    def add_finding(self, mod_name: str, file_path: Path, finding: Finding) -> None:
         """Add a finding to the report."""
         self.findings[mod_name][str(file_path)].append(finding)
         self._all_findings_cache = None  # invalidate cache
@@ -280,7 +280,7 @@ class Reporter:
                                 if detail_str:
                                     print(f"        {detail_str}")
 
-    def save(self, path: Path, verbose: bool = False):
+    def save(self, path: Path, verbose: bool = False) -> None:
         """Save report to file (txt, html, or json)."""
         suffix = path.suffix.lower()
 
@@ -291,7 +291,7 @@ class Reporter:
         else:
             self._save_txt(path, verbose)
 
-    def _get_template_data(self) -> dict:
+    def _get_template_data(self) -> Dict[str, Any]:
         """Prepare data for template rendering."""
         findings_data = {}
         mod_breakdowns = {}
@@ -365,7 +365,7 @@ class Reporter:
                 result[key] = str(value)
         return result
 
-    def _save_json(self, path: Path, verbose: bool = False):
+    def _save_json(self, path: Path, verbose: bool = False) -> None:
         """Save as JSON."""
         if verbose:
             print("  Preparing JSON data...", end="", flush=True)
@@ -404,12 +404,15 @@ class Reporter:
         if verbose:
             print("\r  Writing file...              ", end="", flush=True)
 
-        path.write_text(json.dumps(data, indent=2, default=str), encoding='utf-8')
+        try:
+            path.write_text(json.dumps(data, indent=2, default=str), encoding='utf-8')
+        except (OSError, PermissionError) as e:
+            print(f"\n  [ERROR] Could not save JSON report: {e}")
 
         if verbose:
             print("\r  Done.                        ")
 
-    def _save_txt(self, path: Path, verbose: bool = False):
+    def _save_txt(self, path: Path, verbose: bool = False) -> None:
         """Save as plain text."""
         if verbose:
             print("  Generating text report...", end="", flush=True)
@@ -453,12 +456,15 @@ class Reporter:
         if verbose:
             print("\r  Writing file...              ", end="", flush=True)
 
-        path.write_text('\n'.join(lines), encoding='utf-8')
+        try:
+            path.write_text('\n'.join(lines), encoding='utf-8')
+        except (OSError, PermissionError) as e:
+            print(f"\n  [ERROR] Could not save text report: {e}")
 
         if verbose:
             print("\r  Done.                        ")
 
-    def _save_html(self, path: Path, verbose: bool = False):
+    def _save_html(self, path: Path, verbose: bool = False) -> None:
         """Save as HTML report using Jinja2 template if available."""
         if verbose:
             print("  Preparing template data...", end="", flush=True)
@@ -486,7 +492,10 @@ class Reporter:
             if verbose:
                 print("\r  Writing file...              ", end="", flush=True)
 
-            path.write_text(html_content, encoding='utf-8')
+            try:
+                path.write_text(html_content, encoding='utf-8')
+            except (OSError, PermissionError) as e:
+                print(f"\n  [ERROR] Could not save HTML report: {e}")
 
             if verbose:
                 print("\r  Done.                        ")

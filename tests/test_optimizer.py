@@ -4,6 +4,8 @@ import os
 import shutil
 from ast_analyzer import ASTAnalyzer
 from ast_transformer import ASTTransformer
+from whole_program_analyzer import WholeProgramAnalyzer
+from discovery import discover_mods, get_mod_info
 
 class TestOptimizer(unittest.TestCase):
     def setUp(self):
@@ -46,6 +48,46 @@ class TestOptimizer(unittest.TestCase):
         self.assertTrue(modified)
         self.assertIn("_s_parts = {}", new_content)
         self.assertIn("table.concat(_s_parts)", new_content)
+
+    def test_transformer_long_string(self):
+        script_path = self.test_dir / "test_long_string.lua"
+        content = 'table.insert(t, [[long string with "quotes" and (parens)]])'
+        script_path.write_text(content)
+        transformer = ASTTransformer()
+        modified, new_content, _ = transformer.transform_file(script_path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn('t[#t+1] = [[long string with "quotes" and (parens)]]', new_content)
+
+    def test_whole_program_analyzer(self):
+        script1 = self.test_dir / "mod1.script"
+        script1.write_text('function global_func() end')
+        script2 = self.test_dir / "mod2.script"
+        script2.write_text('global_func()')
+
+        analyzer = WholeProgramAnalyzer()
+        analysis = analyzer.analyze_files([script1, script2])
+
+        self.assertIn('global_func', analysis.definitions)
+        self.assertIn('global_func', analysis.usages)
+
+    def test_discovery_standard(self):
+        mod_dir = self.test_dir / "my_mod"
+        scripts_dir = mod_dir / "gamedata" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "test.script").write_text("-- test")
+
+        mods = discover_mods(self.test_dir)
+        self.assertIn("my_mod", mods)
+        self.assertEqual(len(mods["my_mod"]), 1)
+
+    def test_get_mod_info(self):
+        mod_dir = self.test_dir / "info_mod"
+        mod_dir.mkdir()
+        (mod_dir / "meta.ini").write_text("name=Custom Mod\nversion=1.2.3")
+
+        info = get_mod_info(mod_dir)
+        self.assertEqual(info["name"], "Custom Mod")
+        self.assertEqual(info["version"], "1.2.3")
 
 if __name__ == "__main__":
     unittest.main()

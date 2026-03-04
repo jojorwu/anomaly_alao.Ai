@@ -190,147 +190,158 @@ class WholeProgramAnalyzer:
         """Convert AST node to string representation."""
         if isinstance(node, Name):
             return node.id
-        elif isinstance(node, Index):
-            value = self._node_to_string(node.value)
-            idx = self._node_to_string(node.idx)
-            idx_token = getattr(node.idx, 'first_token', None)
-            if idx_token is not None and str(idx_token) != 'None':
-                return f"{value}[{idx}]"
-            else:
-                return f"{value}.{idx}"
-        elif isinstance(node, String):
-            s = node.s
-            if isinstance(s, bytes):
-                s = s.decode('utf-8', errors='replace')
-            return s
+        if isinstance(node, Index):
+            return self._format_index(node)
+        if isinstance(node, String):
+            return self._format_string(node)
         return ""
-    
+
+    def _format_string(self, node: String) -> str:
+        """Helper to format String nodes."""
+        s = node.s
+        if isinstance(s, bytes):
+            s = s.decode('utf-8', errors='replace')
+        return s
+
+    def _format_index(self, node: Index) -> str:
+        """Helper to format Index nodes."""
+        value = self._node_to_string(node.value)
+        idx = self._node_to_string(node.idx)
+        idx_token = getattr(node.idx, 'first_token', None)
+        if idx_token is not None and str(idx_token) != 'None':
+            return f"{value}[{idx}]"
+        return f"{value}.{idx}"
+
     def _visit_for_definitions(self, node: Node, file_path: Path, in_local_scope: bool = False):
         """Visit AST to collect definitions."""
         if node is None:
             return
-        
-        # Global function: function name() ... end
+
         if isinstance(node, Function):
-            if isinstance(node.name, Name):
-                name = node.name.id
-                line = self._get_line(node)
-                is_callback = name in KNOWN_CALLBACKS
-                
-                self.analysis.definitions[name].append(SymbolDefinition(
-                    name=name,
-                    file_path=file_path,
-                    line=line,
-                    symbol_type='global_function',
-                    scope='global',
-                    is_callback=is_callback,
-                ))
-                
-                if is_callback:
-                    self.analysis.registered_callbacks.add(name)
-            
-            # Module function: function module.name() ... end
-            elif isinstance(node.name, Index):
-                full_name = self._node_to_string(node.name)
-                line = self._get_line(node)
-                
-                self.analysis.definitions[full_name].append(SymbolDefinition(
-                    name=full_name,
-                    file_path=file_path,
-                    line=line,
-                    symbol_type='module_function',
-                    scope='module',
-                ))
-                # module functions are potentially exported
-                self.analysis.exported_symbols.add(full_name)
-        
-        # Local function: local function name() ... end
+            self._define_function(node, file_path)
         elif isinstance(node, LocalFunction):
-            if isinstance(node.name, Name):
-                name = node.name.id
-                line = self._get_line(node)
-                is_callback = name in KNOWN_CALLBACKS
-                
-                self.analysis.definitions[f"local:{file_path.stem}:{name}"].append(SymbolDefinition(
-                    name=name,
-                    file_path=file_path,
-                    line=line,
-                    symbol_type='local_function',
-                    scope='local',
-                    is_callback=is_callback,
-                ))
-        
-        # Method definition: function class:method() ... end
+            self._define_local_function(node, file_path)
         elif isinstance(node, Method):
-            source = self._node_to_string(node.source)
-            method = node.name.id if isinstance(node.name, Name) else ""
-            full_name = f"{source}:{method}"
-            line = self._get_line(node)
-            is_class_method = method in KNOWN_CALLBACKS
-            
-            self.analysis.definitions[full_name].append(SymbolDefinition(
-                name=full_name,
-                file_path=file_path,
-                line=line,
-                symbol_type='method',
-                scope='module',
-                is_class_method=is_class_method,
-            ))
-            
-            if is_class_method:
-                self.analysis.exported_symbols.add(full_name)
-        
-        # Global assignment: name = value
+            self._define_method(node, file_path)
         elif isinstance(node, Assign):
-            for target in node.targets:
-                if isinstance(target, Name):
-                    name = target.id
-                    line = self._get_line(node)
-                    
-                    # Check if assigning a function
-                    if node.values and len(node.values) == 1:
-                        val = node.values[0]
-                        if isinstance(val, Function):
-                            is_callback = name in KNOWN_CALLBACKS
-                            self.analysis.definitions[name].append(SymbolDefinition(
-                                name=name,
-                                file_path=file_path,
-                                line=line,
-                                symbol_type='global_function',
-                                scope='global',
-                                is_callback=is_callback,
-                            ))
-                            if is_callback:
-                                self.analysis.registered_callbacks.add(name)
-                        else:
-                            self.analysis.definitions[name].append(SymbolDefinition(
-                                name=name,
-                                file_path=file_path,
-                                line=line,
-                                symbol_type='global_var',
-                                scope='global',
-                            ))
-                
-                # Module assignment: module.name = value
-                elif isinstance(target, Index):
-                    full_name = self._node_to_string(target)
-                    line = self._get_line(node)
-                    
-                    self.analysis.definitions[full_name].append(SymbolDefinition(
-                        name=full_name,
-                        file_path=file_path,
-                        line=line,
-                        symbol_type='module_var',
-                        scope='module',
-                    ))
-                    self.analysis.exported_symbols.add(full_name)
-        
+            self._define_assign(node, file_path)
+
         # Recurse into children
         for child in ast.walk(node):
             if child is not node:
                 self._visit_for_definitions(child, file_path, in_local_scope)
+
+    def _define_function(self, node: Function, file_path: Path):
+        """Handle Function definition."""
+        if isinstance(node.name, Name):
+            name = node.name.id
+            line = self._get_line(node)
+            is_callback = name in KNOWN_CALLBACKS
+
+            self.analysis.definitions[name].append(SymbolDefinition(
+                name=name,
+                file_path=file_path,
+                line=line,
+                symbol_type='global_function',
+                scope='global',
+                is_callback=is_callback,
+            ))
+
+            if is_callback:
+                self.analysis.registered_callbacks.add(name)
+
+        elif isinstance(node.name, Index):
+            full_name = self._node_to_string(node.name)
+            line = self._get_line(node)
+
+            self.analysis.definitions[full_name].append(SymbolDefinition(
+                name=full_name,
+                file_path=file_path,
+                line=line,
+                symbol_type='module_function',
+                scope='module',
+            ))
+            self.analysis.exported_symbols.add(full_name)
+
+    def _define_local_function(self, node: LocalFunction, file_path: Path):
+        """Handle LocalFunction definition."""
+        if isinstance(node.name, Name):
+            name = node.name.id
+            line = self._get_line(node)
+            is_callback = name in KNOWN_CALLBACKS
+
+            self.analysis.definitions[f"local:{file_path.stem}:{name}"].append(SymbolDefinition(
+                name=name,
+                file_path=file_path,
+                line=line,
+                symbol_type='local_function',
+                scope='local',
+                is_callback=is_callback,
+            ))
+
+    def _define_method(self, node: Method, file_path: Path):
+        """Handle Method definition."""
+        source = self._node_to_string(node.source)
+        method = node.name.id if isinstance(node.name, Name) else ""
+        full_name = f"{source}:{method}"
+        line = self._get_line(node)
+        is_class_method = method in KNOWN_CALLBACKS
+
+        self.analysis.definitions[full_name].append(SymbolDefinition(
+            name=full_name,
+            file_path=file_path,
+            line=line,
+            symbol_type='method',
+            scope='module',
+            is_class_method=is_class_method,
+        ))
+
+        if is_class_method:
+            self.analysis.exported_symbols.add(full_name)
+
+    def _define_assign(self, node: Assign, file_path: Path):
+        """Handle Assignment for global/module definitions."""
+        for target in node.targets:
+            if isinstance(target, Name):
+                name = target.id
+                line = self._get_line(node)
+
+                if node.values and len(node.values) == 1:
+                    val = node.values[0]
+                    if isinstance(val, Function):
+                        is_callback = name in KNOWN_CALLBACKS
+                        self.analysis.definitions[name].append(SymbolDefinition(
+                            name=name,
+                            file_path=file_path,
+                            line=line,
+                            symbol_type='global_function',
+                            scope='global',
+                            is_callback=is_callback,
+                        ))
+                        if is_callback:
+                            self.analysis.registered_callbacks.add(name)
+                    else:
+                        self.analysis.definitions[name].append(SymbolDefinition(
+                            name=name,
+                            file_path=file_path,
+                            line=line,
+                            symbol_type='global_var',
+                            scope='global',
+                        ))
+            elif isinstance(target, Index):
+                full_name = self._node_to_string(target)
+                line = self._get_line(node)
+
+                self.analysis.definitions[full_name].append(SymbolDefinition(
+                    name=full_name,
+                    file_path=file_path,
+                    line=line,
+                    symbol_type='module_var',
+                    scope='module',
+                ))
+                self.analysis.exported_symbols.add(full_name)
     
-    def _visit_for_usages(self, node: Node, file_path: Path):
+    def _visit_for_usages(self, node: Optional[Node], file_path: Path):
         """Visit AST to collect usages (recursively)."""
         if node is None:
             return

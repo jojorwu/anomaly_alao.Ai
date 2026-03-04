@@ -10,30 +10,31 @@ from pathlib import Path
 from typing import Dict, List
 
 
+def _get_scripts_if_exists(path: Path) -> List[Path]:
+    """Helper to return scripts if directory exists."""
+    if path.exists():
+        return find_scripts(path)
+    return []
+
 def discover_mods(root_path: Path) -> Dict[str, List[Path]]:
     """
     Discover all mods and their script files.
-
-    Returns dict mapping mod name -> list of script file paths
+    Returns dict mapping mod name -> list of script file paths.
     """
-    mods = {}
+    mods: Dict[str, List[Path]] = {}
     root_path = Path(root_path)
 
     # check if this IS a gamedata folder directly
     if root_path.name == "gamedata":
-        scripts_dir = root_path / "scripts"
-        if scripts_dir.exists():
-            scripts = find_scripts(scripts_dir)
-            if scripts:
-                mods["(root)"] = scripts
+        scripts = _get_scripts_if_exists(root_path / "scripts")
+        if scripts:
+            mods["(root)"] = scripts
         return mods
 
     # check if this folder contains gamedata directly (single mod)
-    direct_gamedata = root_path / "gamedata" / "scripts"
-    if direct_gamedata.exists():
-        scripts = find_scripts(direct_gamedata)
-        if scripts:
-            mods[root_path.name] = scripts
+    scripts = _get_scripts_if_exists(root_path / "gamedata" / "scripts")
+    if scripts:
+        mods[root_path.name] = scripts
 
     # scan subdirectories for mod folders
     for item in root_path.iterdir():
@@ -44,21 +45,16 @@ def discover_mods(root_path: Path) -> Dict[str, List[Path]]:
         if item.name.startswith('.') or item.name in ('__pycache__', 'backup', 'backups'):
             continue
 
-        scripts_dir = item / "gamedata" / "scripts"
-        if scripts_dir.exists():
-            scripts = find_scripts(scripts_dir)
-            if scripts:
-                mods[item.name] = scripts
+        scripts = _get_scripts_if_exists(item / "gamedata" / "scripts")
+        if scripts:
+            mods[item.name] = scripts
         else:
             # maybe nested structure, check one level deeper
             for subitem in item.iterdir():
                 if subitem.is_dir():
-                    nested_scripts = subitem / "gamedata" / "scripts"
-                    if nested_scripts.exists():
-                        scripts = find_scripts(nested_scripts)
-                        if scripts:
-                            mod_name = f"{item.name}/{subitem.name}"
-                            mods[mod_name] = scripts
+                    scripts = _get_scripts_if_exists(subitem / "gamedata" / "scripts")
+                    if scripts:
+                        mods[f"{item.name}/{subitem.name}"] = scripts
 
     return mods
 
@@ -73,7 +69,7 @@ def find_scripts(scripts_dir: Path) -> List[Path]:
     return sorted(scripts)
 
 
-def get_mod_info(mod_path: Path) -> dict:
+def get_mod_info(mod_path: Path) -> Dict[str, str]:
     """
     Try to extract mod info from common metadata files.
     Returns dict with name, version, author if found.
