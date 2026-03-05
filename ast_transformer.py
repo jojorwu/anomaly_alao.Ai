@@ -217,7 +217,7 @@ class ASTTransformer:
             self._edit_return_ternary_simplification(finding)
         elif pattern == 'math_atan2_to_atan':
             self._edit_math_atan2(finding)
-        elif pattern == 'math_mod_to_percent':
+        elif pattern in ('math_mod_to_percent', 'math_fmod_to_percent'):
             self._edit_math_mod(finding)
         elif pattern == 'math_log_base_e':
             self._edit_math_log(finding)
@@ -561,6 +561,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
+            priority=100  # High priority to override constant folding of arguments
         ))
 
     def _edit_math_random_1(self, finding: Finding):
@@ -773,10 +774,15 @@ class ASTTransformer:
         if start is None:
             return
 
+        # Give Call folding higher priority than nested expression folding
+        from luaparser.astnodes import Call
+        priority = 10 if isinstance(node, Call) else 0
+
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=str(result)
+            replacement=str(result),
+            priority=priority
         ))
 
     def _edit_expo_to_mult(self, finding: Finding):
@@ -870,6 +876,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
+            priority=100 # High priority to override table.getn(t) -> #t folding
         ))
 
     def _find_matching_paren(self, text: str, start_pos: int) -> int:
@@ -1018,6 +1025,15 @@ class ASTTransformer:
             replacement = f'math.sqrt({base})'
         elif pow_type == 'power' and isinstance(exp, int):
             replacement = '*'.join([base] * exp)
+        elif pow_type == 'power_neg':
+            if exp == -1:
+                replacement = f'1/{base}'
+            elif exp == -2:
+                replacement = f'1/({base}*{base})'
+            elif exp == -0.5:
+                replacement = f'1/math.sqrt({base})'
+            else:
+                return
         else:
             return
 
@@ -1025,6 +1041,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
+            priority=10,
         ))
 
     def _edit_distance_to_comparison(self, finding: Finding):

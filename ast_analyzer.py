@@ -25,6 +25,7 @@ from collections import defaultdict
 import sys
 import io
 import re
+import math as py_math
 
 from models import (
     Finding, detect_file_encoding, Scope, CallInfo, AssignInfo,
@@ -656,7 +657,13 @@ class ASTAnalyzer:
             return 'number'
         if isinstance(node, Call):
             _, _, full_name = self._get_call_name(node)
-            if full_name in ('math.floor', 'math.ceil', 'math.abs', 'math.sqrt', 'math.sin', 'math.cos', 'math.random', 'math.pow', 'tonumber', 'string.len'):
+            if full_name in (
+                'math.floor', 'math.ceil', 'math.abs', 'math.sqrt', 'math.sin', 'math.cos',
+                'math.tan', 'math.asin', 'math.acos', 'math.atan', 'math.atan2', 'math.exp',
+                'math.log', 'math.log10', 'math.random', 'math.pow', 'math.min', 'math.max',
+                'math.deg', 'math.rad', 'math.fmod', 'math.modf', 'math.sinh', 'math.cosh',
+                'math.tanh', 'tonumber', 'string.len'
+            ):
                 return 'number'
             if full_name in ('tostring', 'string.format', 'string.sub', 'string.gsub', 'string.lower', 'string.upper'):
                 return 'string'
@@ -1236,6 +1243,7 @@ class ASTAnalyzer:
         self._analyze_math_pow()
         self._analyze_math_atan2()
         self._analyze_math_mod()
+        self._analyze_math_fmod()
         self._analyze_math_log()
         self._analyze_math_deg_rad()
         self._analyze_math_random_0_1()
@@ -1333,6 +1341,25 @@ class ASTAnalyzer:
                     message=f'pairs({table_name}) in hot loop -> next, {table_name}, nil is faster in LuaJIT',
                     details={
                         'table': table_name,
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_math_fmod(self):
+        """Find math.fmod(x, y) and suggest x % y."""
+        for call in self.calls:
+            if call.full_name == 'math.fmod' and len(call.args) == 2:
+                x_str = node_to_string(call.args[0])
+                y_str = node_to_string(call.args[1])
+                self.findings.append(Finding(
+                    pattern_name='math_fmod_to_percent',
+                    severity='YELLOW',
+                    line_num=call.line,
+                    message=f'math.fmod({x_str}, {y_str}) -> {x_str} % {y_str} (note: behavior differs for negative numbers)',
+                    details={
+                        'x_str': x_str,
+                        'y_str': y_str,
                         'node': call.node,
                     },
                     source_line=self._get_source_line(call.line),
@@ -1778,36 +1805,47 @@ class ASTAnalyzer:
                             source_line=self._get_source_line(self._get_line(node)),
                         ))
 
+    def _get_const_val(self, node):
+        """Helper to get constant value of a node if possible."""
+        if isinstance(node, Number):
+            return node.n
+        if isinstance(node, UMinusOp):
+            val = self._get_const_val(node.operand)
+            return -val if val is not None else None
+        if isinstance(node, Index):
+            full_name = node_to_string(node)
+            if full_name == 'math.pi':
+                return py_math.pi
+            if full_name == 'math.huge':
+                return float('inf')
+        return None
+
     def _analyze_constant_folding(self):
         """Find arithmetic operations on numeric literals and constants that can be folded."""
-        import math as py_math
         ops = {
             AddOp: "+", SubOp: "-", MultOp: "*", FloatDivOp: "/",
             ModOp: "%", ExpoOp: "^"
         }
 
-        def get_const_val(node):
-            if isinstance(node, Number):
-                return node.n
-            if isinstance(node, Index):
-                full_name = node_to_string(node)
-                if full_name == 'math.pi':
-                    return py_math.pi
-                if full_name == 'math.huge':
-                    return float('inf')
-            return None
-
-        # Fold math.deg and math.rad with constant arguments
+        # Fold common math functions with constant arguments
         for node in ast.walk(self._ast_tree):
             if isinstance(node, Call):
                 _, _, full_name = self._get_call_name(node)
-                if full_name in ('math.deg', 'math.rad') and len(node.args) == 1:
-                    arg_val = get_const_val(node.args[0])
+                if full_name in ('math.deg', 'math.rad', 'math.abs', 'math.sqrt', 'math.floor', 'math.ceil') and len(node.args) == 1:
+                    arg_val = self._get_const_val(node.args[0])
                     if arg_val is not None:
-                        if full_name == 'math.deg':
-                            result = py_math.degrees(arg_val)
-                        else:
-                            result = py_math.radians(arg_val)
+                        try:
+                            if full_name == 'math.deg': result = py_math.degrees(arg_val)
+                            elif full_name == 'math.rad': result = py_math.radians(arg_val)
+                            elif full_name == 'math.abs': result = abs(arg_val)
+                            elif full_name == 'math.sqrt':
+                                if arg_val < 0: continue
+                                result = py_math.sqrt(arg_val)
+                            elif full_name == 'math.floor': result = py_math.floor(arg_val)
+                            elif full_name == 'math.ceil': result = py_math.ceil(arg_val)
+                            else: continue
+                        except (ValueError, OverflowError):
+                            continue
 
                         res_str = f"{result:.10g}" if result != int(result) else str(int(result))
                         self.findings.append(Finding(
@@ -1819,10 +1857,45 @@ class ASTAnalyzer:
                             source_line=self._get_source_line(self._get_line(node)),
                         ))
 
+                # Fold math.min and math.max with constant arguments
+                elif full_name in ('math.min', 'math.max') and len(node.args) >= 2:
+                    arg_vals = [self._get_const_val(arg) for arg in node.args]
+                    if all(v is not None for v in arg_vals):
+                        result = min(arg_vals) if full_name == 'math.min' else max(arg_vals)
+                        res_str = f"{result:.10g}" if result != int(result) else str(int(result))
+                        self.findings.append(Finding(
+                            pattern_name='constant_folding',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Constant folding: {full_name}({", ".join(map(str, arg_vals))}) -> {res_str}',
+                            details={'result': res_str, 'node': node},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
         for node in ast.walk(self._ast_tree):
+            if isinstance(node, UMinusOp):
+                val = self._get_const_val(node.operand)
+                if val is not None:
+                    # check if parent is already folded (e.g. -1 + 2)
+                    # if parent is binary op, we don't fold UMinusOp separately
+                    parent = self.parent_map.get(id(node))
+                    if isinstance(parent, tuple(ops.keys())):
+                        continue
+
+                    result = -val
+                    res_str = f"{result:.10g}" if result != int(result) else str(int(result))
+                    self.findings.append(Finding(
+                        pattern_name='constant_folding',
+                        severity='GREEN',
+                        line_num=self._get_line(node),
+                        message=f'Constant folding: -{val} -> {res_str}',
+                        details={'result': res_str, 'node': node},
+                        source_line=self._get_source_line(self._get_line(node)),
+                    ))
+
             if isinstance(node, tuple(ops.keys())):
-                l_val = get_const_val(node.left)
-                r_val = get_const_val(node.right)
+                l_val = self._get_const_val(node.left)
+                r_val = self._get_const_val(node.right)
 
                 if l_val is not None and r_val is not None:
                     op_str = ops[type(node)]
@@ -2123,24 +2196,34 @@ class ASTAnalyzer:
                     table_name = node_to_string(table_node)
 
                     if isinstance(pos_node, AddOp):
-                        # check if it's #t + 1
+                        # check if it's #t + 1 or table.getn(t) + 1
                         left = pos_node.left
                         right = pos_node.right
-                        if isinstance(left, ULengthOP) and isinstance(right, Number) and right.n == 1:
+
+                        is_len = False
+                        if isinstance(left, ULengthOP):
                             if node_to_string(left.operand) == table_name:
-                                self.findings.append(Finding(
-                                    pattern_name='table_insert_append_len',
-                                    severity='GREEN',
-                                    line_num=call.line,
-                                    message=f'table.insert({table_name}, #{table_name}+1, v) -> {table_name}[#{table_name}+1] = v',
-                                    details={
-                                        'table': table_name,
-                                        'value': node_to_string(call.args[2]),
-                                        'node': call.node,
-                                    },
-                                    source_line=self._get_source_line(call.line),
-                                ))
-                                continue
+                                is_len = True
+                        elif isinstance(left, Call):
+                            _, _, left_full_name = self._get_call_name(left)
+                            if left_full_name == 'table.getn' and len(left.args) == 1:
+                                if node_to_string(left.args[0]) == table_name:
+                                    is_len = True
+
+                        if is_len and isinstance(right, Number) and right.n == 1:
+                            self.findings.append(Finding(
+                                pattern_name='table_insert_append_len',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'table.insert({table_name}, #{table_name}+1, v) -> {table_name}[#{table_name}+1] = v',
+                                details={
+                                    'table': table_name,
+                                    'value': node_to_string(call.args[2]),
+                                    'node': call.node,
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
 
                 if len(call.args) == 2:
                     # 2-arg form: table.insert(t, v)
@@ -2358,7 +2441,6 @@ class ASTAnalyzer:
 
     def _analyze_math_deg_rad(self):
         """Find math.deg(x) or math.rad(x) and suggest multiplication by constant."""
-        import math as py_math
         for call in self.calls:
             if call.full_name in ('math.deg', 'math.rad') and len(call.args) == 1:
                 arg = call.args[0]
@@ -2492,8 +2574,8 @@ class ASTAnalyzer:
                 exp_node = call.args[1]
 
                 # check for simple cases
-                if isinstance(exp_node, Number):
-                    exp = exp_node.n
+                exp = self._get_const_val(exp_node)
+                if exp is not None:
                     full_match = f'math.pow({base}, {exp})'
 
                     if exp == 0.5:
@@ -2506,6 +2588,54 @@ class ASTAnalyzer:
                                 'base': base,
                                 'exponent': exp,
                                 'type': 'sqrt',
+                                'is_simple': True,
+                                'full_match': full_match,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                    elif exp == -1 and self._is_simple_expr(call.args[0]):
+                        self.findings.append(Finding(
+                            pattern_name='math_pow_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'{full_match} -> 1/{base}',
+                            details={
+                                'base': base,
+                                'exponent': -1,
+                                'type': 'power_neg',
+                                'is_simple': True,
+                                'full_match': full_match,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                    elif exp == -2 and self._is_simple_expr(call.args[0]):
+                        self.findings.append(Finding(
+                            pattern_name='math_pow_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'{full_match} -> 1/({base}*{base})',
+                            details={
+                                'base': base,
+                                'exponent': -2,
+                                'type': 'power_neg',
+                                'is_simple': True,
+                                'full_match': full_match,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                    elif exp == -0.5 and self._is_simple_expr(call.args[0]):
+                        self.findings.append(Finding(
+                            pattern_name='math_pow_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'{full_match} -> 1/math.sqrt({base})',
+                            details={
+                                'base': base,
+                                'exponent': -0.5,
+                                'type': 'power_neg',
                                 'is_simple': True,
                                 'full_match': full_match,
                                 'node': call.node,
