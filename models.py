@@ -3,8 +3,9 @@ Shared data for the Lua analyzer.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Set, Tuple
 from pathlib import Path
+from luaparser.astnodes import Node
 
 
 def detect_file_encoding(file_path: Path) -> str:
@@ -41,9 +42,6 @@ class Finding:
     @property
     def line_content(self) -> str:
         return self.source_line
-
-from typing import List, Set, Tuple
-from luaparser.astnodes import Node
 
 @dataclass
 class Scope:

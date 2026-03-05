@@ -65,6 +65,7 @@ import shutil
 import zipfile
 import glob
 import traceback
+from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, BrokenExecutor
@@ -151,7 +152,11 @@ def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False)
         filename = f'scripts-backup-{timestamp}.zip'
         # save in mods_root if provided, otherwise current directory
         if mods_root:
-            output_path = Path(mods_root) / filename
+            mods_root = Path(mods_root)
+            if mods_root.is_file():
+                output_path = mods_root.parent / filename
+            else:
+                output_path = mods_root / filename
         else:
             output_path = Path(filename)
     else:

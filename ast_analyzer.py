@@ -1232,8 +1232,11 @@ class ASTAnalyzer:
         self._analyze_string_format_to_concat()
         self._analyze_table_concat_literal()
         self._analyze_string_sub_to_byte()
+        self._analyze_string_sub_to_byte_simple()
         self._analyze_string_lower_case()
         self._analyze_math_abs_positive()
+        self._analyze_constant_folding()
+        self._analyze_expo_to_mult()
         self._analyze_table_new_in_loop()
         self._analyze_repeated_member_access_in_loop()
 
@@ -1377,6 +1380,32 @@ class ASTAnalyzer:
                         source_line=self._get_source_line(call.line)
                     ))
 
+    def _analyze_string_sub_to_byte_simple(self):
+        """Find string.sub(s, 1, 1) calls that can be optimized."""
+        for call in self.calls:
+            if call.full_name == 'string.sub' and len(call.args) >= 2:
+                arg2 = call.args[1]
+                arg3 = call.args[2] if len(call.args) > 2 else None
+
+                # string.sub(s, 1, 1)
+                if isinstance(arg2, Number) and arg2.n == 1:
+                    if arg3 is None or (isinstance(arg3, Number) and arg3.n == 1):
+                        s_str = node_to_string(call.args[0])
+
+                        # safety check: check context (if used in comparison, handled by string_sub_to_byte)
+                        # here we just suggest general optimization to string.byte
+                        self.findings.append(Finding(
+                            pattern_name='string_sub_to_byte_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.sub({s_str}, 1, 1) -> string.byte({s_str}) is faster',
+                            details={
+                                's_str': s_str,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
     def _analyze_string_sub_to_byte(self):
         """Find string.sub(s, n, n) == "c" that can be string.byte(s, n) == code."""
         for node in ast.walk(self._ast_tree):
@@ -1435,6 +1464,90 @@ class ASTAnalyzer:
                         },
                         source_line=self._get_source_line(assign.line),
                     ))
+
+    def _analyze_expo_to_mult(self):
+        """Find x^2, x^3 etc. that can be simplified to multiplication."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, ExpoOp):
+                if isinstance(node.right, Number) and node.right.n in (2, 3):
+                    base_str = node_to_string(node.left)
+                    exponent = int(node.right.n)
+
+                    if self._is_simple_expr(node.left):
+                        replacement = '*'.join([base_str] * exponent)
+                        self.findings.append(Finding(
+                            pattern_name='expo_to_mult',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Exponent to multiplication: {base_str}^{exponent} -> {replacement}',
+                            details={
+                                'replacement': replacement,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                    else:
+                        # Complex expression like (a+b)^2
+                        self.findings.append(Finding(
+                            pattern_name='expo_to_mult_complex',
+                            severity='YELLOW',
+                            line_num=self._get_line(node),
+                            message=f'Exponent to multiplication: ({base_str})^{exponent} -> use local variable for base to avoid redundant calculation',
+                            details={
+                                'base_str': base_str,
+                                'exponent': exponent,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_constant_folding(self):
+        """Find arithmetic operations on numeric literals that can be folded."""
+        ops = {
+            AddOp: "+", SubOp: "-", MultOp: "*", FloatDivOp: "/",
+            ModOp: "%", ExpoOp: "^"
+        }
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, tuple(ops.keys())):
+                if isinstance(node.left, Number) and isinstance(node.right, Number):
+                    l_val = node.left.n
+                    r_val = node.right.n
+                    op_str = ops[type(node)]
+
+                    try:
+                        if isinstance(node, AddOp): result = l_val + r_val
+                        elif isinstance(node, SubOp): result = l_val - r_val
+                        elif isinstance(node, MultOp): result = l_val * r_val
+                        elif isinstance(node, FloatDivOp):
+                            if r_val == 0: continue
+                            result = l_val / r_val
+                        elif isinstance(node, ModOp):
+                            if r_val == 0: continue
+                            result = l_val % r_val
+                        elif isinstance(node, ExpoOp):
+                            if l_val == 0 and r_val < 0: continue
+                            result = l_val ** r_val
+                        else: continue
+
+                        # format result: int if possible, else limited precision
+                        if result == int(result):
+                            res_str = str(int(result))
+                        else:
+                            res_str = f"{result:.6g}"
+
+                        self.findings.append(Finding(
+                            pattern_name='constant_folding',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Constant folding: {l_val} {op_str} {r_val} -> {res_str}',
+                            details={
+                                'result': res_str,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                    except (ArithmeticError, ValueError):
+                        continue
 
     def _analyze_repeated_member_access_in_loop(self):
         """Find repeated member access (e.g., self.object) in loops."""

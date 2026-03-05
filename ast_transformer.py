@@ -182,6 +182,12 @@ class ASTTransformer:
             self._edit_math_random_1(finding)
         elif pattern == 'math_abs_positive':
             self._edit_math_abs_positive(finding)
+        elif pattern == 'constant_folding':
+            self._edit_constant_folding(finding)
+        elif pattern == 'expo_to_mult':
+            self._edit_expo_to_mult(finding)
+        elif pattern == 'string_sub_to_byte_simple':
+            self._edit_string_sub_to_byte_simple(finding)
         elif pattern == 'string_format_to_concat':
             self._edit_string_format_to_concat(finding)
         elif pattern == 'redundant_return_bool':
@@ -459,6 +465,59 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement
+        ))
+
+    def _edit_constant_folding(self, finding: Finding):
+        """Replace arithmetic operation with pre-calculated result."""
+        node = finding.details.get('node')
+        result = finding.details.get('result')
+        if not node or result is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=str(result)
+        ))
+
+    def _edit_expo_to_mult(self, finding: Finding):
+        """Replace x^n with x*x*..."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_string_sub_to_byte_simple(self, finding: Finding):
+        """Convert string.sub(s, 1, 1) to string.char(string.byte(s))."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str')
+        if not node or not s_str:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # We need it to be string again to match original behavior
+        # string.sub returns string, string.byte returns number
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'string.char(string.byte({s_str}))'
         ))
 
     def _edit_math_abs_positive(self, finding: Finding):

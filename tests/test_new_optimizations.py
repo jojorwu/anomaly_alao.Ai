@@ -218,5 +218,32 @@ class TestNewOptimizations(unittest.TestCase):
         findings = self.analyzer.analyze_file(path)
         self.assertTrue(any(f.pattern_name == 'always_false_comparison' for f in findings))
 
+    def test_constant_folding(self):
+        script = "local x = 20 * 2"
+        path = self.test_dir / "fold.lua"
+        path.write_text(script)
+
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("local x = 40", new_content)
+
+    def test_expo_to_mult(self):
+        script = "local x = a^2"
+        path = self.test_dir / "expo.lua"
+        path.write_text(script)
+
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("local x = a*a", new_content)
+
+    def test_string_sub_simple(self):
+        script = "local c = string.sub(s, 1, 1)"
+        path = self.test_dir / "sub_simple.lua"
+        path.write_text(script)
+
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("string.char(string.byte(s))", new_content)
+
 if __name__ == "__main__":
     unittest.main()
