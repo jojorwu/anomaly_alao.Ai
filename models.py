@@ -156,6 +156,7 @@ class Assignment:
     line: int
     node: Node
     is_used: bool = False
+    inferred_type: Optional[str] = None  # 'number', 'string', 'boolean', 'table', 'function', 'nil'
 
 
 @dataclass

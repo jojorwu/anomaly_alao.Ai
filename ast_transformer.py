@@ -209,6 +209,18 @@ class ASTTransformer:
             self._edit_divide_by_constant(finding)
         elif pattern == 'if_nil_assign':
             self._edit_if_nil_assign(finding)
+        elif pattern == 'redundant_type_conversion':
+            self._edit_redundant_type_conversion(finding)
+        elif pattern == 'string_byte_1':
+            self._edit_string_byte_1(finding)
+        elif pattern == 'return_ternary_simplification':
+            self._edit_return_ternary_simplification(finding)
+        elif pattern == 'math_atan2_to_atan':
+            self._edit_math_atan2(finding)
+        elif pattern == 'math_mod_to_percent':
+            self._edit_math_mod(finding)
+        elif pattern == 'math_log_base_e':
+            self._edit_math_log(finding)
 
 
     # Edit methods using AST positions
@@ -283,6 +295,122 @@ class ASTTransformer:
             left_str = f'({left_str})'
 
         replacement = f'{left_str} * {reciprocal}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_redundant_type_conversion(self, finding: Finding):
+        """Remove redundant tonumber() or tostring() call."""
+        node = finding.details.get('node')
+        arg_str = finding.details.get('arg_str')
+        if not node or arg_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=arg_str
+        ))
+
+    def _edit_string_byte_1(self, finding: Finding):
+        """Convert string.byte(s, 1) to string.byte(s)."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str')
+        if not node or s_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'string.byte({s_str})'
+        ))
+
+    def _edit_math_log(self, finding: Finding):
+        """Convert math.log(x, base) to math.log(x)."""
+        node = finding.details.get('node')
+        x_str = finding.details.get('x_str')
+        if not node or x_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'math.log({x_str})'
+        ))
+
+    def _edit_math_mod(self, finding: Finding):
+        """Convert math.mod(x, y) to x % y."""
+        node = finding.details.get('node')
+        x_str = finding.details.get('x_str')
+        y_str = finding.details.get('y_str')
+        if not node or x_str is None or y_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # check if x needs parens
+        if not isinstance(node.args[0], (Name, Number, Call, Invoke, Index)):
+            x_str = f'({x_str})'
+        # check if y needs parens
+        if not isinstance(node.args[1], (Name, Number, Call, Invoke, Index)):
+            y_str = f'({y_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'{x_str} % {y_str}'
+        ))
+
+    def _edit_math_atan2(self, finding: Finding):
+        """Convert math.atan2(y, 1) to math.atan(y)."""
+        node = finding.details.get('node')
+        y_str = finding.details.get('y_str')
+        if not node or y_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'math.atan({y_str})'
+        ))
+
+    def _edit_return_ternary_simplification(self, finding: Finding):
+        """Convert if cond then return a else return b end to return cond and a or b."""
+        node = finding.details.get('node')
+        cond = finding.details.get('cond')
+        v1 = finding.details.get('v1')
+        v2 = finding.details.get('v2')
+
+        if not node or cond is None or v1 is None or v2 is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Optimization: use small-ternary
+        replacement = f'return {cond} and {v1} or {v2}'
 
         self.edits.append(SourceEdit(
             start_char=start,

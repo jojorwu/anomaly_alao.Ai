@@ -638,6 +638,34 @@ class ASTAnalyzer:
                 return  # Only remove from innermost scope where it exists
             scope = scope.parent
 
+    def _infer_type(self, node: Node) -> Optional[str]:
+        """Infer the Lua type of an expression node."""
+        if isinstance(node, (Number, AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp, UMinusOp)):
+            return 'number'
+        if isinstance(node, (String, Concat)):
+            return 'string'
+        if isinstance(node, (TrueExpr, FalseExpr, AndLoOp, OrLoOp, ULNotOp, LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp, EqToOp, NotEqToOp)):
+            return 'boolean'
+        if isinstance(node, Table):
+            return 'table'
+        if isinstance(node, (Function, LocalFunction)):
+            return 'function'
+        if isinstance(node, Nil):
+            return 'nil'
+        if isinstance(node, ULengthOP):
+            return 'number'
+        if isinstance(node, Call):
+            _, _, full_name = self._get_call_name(node)
+            if full_name in ('math.floor', 'math.ceil', 'math.abs', 'math.sqrt', 'math.sin', 'math.cos', 'math.random', 'math.pow', 'tonumber', 'string.len'):
+                return 'number'
+            if full_name in ('tostring', 'string.format', 'string.sub', 'string.gsub', 'string.lower', 'string.upper'):
+                return 'string'
+        if isinstance(node, Name):
+            key = self._find_local_key(node.id)
+            if key and key in self.active_assignments:
+                return self.active_assignments[key].inferred_type
+        return None
+
     def _is_in_locals(self, name: str) -> bool:
         """Check if name is in any scope's locals."""
         scope = self.current_scope
@@ -660,7 +688,7 @@ class ASTAnalyzer:
                     # (might be used in next iteration)
                     pass
 
-            new_assign = Assignment(line=line, node=value)
+            new_assign = Assignment(line=line, node=value, inferred_type=self._infer_type(value))
             self.local_vars[key].assignments.append(new_assign)
             self.active_assignments[key] = new_assign
 
@@ -1206,6 +1234,9 @@ class ASTAnalyzer:
         self._analyze_table_remove()
         self._analyze_deprecated_funcs()
         self._analyze_math_pow()
+        self._analyze_math_atan2()
+        self._analyze_math_mod()
+        self._analyze_math_log()
         self._analyze_uncached_globals()
         self._analyze_repeated_calls_in_scope()
         self._analyze_string_concat_in_loop()
@@ -1241,6 +1272,103 @@ class ASTAnalyzer:
         self._analyze_unpack_to_indexing()
         self._analyze_divide_by_constant()
         self._analyze_if_nil_assign()
+        self._analyze_redundant_tonumber_tostring()
+        self._analyze_string_byte_1()
+        self._analyze_pairs_to_next()
+        self._analyze_return_ternary()
+
+    def _analyze_redundant_tonumber_tostring(self):
+        """Find redundant tonumber() or tostring() calls."""
+        for call in self.calls:
+            if call.full_name in ('tonumber', 'tostring') and len(call.args) == 1:
+                arg = call.args[0]
+                inferred = self._infer_type(arg)
+
+                if (call.full_name == 'tonumber' and inferred == 'number') or \
+                   (call.full_name == 'tostring' and inferred == 'string'):
+                    arg_str = node_to_string(arg)
+                    self.findings.append(Finding(
+                        pattern_name='redundant_type_conversion',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'Redundant {call.full_name}({arg_str})',
+                        details={
+                            'func': call.full_name,
+                            'arg_str': arg_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_string_byte_1(self):
+        """Find string.byte(s, 1) and suggest string.byte(s)."""
+        for call in self.calls:
+            if call.full_name == 'string.byte' and len(call.args) == 2:
+                if isinstance(call.args[1], Number) and call.args[1].n == 1:
+                    s_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='string_byte_1',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'string.byte({s_str}, 1) -> string.byte({s_str})',
+                        details={
+                            's_str': s_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_pairs_to_next(self):
+        """Suggest next, t instead of pairs(t) in hot loops for LuaJIT."""
+        for call in self.calls:
+            if call.full_name == 'pairs' and (call.scope.is_hot_callback or call.in_loop):
+                table_name = node_to_string(call.args[0]) if call.args else "t"
+                self.findings.append(Finding(
+                    pattern_name='pairs_to_next',
+                    severity='YELLOW',
+                    line_num=call.line,
+                    message=f'pairs({table_name}) in hot loop -> next, {table_name}, nil is faster in LuaJIT',
+                    details={
+                        'table': table_name,
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_return_ternary(self):
+        """Find if cond then return a else return b end and suggest ternary return."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, If) and node.orelse and isinstance(node.orelse, Block):
+                if len(node.body.body) == 1 and len(node.orelse.body) == 1:
+                    stmt1 = node.body.body[0]
+                    stmt2 = node.orelse.body[0]
+
+                    if isinstance(stmt1, Return) and isinstance(stmt2, Return):
+                        if len(stmt1.values) == 1 and len(stmt2.values) == 1:
+                            v1 = stmt1.values[0]
+                            v2 = stmt2.values[0]
+
+                            # check if they are simple enough for ternary
+                            # AND v1 must be truthy for Lua ternary pattern to work
+                            if self._is_simple_expr(v1) and self._is_simple_expr(v2) and self._is_guaranteed_truthy(v1):
+                                cond_str = node_to_string(node.test)
+                                v1_str = node_to_string(v1)
+                                v2_str = node_to_string(v2)
+
+                                self.findings.append(Finding(
+                                    pattern_name='return_ternary_simplification',
+                                    severity='YELLOW',
+                                    line_num=self._get_line(node),
+                                    message=f'if {cond_str} then return {v1_str} else return {v2_str} end -> return {cond_str} and {v1_str} or {v2_str}',
+                                    details={
+                                        'cond': cond_str,
+                                        'v1': v1_str,
+                                        'v2': v2_str,
+                                        'node': node,
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
 
     def _analyze_string_match_existence(self):
         """Find string.match() used in boolean context with plain patterns."""
@@ -1648,16 +1776,30 @@ class ASTAnalyzer:
                         ))
 
     def _analyze_constant_folding(self):
-        """Find arithmetic operations on numeric literals that can be folded."""
+        """Find arithmetic operations on numeric literals and constants that can be folded."""
+        import math as py_math
         ops = {
             AddOp: "+", SubOp: "-", MultOp: "*", FloatDivOp: "/",
             ModOp: "%", ExpoOp: "^"
         }
+
+        def get_const_val(node):
+            if isinstance(node, Number):
+                return node.n
+            if isinstance(node, Index):
+                full_name = node_to_string(node)
+                if full_name == 'math.pi':
+                    return py_math.pi
+                if full_name == 'math.huge':
+                    return float('inf')
+            return None
+
         for node in ast.walk(self._ast_tree):
             if isinstance(node, tuple(ops.keys())):
-                if isinstance(node.left, Number) and isinstance(node.right, Number):
-                    l_val = node.left.n
-                    r_val = node.right.n
+                l_val = get_const_val(node.left)
+                r_val = get_const_val(node.right)
+
+                if l_val is not None and r_val is not None:
                     op_str = ops[type(node)]
 
                     try:
@@ -1679,7 +1821,8 @@ class ASTAnalyzer:
                         if result == int(result):
                             res_str = str(int(result))
                         else:
-                            res_str = f"{result:.6g}"
+                            # use enough precision for floats
+                            res_str = f"{result:.10g}"
 
                         self.findings.append(Finding(
                             pattern_name='constant_folding',
@@ -2171,6 +2314,78 @@ class ASTAnalyzer:
                                 source_line=self._get_source_line(call.line),
                             ))
 
+    def _analyze_math_log(self):
+        """Find math.log(x, base) and suggest math.log(x) if base is e."""
+        for call in self.calls:
+            if call.full_name == 'math.log' and len(call.args) == 2:
+                base_node = call.args[1]
+                is_e = False
+
+                # check for math.exp(1)
+                if isinstance(base_node, Call):
+                    _, _, full_name = self._get_call_name(base_node)
+                    if full_name == 'math.exp' and len(base_node.args) == 1:
+                        arg = base_node.args[0]
+                        if isinstance(arg, Number) and arg.n == 1:
+                            is_e = True
+
+                # check for numeric value of e (approx)
+                elif isinstance(base_node, Number):
+                    if 2.71828 <= base_node.n <= 2.71829:
+                        is_e = True
+
+                if is_e:
+                    x_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='math_log_base_e',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.log({x_str}, e) -> math.log({x_str})',
+                        details={
+                            'x_str': x_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_math_mod(self):
+        """Find math.mod(x, y) and suggest x % y."""
+        for call in self.calls:
+            if call.full_name == 'math.mod' and len(call.args) == 2:
+                x_str = node_to_string(call.args[0])
+                y_str = node_to_string(call.args[1])
+                self.findings.append(Finding(
+                    pattern_name='math_mod_to_percent',
+                    severity='GREEN',
+                    line_num=call.line,
+                    message=f'math.mod({x_str}, {y_str}) -> {x_str} % {y_str}',
+                    details={
+                        'x_str': x_str,
+                        'y_str': y_str,
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_math_atan2(self):
+        """Find math.atan2(y, 1) and suggest math.atan(y)."""
+        for call in self.calls:
+            if call.full_name == 'math.atan2' and len(call.args) == 2:
+                arg2 = call.args[1]
+                if isinstance(arg2, Number) and arg2.n == 1:
+                    y_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='math_atan2_to_atan',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.atan2({y_str}, 1) -> math.atan({y_str})',
+                        details={
+                            'y_str': y_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
     def _analyze_math_pow(self):
         """Find math.pow that can be simplified."""
         for call in self.calls:
@@ -2219,7 +2434,17 @@ class ASTAnalyzer:
 
     def _is_simple_expr(self, node: Node) -> bool:
         """Check if node is a simple expression (safe to repeat)."""
-        return isinstance(node, (Name, Number))
+        return isinstance(node, (Name, Number, String, TrueExpr, FalseExpr))
+
+    def _is_guaranteed_truthy(self, node: Node) -> bool:
+        """Check if node is guaranteed to be truthy in Lua."""
+        if isinstance(node, (Number, String, TrueExpr, Table, Function, LocalFunction)):
+            return True
+        # also check inferred type
+        inferred = self._infer_type(node)
+        if inferred in ('number', 'string', 'table', 'function'):
+            return True
+        return False
     
     def _count_calls_branch_aware(self, calls: List[CallInfo]) -> int:
         """
@@ -2964,11 +3189,28 @@ class ASTAnalyzer:
         """
         # Report unused locals from scope-aware tracking
         for (scope_id, name), info in self.local_vars.items():
-            # Skip functions (handled separately) and loop vars
-            if info.is_function or info.is_loop_var:
+            # Skip functions (handled separately)
+            if info.is_function:
                 continue
                 
             if not info.is_read:
+                # Special pattern for unused loop variables
+                if info.is_loop_var:
+                    scope_name = info.scope.name if info.scope else '<unknown>'
+                    self.findings.append(Finding(
+                        pattern_name='unused_loop_variable',
+                        severity='YELLOW',
+                        line_num=info.assign_line,
+                        message=f"Loop variable '{name}' is never used in {scope_name}",
+                        details={
+                            'var_name': name,
+                            'assign_line': info.assign_line,
+                            'scope_name': scope_name,
+                        },
+                        source_line=self._get_source_line(info.assign_line),
+                    ))
+                    continue
+
                 # Check if it's used as callback (RegisterScriptCallback)
                 if name in self.callback_registrations:
                     continue
