@@ -227,6 +227,10 @@ class ASTTransformer:
             self._edit_math_random_0_1(finding)
         elif pattern == 'string_rep_simple':
             self._edit_string_rep_simple(finding)
+        elif pattern == 'algebraic_simplification':
+            self._edit_algebraic_simplification(finding)
+        elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
+            self._edit_string_starts_with(finding)
 
 
     # Edit methods using AST positions
@@ -534,6 +538,41 @@ class ASTTransformer:
                 replacement = f'not {target_str}'
             else:
                 replacement = f'not ({target_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_string_starts_with(self, finding: Finding):
+        """Replace string.find(s, p) == 1 with string.sub(s, 1, #p) == p."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
+    def _edit_algebraic_simplification(self, finding: Finding):
+        """Replace redundant algebraic operation with the target expression."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
 
         self.edits.append(SourceEdit(
             start_char=start,
@@ -1034,6 +1073,10 @@ class ASTTransformer:
                 replacement = f'1/math.sqrt({base})'
             else:
                 return
+        elif pow_type == 'power_1':
+            replacement = base
+        elif pow_type == 'power_0':
+            replacement = '1'
         else:
             return
 

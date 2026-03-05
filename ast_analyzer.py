@@ -1287,6 +1287,120 @@ class ASTAnalyzer:
         self._analyze_string_byte_1()
         self._analyze_pairs_to_next()
         self._analyze_return_ternary()
+        self._analyze_algebraic_simplification()
+        self._analyze_string_starts_with()
+
+    def _analyze_string_starts_with(self):
+        """Find string.find(s, prefix) == 1 and suggest string.sub(s, 1, #prefix) == prefix."""
+        lua_regex_chars = set(b'^$()%.[]*+-?')
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, EqToOp):
+                call = None
+
+                if isinstance(node.left, Call) and isinstance(node.right, Number) and node.right.n == 1:
+                    call = node.left
+                elif isinstance(node.right, Call) and isinstance(node.left, Number) and node.left.n == 1:
+                    call = node.right
+
+                if call:
+                    _, _, full_name = self._get_call_name(call)
+                    if full_name == 'string.find' and len(call.args) >= 2:
+                        s_node = call.args[0]
+                        prefix_node = call.args[1]
+
+                        if isinstance(prefix_node, String):
+                            prefix_val = prefix_node.s
+                            prefix_bytes = prefix_val if isinstance(prefix_val, bytes) else prefix_val.encode('utf-8', errors='replace')
+
+                            # if it contains regex chars, we can't safely use this optimization
+                            # unless it's a plain find, but we're suggesting sub which is plain anyway
+                            if not any(b in lua_regex_chars for b in prefix_bytes):
+                                s_str = node_to_string(s_node)
+                                prefix_len = len(prefix_bytes)
+                                prefix_text = prefix_bytes.decode('utf-8', errors='replace')
+
+                                # suggestions
+                                if prefix_len == 1:
+                                    # string.byte(s) == code
+                                    replacement = f'string.byte({s_str}) == {prefix_bytes[0]}'
+                                    pattern = 'string_starts_with_byte'
+                                else:
+                                    replacement = f'string.sub({s_str}, 1, {prefix_len}) == "{prefix_text}"'
+                                    pattern = 'string_starts_with_sub'
+
+                                self.findings.append(Finding(
+                                    pattern_name=pattern,
+                                    severity='GREEN',
+                                    line_num=self._get_line(node),
+                                    message=f'string.find(s, "{prefix_text}") == 1 -> {replacement} (faster in LuaJIT)',
+                                    details={
+                                        's_str': s_str,
+                                        'prefix': prefix_text,
+                                        'replacement': replacement,
+                                        'node': node,
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+
+    def _analyze_algebraic_simplification(self):
+        """Find redundant algebraic operations like x + 0, x * 1."""
+        if not self._ast_tree: return
+
+        ops = (AddOp, SubOp, MultOp, FloatDivOp, ExpoOp)
+
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, ops):
+                left_val = self._get_const_val(node.left)
+                right_val = self._get_const_val(node.right)
+
+                target = None
+                reason = None
+
+                if isinstance(node, AddOp):
+                    if right_val == 0: target = node.left; reason = "x + 0"
+                    elif left_val == 0: target = node.right; reason = "0 + x"
+                elif isinstance(node, SubOp):
+                    if right_val == 0: target = node.left; reason = "x - 0"
+                elif isinstance(node, MultOp):
+                    if right_val == 1: target = node.left; reason = "x * 1"
+                    elif left_val == 1: target = node.right; reason = "1 * x"
+                elif isinstance(node, FloatDivOp):
+                    if right_val == 1: target = node.left; reason = "x / 1"
+                elif isinstance(node, ExpoOp):
+                    if right_val == 1: target = node.left; reason = "x ^ 1"
+                    elif right_val == 0:
+                        # x ^ 0 is always 1 in Lua, even for 0 ^ 0
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: x ^ 0 -> 1',
+                            details={
+                                'target_node': None,
+                                'node': node,
+                                'replacement': '1'
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
+
+                if target:
+                    # Only optimize if the non-constant part is inferred to be a number
+                    # to avoid changing behavior (e.g. string + 0 errors in Lua)
+                    if self._infer_type(target) == 'number':
+                        target_str = node_to_string(target)
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: {reason} -> {target_str}',
+                            details={
+                                'target_node': target,
+                                'node': node,
+                                'replacement': target_str
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
 
     def _analyze_redundant_tonumber_tostring(self):
         """Find redundant tonumber() or tostring() calls."""
@@ -1724,16 +1838,18 @@ class ASTAnalyzer:
                     call = node.right
                     const_str = node.left.s
 
-                if call and const_str and len(const_str) == 1:
-                    _, _, full_name = self._get_call_name(call)
-                    if full_name == 'string.sub' and len(call.args) >= 2:
-                        # check if it's string.sub(s, n, n)
-                        s_str = node_to_string(call.args[0])
-                        n_str = node_to_string(call.args[1])
-                        m_str = node_to_string(call.args[2]) if len(call.args) > 2 else None
+                if call and const_str:
+                    const_bytes = const_str if isinstance(const_str, bytes) else const_str.encode('utf-8', errors='replace')
+                    if len(const_bytes) == 1:
+                        _, _, full_name = self._get_call_name(call)
+                        if full_name == 'string.sub' and len(call.args) >= 2:
+                            # check if it's string.sub(s, n, n)
+                            s_str = node_to_string(call.args[0])
+                            n_str = node_to_string(call.args[1])
+                            m_str = node_to_string(call.args[2]) if len(call.args) > 2 else None
 
-                        if n_str == m_str or (m_str is None and n_str == "1"):
-                            byte_val = ord(const_str)
+                            if n_str == m_str or (m_str is None and n_str == "1"):
+                                byte_val = const_bytes[0]
                             op = '==' if isinstance(node, EqToOp) else '~='
 
                             self.findings.append(Finding(
@@ -1809,6 +1925,8 @@ class ASTAnalyzer:
         """Helper to get constant value of a node if possible."""
         if isinstance(node, Number):
             return node.n
+        if isinstance(node, String):
+            return node.s
         if isinstance(node, UMinusOp):
             val = self._get_const_val(node.operand)
             return -val if val is not None else None
@@ -1871,6 +1989,113 @@ class ASTAnalyzer:
                             details={'result': res_str, 'node': node},
                             source_line=self._get_source_line(self._get_line(node)),
                         ))
+
+                # Fold bit operations
+                elif full_name.startswith('bit.') and len(node.args) >= 1:
+                    arg_vals = [self._get_const_val(arg) for arg in node.args]
+                    if all(v is not None for v in arg_vals):
+                        # Convert to 32-bit integers for bitwise ops
+                        int_args = [int(v) & 0xFFFFFFFF for v in arg_vals]
+                        result = None
+
+                        try:
+                            if full_name == 'bit.band':
+                                result = int_args[0]
+                                for val in int_args[1:]: result &= val
+                            elif full_name == 'bit.bor':
+                                result = int_args[0]
+                                for val in int_args[1:]: result |= val
+                            elif full_name == 'bit.bxor':
+                                result = int_args[0]
+                                for val in int_args[1:]: result ^= val
+                            elif full_name == 'bit.bnot' and len(int_args) == 1:
+                                result = ~int_args[0] & 0xFFFFFFFF
+                            elif full_name == 'bit.lshift' and len(int_args) == 2:
+                                result = (int_args[0] << (int_args[1] & 31)) & 0xFFFFFFFF
+                            elif full_name == 'bit.rshift' and len(int_args) == 2:
+                                result = (int_args[0] >> (int_args[1] & 31)) & 0xFFFFFFFF
+                            elif full_name == 'bit.arshift' and len(int_args) == 2:
+                                # Arithmetic shift right (sign-preserving)
+                                # In Python, >> on signed ints is already arithmetic
+                                # We need to treat as 32-bit signed
+                                x = int_args[0]
+                                if x & 0x80000000: x -= 0x100000000
+                                result = (x >> (int_args[1] & 31)) & 0xFFFFFFFF
+                            elif full_name == 'bit.rol' and len(int_args) == 2:
+                                n = int_args[1] & 31
+                                result = ((int_args[0] << n) | (int_args[0] >> (32 - n))) & 0xFFFFFFFF
+                            elif full_name == 'bit.ror' and len(int_args) == 2:
+                                n = int_args[1] & 31
+                                result = ((int_args[0] >> n) | (int_args[0] << (32 - n))) & 0xFFFFFFFF
+                        except (ValueError, IndexError):
+                            continue
+
+                        if result is not None:
+                            # LuaJIT bit library returns signed 32-bit integers
+                            if result & 0x80000000:
+                                result -= 0x100000000
+
+                            res_str = str(result)
+                            self.findings.append(Finding(
+                                pattern_name='constant_folding',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Constant folding: {full_name}({", ".join(map(str, arg_vals))}) -> {res_str}',
+                                details={'result': res_str, 'node': node},
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
+                # Fold string and conversion functions
+                elif full_name in ('string.len', 'string.byte', 'string.char', 'string.upper', 'string.lower', 'tonumber', 'tostring'):
+                    arg_vals = [self._get_const_val(arg) for arg in node.args]
+                    if all(v is not None for v in arg_vals):
+                        result = None
+                        try:
+                            if full_name == 'string.len' and len(arg_vals) == 1:
+                                val = arg_vals[0]
+                                if isinstance(val, str): val = val.encode('utf-8')
+                                if isinstance(val, bytes): result = len(val)
+                            elif full_name == 'string.byte' and len(arg_vals) >= 1:
+                                s = arg_vals[0]
+                                if isinstance(s, str): s = s.encode('utf-8')
+                                if isinstance(s, bytes):
+                                    idx = int(arg_vals[1]) if len(arg_vals) > 1 else 1
+                                    if 1 <= idx <= len(s): result = s[idx-1]
+                            elif full_name == 'string.char':
+                                if all(isinstance(v, (int, float)) for v in arg_vals):
+                                    result = '"' + "".join(chr(int(v) & 0xFF) for v in arg_vals) + '"'
+                            elif full_name == 'tonumber' and len(arg_vals) == 1:
+                                result = float(arg_vals[0])
+                            elif full_name == 'string.upper' and len(arg_vals) == 1:
+                                val = arg_vals[0]
+                                if isinstance(val, bytes): val = val.decode('utf-8', errors='replace')
+                                if isinstance(val, str): result = f'"{val.upper()}"'
+                            elif full_name == 'string.lower' and len(arg_vals) == 1:
+                                val = arg_vals[0]
+                                if isinstance(val, bytes): val = val.decode('utf-8', errors='replace')
+                                if isinstance(val, str): result = f'"{val.lower()}"'
+                            elif full_name == 'tostring' and len(arg_vals) == 1:
+                                val = arg_vals[0]
+                                if isinstance(val, bytes):
+                                    val = val.decode('utf-8', errors='replace')
+
+                                if isinstance(val, (int, float)):
+                                    result = f'"{val:.10g}"' if val != int(val) else f'"{int(val)}"'
+                                elif isinstance(val, str):
+                                    result = f'"{val}"'
+                        except (ValueError, TypeError, OverflowError):
+                            continue
+
+                        if result is not None:
+                            res_str = f"{result:.10g}" if isinstance(result, float) and result != int(result) else str(result)
+                            self.findings.append(Finding(
+                                pattern_name='constant_folding',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Constant folding: {full_name}({", ".join(map(str, arg_vals))}) -> {res_str}',
+                                details={'result': res_str, 'node': node},
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
 
         for node in ast.walk(self._ast_tree):
             if isinstance(node, UMinusOp):
@@ -2636,6 +2861,38 @@ class ASTAnalyzer:
                                 'base': base,
                                 'exponent': -0.5,
                                 'type': 'power_neg',
+                                'is_simple': True,
+                                'full_match': full_match,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                    elif exp == 1:
+                        self.findings.append(Finding(
+                            pattern_name='math_pow_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'{full_match} -> {base}',
+                            details={
+                                'base': base,
+                                'exponent': 1,
+                                'type': 'power_1',
+                                'is_simple': True,
+                                'full_match': full_match,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                    elif exp == 0:
+                        self.findings.append(Finding(
+                            pattern_name='math_pow_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'{full_match} -> 1',
+                            details={
+                                'base': base,
+                                'exponent': 0,
+                                'type': 'power_0',
                                 'is_simple': True,
                                 'full_match': full_match,
                                 'node': call.node,
