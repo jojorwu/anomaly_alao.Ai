@@ -1237,6 +1237,9 @@ class ASTAnalyzer:
         self._analyze_math_atan2()
         self._analyze_math_mod()
         self._analyze_math_log()
+        self._analyze_math_deg_rad()
+        self._analyze_math_random_0_1()
+        self._analyze_string_rep()
         self._analyze_uncached_globals()
         self._analyze_repeated_calls_in_scope()
         self._analyze_string_concat_in_loop()
@@ -1794,6 +1797,28 @@ class ASTAnalyzer:
                     return float('inf')
             return None
 
+        # Fold math.deg and math.rad with constant arguments
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, Call):
+                _, _, full_name = self._get_call_name(node)
+                if full_name in ('math.deg', 'math.rad') and len(node.args) == 1:
+                    arg_val = get_const_val(node.args[0])
+                    if arg_val is not None:
+                        if full_name == 'math.deg':
+                            result = py_math.degrees(arg_val)
+                        else:
+                            result = py_math.radians(arg_val)
+
+                        res_str = f"{result:.10g}" if result != int(result) else str(int(result))
+                        self.findings.append(Finding(
+                            pattern_name='constant_folding',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Constant folding: {full_name}({arg_val}) -> {res_str}',
+                            details={'result': res_str, 'node': node},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
         for node in ast.walk(self._ast_tree):
             if isinstance(node, tuple(ops.keys())):
                 l_val = get_const_val(node.left)
@@ -2313,6 +2338,79 @@ class ASTAnalyzer:
                                 },
                                 source_line=self._get_source_line(call.line),
                             ))
+
+    def _analyze_math_random_0_1(self):
+        """Find math.random(0, 1) and suggest math.random()."""
+        for call in self.calls:
+            if call.full_name == 'math.random' and len(call.args) == 2:
+                arg1 = call.args[0]
+                arg2 = call.args[1]
+                if isinstance(arg1, Number) and arg1.n == 0 and \
+                   isinstance(arg2, Number) and arg2.n == 1:
+                    self.findings.append(Finding(
+                        pattern_name='math_random_0_1',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message='math.random(0, 1) -> math.random()',
+                        details={'node': call.node},
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_math_deg_rad(self):
+        """Find math.deg(x) or math.rad(x) and suggest multiplication by constant."""
+        import math as py_math
+        for call in self.calls:
+            if call.full_name in ('math.deg', 'math.rad') and len(call.args) == 1:
+                arg = call.args[0]
+                if isinstance(arg, Number):
+                    continue # handled by constant folding
+
+                x_str = node_to_string(arg)
+
+                if call.full_name == 'math.deg':
+                    # x * (180 / pi)
+                    const = 180 / py_math.pi
+                    msg = f'math.deg({x_str}) -> {x_str} * {const:.10g}'
+                    pattern = 'math_deg_to_mult'
+                else:
+                    # x * (pi / 180)
+                    const = py_math.pi / 180
+                    msg = f'math.rad({x_str}) -> {x_str} * {const:.10g}'
+                    pattern = 'math_rad_to_mult'
+
+                self.findings.append(Finding(
+                    pattern_name=pattern,
+                    severity='GREEN',
+                    line_num=call.line,
+                    message=msg,
+                    details={
+                        'x_str': x_str,
+                        'const': f'{const:.10g}',
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_string_rep(self):
+        """Find string.rep(s, 2) and suggest s .. s."""
+        for call in self.calls:
+            if call.full_name == 'string.rep' and len(call.args) == 2:
+                count_node = call.args[1]
+                if isinstance(count_node, Number) and count_node.n == 2:
+                    s_str = node_to_string(call.args[0])
+                    if self._is_simple_expr(call.args[0]):
+                        replacement = f'{s_str} .. {s_str}'
+                        self.findings.append(Finding(
+                            pattern_name='string_rep_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.rep({s_str}, 2) -> {replacement}',
+                            details={
+                                'replacement': replacement,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
 
     def _analyze_math_log(self):
         """Find math.log(x, base) and suggest math.log(x) if base is e."""

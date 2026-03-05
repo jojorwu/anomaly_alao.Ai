@@ -221,6 +221,12 @@ class ASTTransformer:
             self._edit_math_mod(finding)
         elif pattern == 'math_log_base_e':
             self._edit_math_log(finding)
+        elif pattern in ('math_deg_to_mult', 'math_rad_to_mult'):
+            self._edit_math_deg_rad(finding)
+        elif pattern == 'math_random_0_1':
+            self._edit_math_random_0_1(finding)
+        elif pattern == 'string_rep_simple':
+            self._edit_string_rep_simple(finding)
 
 
     # Edit methods using AST positions
@@ -334,6 +340,61 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=f'string.byte({s_str})'
+        ))
+
+    def _edit_string_rep_simple(self, finding: Finding):
+        """Convert string.rep(s, 2) to s .. s."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_math_random_0_1(self, finding: Finding):
+        """Convert math.random(0, 1) to math.random()."""
+        node = finding.details.get('node')
+        if not node:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement='math.random()'
+        ))
+
+    def _edit_math_deg_rad(self, finding: Finding):
+        """Convert math.deg(x) or math.rad(x) to x * const."""
+        node = finding.details.get('node')
+        x_str = finding.details.get('x_str')
+        const = finding.details.get('const')
+        if not node or x_str is None or const is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # check if x needs parens
+        if not isinstance(node.args[0], (Name, Number, Call, Invoke, Index)):
+            x_str = f'({x_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'{x_str} * {const}'
         ))
 
     def _edit_math_log(self, finding: Finding):
