@@ -65,6 +65,7 @@ import shutil
 import zipfile
 import glob
 import traceback
+from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, BrokenExecutor
@@ -74,6 +75,7 @@ from ast_analyzer import analyze_file
 from ast_transformer import transform_file
 from reporter import Reporter
 from models import Finding
+from whole_program_analyzer import WholeProgramAnalyzer
 
 
 def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: int = 4, experimental: bool = False):
@@ -150,7 +152,11 @@ def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False)
         filename = f'scripts-backup-{timestamp}.zip'
         # save in mods_root if provided, otherwise current directory
         if mods_root:
-            output_path = Path(mods_root) / filename
+            mods_root = Path(mods_root)
+            if mods_root.is_file():
+                output_path = mods_root.parent / filename
+            else:
+                output_path = mods_root / filename
         else:
             output_path = Path(filename)
     else:
@@ -193,7 +199,8 @@ def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False)
         return None
 
 
-def main():
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Anomaly Lua Auto Optimizer (ALAO)"
     )
@@ -341,6 +348,11 @@ def main():
         default=None,
         help="Path to file containing mod names to exclude (one per line)"
     )
+    parser.add_argument(
+        "--cross-file",
+        action="store_true",
+        help="Perform whole-program (cross-file) analysis to detect unused global functions/variables"
+    )
 
     args = parser.parse_args()
 
@@ -348,7 +360,10 @@ def main():
     if args.cache_threshold < 2:
         print(f"Warning: Invalid cache threshold ({args.cache_threshold}), using minimum value of 2")
         args.cache_threshold = 2
+    return args
 
+def get_files_to_process(args: argparse.Namespace) -> Tuple[Path, Dict[str, List[Path]]]:
+    """Discover and filter mods/scripts based on arguments."""
     # try get path interactively if not provided
     if args.path:
         # clean path: strip quotes, trailing slashes, and fix common issues
@@ -458,6 +473,96 @@ def main():
         print(f"Found {total_scripts} script files (direct mode)\n")
     else:
         print(f"Found {len(mods)} mods with {total_scripts} script files\n")
+    return mods_path, mods
+
+def run_parallel(work_items: List[Any], worker_func: Any, num_workers: int, quiet: bool = False, desc: str = "Processing") -> Tuple[List[Tuple[Any, Optional[Exception]]], bool, bool, int]:
+    """Generic helper to run tasks in parallel with progress tracking."""
+    completed = 0
+    results = []
+    start_time = datetime.now()
+    total = len(work_items)
+    pool_crashed = False
+    interrupted = False
+
+    if not work_items:
+        return [], False, False, 0
+
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Map futures to their corresponding work items
+            futures = {executor.submit(worker_func, item): item for item in work_items}
+
+            for future in as_completed(futures):
+                item = futures[future]
+                completed += 1
+                if not quiet:
+                    progress = (completed / total * 100)
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    rate = completed / elapsed if elapsed > 0.01 else 0
+                    remaining = total - completed
+                    eta = remaining / rate if rate > 0 and remaining > 0 else 0
+                    print(f"\r[{progress:5.1f}%] {desc} {completed}/{total} | ETA: {eta:.0f}s  ", end="", flush=True)
+
+                try:
+                    result = future.result()
+                    results.append((result, None, item))
+                except Exception as e:
+                    results.append((None, e, item))
+    except BrokenExecutor:
+        pool_crashed = True
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"\n\nInterrupted!")
+
+    return results, pool_crashed, interrupted, completed
+
+def print_final_stats(args: argparse.Namespace, reporter: Reporter, files_analyzed: int, files_with_issues: int, files_skipped: int, parse_errors: int, files_modified: int, total_edits: int) -> None:
+    """Print final statistics and usage tips."""
+    print(f"\n{'=' * 55}")
+    print(f"Files analyzed: {files_analyzed}")
+    print(f"Files with issues: {files_with_issues}")
+    if files_skipped > 0:
+        print(f"Files skipped (timeout/error): {files_skipped}")
+    if parse_errors > 0:
+        print(f"Files with parse errors: {parse_errors}")
+
+    fix_flags_set = (args.fix or args.fix_debug or args.fix_yellow or
+                     args.experimental or args.fix_nil or args.remove_dead_code)
+
+    if fix_flags_set:
+        print(f"Files modified: {files_modified}")
+        print(f"Total edits applied: {total_edits}")
+
+    print(f"\nFindings: {reporter.get_findings_summary()}")
+
+    green_count = reporter.count_by_severity("GREEN")
+    yellow_count = reporter.count_by_severity("YELLOW")
+    debug_count = reporter.count_by_severity("DEBUG")
+
+    # count fixable findings for tips
+    nil_fixable = sum(1 for f in reporter.all_findings
+                     if f.pattern_name == 'potential_nil_access' and f.details.get('is_safe_to_fix'))
+    dead_code_fixable = sum(1 for f in reporter.all_findings
+                           if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
+
+    if green_count > 0 and not args.fix:
+        print("\nTip: Run with --fix to automatically apply GREEN fixes")
+    if yellow_count > 0 and not args.fix_yellow:
+        print("Tip: Run with --fix-yellow to also apply YELLOW fixes (unsafe)")
+    if debug_count > 0 and not args.fix_debug:
+        print("Tip: Run with --fix-debug to comment out DEBUG statements")
+    if yellow_count > 0 and not args.experimental:
+        print("Tip: Run with --experimental to fix string concat in loops (experimental)")
+    if nil_fixable > 0 and not args.fix_nil:
+        print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
+    if dead_code_fixable > 0 and not args.remove_dead_code:
+        print("Tip: Run with --remove-dead-code to remove safe unreachable code")
+    if fix_flags_set:
+        print("Tip: Run with --revert to undo all changes using .alao-bak files")
+
+def main():
+    args = parse_args()
+    mods_path, mods = get_files_to_process(args)
 
     # handle backup operations (only ALAO-created .alao-bak files)
     if args.list_backups or args.revert or args.clean_backups:
@@ -686,66 +791,30 @@ def main():
         for mod_name, script_path in all_files
     ]
 
-    completed = 0
-    pool_crashed = False
-    interrupted = False
-    processed_paths = set()  # track which files were processed
+    processed_paths = set()
+    results, pool_crashed, interrupted, completed = run_parallel(work_items, analyze_file_worker, num_workers, args.quiet, "Analyzing")
 
-    try:
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(analyze_file_worker, item): item for item in work_items}
+    for res, err, item in results:
+        mod_name, script_path, findings, error = res if res else (item[0], item[1], [], str(err))
+        processed_paths.add(script_path)
 
-            for future in as_completed(futures):
-                item = futures[future]
-                
-                try:
-                    mod_name, script_path, findings, error = future.result()
-                    processed_paths.add(script_path)
-                    completed += 1
-                except BrokenExecutor:
-                    pool_crashed = True
-                    break
-                except Exception as e:
-                    processed_paths.add(item[1])
-                    completed += 1
-                    files_skipped += 1
-                    if args.verbose:
-                        print(f"\n  [ERROR] {item[1].name}: {e}")
-                    continue
-
-                if not args.quiet:
-                    total = len(all_files)
-                    progress = (completed / total * 100) if total > 0 else 100
-                    elapsed = (datetime.now() - start_time).total_seconds()
-                    rate = completed / elapsed if elapsed > 0.01 else 0
-                    remaining = total - completed
-                    eta = remaining / rate if rate > 0 and remaining > 0 else 0
-                    print(
-                        f"\r[{progress:5.1f}%] {completed}/{total} | ETA: {eta:.0f}s  ", end="", flush=True)
-
-                if error:
-                    if 'SyntaxError' in error or 'parse' in error.lower() or 'TimeoutError' in error:
-                        parse_errors += 1
-                        if args.verbose:
-                            print(f"\n  [PARSE ERROR] {script_path.name}")
-                    else:
-                        files_skipped += 1
-                        if args.verbose:
-                            print(f"\n  [ERROR] {script_path.name}: {error}")
-                else:
-                    files_analyzed += 1
-                    if findings:
-                        files_with_issues += 1
-                        for finding in findings:
-                            reporter.add_finding(mod_name, script_path, finding)
-
-                        if args.verbose and not args.quiet:
-                            print(f"\n  [{len(findings):3d} issues] {script_path.name}")
-    except BrokenExecutor:
-        pool_crashed = True
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\n\nInterrupted! Finishing current tasks...")
+        if error:
+            if 'SyntaxError' in error or 'parse' in error.lower() or 'TimeoutError' in error:
+                parse_errors += 1
+                if args.verbose:
+                    print(f"\n  [PARSE ERROR] {script_path.name}")
+            else:
+                files_skipped += 1
+                if args.verbose:
+                    print(f"\n  [ERROR] {script_path.name}: {error}")
+        else:
+            files_analyzed += 1
+            if findings:
+                files_with_issues += 1
+                for finding in findings:
+                    reporter.add_finding(mod_name, script_path, finding)
+                if args.verbose and not args.quiet:
+                    print(f"\n  [{len(findings):3d} issues] {script_path.name}")
 
     if interrupted:
         print(f"Processed {completed}/{len(all_files)} files before interruption.")
@@ -780,6 +849,30 @@ def main():
     # clear progress line
     if not args.quiet:
         print("\r" + " " * 80 + "\r", end="")
+
+    # perform cross-file analysis if requested
+    if args.cross_file:
+        if not args.quiet:
+            print("Performing whole-program (cross-file) analysis...")
+
+        try:
+            wp_analyzer = WholeProgramAnalyzer()
+            wp_analyzer.analyze_files([s for _, s in all_files])
+
+            # map findings back to their respective mods
+            file_to_mod = {s: m for m, s in all_files}
+
+            wp_findings = wp_analyzer.get_findings()
+            for file_path, finding in wp_findings:
+                mod_name = file_to_mod.get(file_path, "(unknown)")
+                reporter.add_finding(mod_name, file_path, finding)
+
+            if not args.quiet:
+                print(f"  Found {len(wp_findings)} unused global symbols.\n")
+        except Exception as e:
+            print(f"Warning: Cross-file analysis failed: {e}")
+            if args.verbose:
+                traceback.print_exc()
 
     # apply fixes if requested
     files_modified = 0
@@ -852,49 +945,21 @@ def main():
             if not args.quiet:
                 print()
         else:
-            completed = 0
-            pool_crashed = False
-            transform_interrupted = False
             processed_paths = set()
+            results, pool_crashed, transform_interrupted, transform_completed = run_parallel(work_items, transform_file_worker, num_workers, args.quiet, "Fixing")
 
-            try:
-                with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                    futures = {
-                        executor.submit(
-                            transform_file_worker,
-                            item): item for item in work_items}
+            for res, err, item in results:
+                script_path, modified, edit_count, error = res if res else (item[0], False, 0, str(err))
+                processed_paths.add(script_path)
 
-                    for future in as_completed(futures):
-                        completed += 1
-                        if not args.quiet:
-                            progress = (completed / len(work_items) * 100) if work_items else 100
-                            print(
-                                f"\r[{progress:5.1f}%] Fixing {completed}/{len(work_items)}...", end="", flush=True)
-
-                        try:
-                            script_path, modified, edit_count, error = future.result()
-                            processed_paths.add(futures[future][0])
-                        except BrokenExecutor:
-                            pool_crashed = True
-                            break
-                        except Exception as e:
-                            if args.verbose:
-                                print(f"\n  [ERROR] {e}")
-                            continue
-
-                        if error:
-                            if args.verbose:
-                                print(f"\n  [FIX ERROR] {script_path.name}: {error}")
-                        elif modified:
-                            files_modified += 1
-                            total_edits += edit_count
-                            if args.verbose:
-                                print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
-            except BrokenExecutor:
-                pool_crashed = True
-            except KeyboardInterrupt:
-                transform_interrupted = True
-                print("\n\nInterrupted during fixes! Some files may have been modified.")
+                if error:
+                    if args.verbose:
+                        print(f"\n  [FIX ERROR] {script_path.name}: {error}")
+                elif modified:
+                    files_modified += 1
+                    total_edits += edit_count
+                    if args.verbose:
+                        print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
 
             if pool_crashed and not transform_interrupted:
                 if not args.quiet:
@@ -948,57 +1013,7 @@ def main():
         reporter.save(report_path, verbose=not args.quiet)
         print(f"Report saved to: {report_path}")
 
-    # final stats
-    print(f"\n{'=' * 55}")
-    print(f"Files analyzed: {files_analyzed}")
-    print(f"Files with issues: {files_with_issues}")
-    if files_skipped > 0:
-        print(f"Files skipped (timeout/error): {files_skipped}")
-    if parse_errors > 0:
-        print(f"Files with parse errors: {parse_errors}")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
-        print(f"Files modified: {files_modified}")
-        print(f"Total edits applied: {total_edits}")
-
-    green_count = reporter.count_by_severity("GREEN")
-    yellow_count = reporter.count_by_severity("YELLOW")
-    red_count = reporter.count_by_severity("RED")
-    debug_count = reporter.count_by_severity("DEBUG")
-    
-    # count nil access findings
-    nil_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'potential_nil_access')
-    nil_fixable = sum(1 for f in reporter.all_findings 
-                     if f.pattern_name == 'potential_nil_access' and f.details.get('is_safe_to_fix'))
-    
-    # count dead code findings
-    dead_code_count = sum(1 for f in reporter.all_findings if f.pattern_name.startswith('dead_code_'))
-    dead_code_fixable = sum(1 for f in reporter.all_findings
-                           if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
-    unused_count = sum(1 for f in reporter.all_findings if f.pattern_name.startswith('unused_'))
-
-    findings_str = f"{green_count} GREEN (auto-fixable), {yellow_count} YELLOW (review), {red_count} RED (info)"
-    if debug_count > 0:
-        findings_str += f", {debug_count} DEBUG (logging)"
-    if nil_count > 0:
-        findings_str += f", {nil_count} NIL ({nil_fixable} fixable)"
-    if dead_code_count > 0 or unused_count > 0:
-        findings_str += f", {dead_code_count + unused_count} DEAD-CODE ({dead_code_fixable} removable)"
-    print(f"\nFindings: {findings_str}")
-
-    if green_count > 0 and not args.fix:
-        print("\nTip: Run with --fix to automatically apply GREEN fixes")
-    if yellow_count > 0 and not args.fix_yellow: 
-        print("Tip: Run with --fix-yellow to also apply YELLOW fixes (unsafe)")
-    if debug_count > 0 and not args.fix_debug:
-        print("Tip: Run with --fix-debug to comment out DEBUG statements")
-    if yellow_count > 0 and not args.experimental:
-        print("Tip: Run with --experimental to fix string concat in loops (experimental)")
-    if nil_fixable > 0 and not args.fix_nil:
-        print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
-    if dead_code_fixable > 0 and not args.remove_dead_code:
-        print("Tip: Run with --remove-dead-code to remove safe unreachable code")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
-        print("Tip: Run with --revert to undo all changes using .alao-bak files")
+    print_final_stats(args, reporter, files_analyzed, files_with_issues, files_skipped, parse_errors, files_modified, total_edits)
 
 
 if __name__ == "__main__":

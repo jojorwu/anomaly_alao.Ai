@@ -20,331 +20,35 @@ from luaparser.astnodes import (
     SemiColon, Comment,
 )
 from typing import List, Dict, Set, Optional, Tuple, Any
-from dataclasses import dataclass, field
 from pathlib import Path
 from collections import defaultdict
 import sys
 import io
 import re
 
-from models import Finding, detect_file_encoding
-
-
-# Hot callbacks that run frequently
-HOT_CALLBACKS = frozenset({
-    'actor_on_update', 'actor_on_first_update',
-    'npc_on_update', 'monster_on_update',
-    'on_key_press', 'on_key_release', 'on_key_hold',
-    'actor_on_weapon_fired', 'actor_on_hud_animation_end',
-    'on_before_hit', 'on_hit',
-    'physic_object_on_hit_callback',
-    'npc_on_before_hit', 'monster_on_before_hit',
-    'npc_on_hit_callback', 'monster_on_hit_callback',
-    'actor_on_feel_touch',
-    'actor_on_item_take', 'actor_on_item_drop',
-    'actor_on_item_use',
-})
-
-# Per-frame callbacks detection
-PER_FRAME_CALLBACKS = frozenset({
-    'actor_on_update',
-    'npc_on_update',
-    'monster_on_update',
-    'physic_object_on_update',
-})
-
-# Bare globals that benefit from caching
-CACHEABLE_BARE_GLOBALS = frozenset({
-    'pairs', 'ipairs', 'next', 'type', 'tostring', 'tonumber',
-    'unpack', 'select', 'rawget', 'rawset',
-})
-
-# these are less beneficial to cache (error handling, output)
-BARE_GLOBALS_UNSAFE_TO_CACHE = frozenset({
-    'pcall', 'xpcall', 'error', 'assert', 'print',
-})
-
-# Module functions that benefit from caching
-CACHEABLE_MODULE_FUNCS = {
-    'math': frozenset({
-        'floor', 'ceil', 'abs', 'min', 'max', 'sqrt', 'sin', 'cos', 'tan',
-        'random', 'pow', 'log', 'exp', 'atan2', 'atan', 'asin', 'acos',
-        'deg', 'rad', 'fmod', 'modf', 'huge',
-    }),
-    'string': frozenset({
-        'find', 'sub', 'gsub', 'match', 'gmatch', 'format',
-        'lower', 'upper', 'len', 'rep', 'byte', 'char', 'reverse',
-    }),
-    'table': frozenset({
-        'insert', 'remove', 'concat', 'sort', 'getn', 'unpack',
-    }),
-    'bit': frozenset({
-        'band', 'bor', 'bxor', 'bnot', 'lshift', 'rshift', 'arshift', 'rol', 'ror',
-    }),
-}
-
-# Debug/logging function patterns
-DEBUG_FUNCTIONS = frozenset({
-    'print', 'printf', 'printe', 'printd', 'log',
-    'log1', 'log2', 'log3',
-    'DebugLog', 'debug_log', 'trace', 'dump',
-})
-
-# functions that have direct replacement patterns (not cached)
-DIRECT_REPLACEMENT_FUNCS = frozenset({
-    'table.insert', 'table.getn', 'string.len',
-})
-
-# Functions/properties that can return nil - calling methods on these without
-# nil checks can cause CTD (crash to desktop)
-# Format: full_name -> description of when it returns nil
-NIL_RETURNING_FUNCTIONS = {
-    # level functions
-    'level.object_by_id': 'object is offline or does not exist',
-    'level.get_target_obj': 'nothing under crosshair',
-    'level.get_target_element': 'nothing under crosshair',
-    'level.get_target_pos': 'nothing under crosshair',
-    'level.vertex_position': 'invalid vertex ID',
-    'level.get_view_entity': 'no view entity set',
-    
-    # alife functions
-    'alife': 'called from main menu or during loading',
-    'alife().object': 'object does not exist in simulation',
-    'alife():object': 'object does not exist in simulation',
-    'alife().story_object': 'no object with that story_id',
-    'alife():story_object': 'no object with that story_id',
-    'alife().actor': 'actor not spawned yet',
-    'alife():actor': 'actor not spawned yet',
-    
-    # game object methods that can return nil
-    ':parent': 'object has no parent (not in inventory)',
-    ':best_enemy': 'no enemy detected',
-    ':best_item': 'no item of interest found',
-    ':best_danger': 'no danger detected',
-    ':best_weapon': 'no weapon available',
-    ':best_cover': 'no cover available',
-    ':active_item': 'no weapon/item currently equipped',
-    ':active_detector': 'no detector currently active',
-    ':object': 'item not in inventory or index out of bounds',
-    ':get_enemy': 'no current enemy target',
-    ':get_corpse': 'no corpse being investigated',
-    ':get_current_outfit': 'no outfit equipped',
-    ':item_in_slot': 'slot is empty',
-    ':get_helicopter': 'not a helicopter or no helicopter',
-    ':get_car': 'not in a vehicle',
-    ':get_campfire': 'not a campfire zone',
-    ':get_artefact': 'not an artefact',
-    ':get_physics_shell': 'object has no physics shell',
-    ':spawn_ini': 'no spawn ini defined',
-    ':motivation_action_manager': 'not an NPC with action manager',
-    ':get_current_holder': 'not in a vehicle/turret',
-    ':get_old_holder': 'was not in a vehicle/turret',
-    ':memory_position': 'object never seen',
-    ':get_dest_enemy': 'no destination enemy',
-    ':bone_id': 'bone name does not exist',
-    ':bone_position': 'bone does not exist',
-    ':bone_direction': 'bone does not exist',
-    
-    # common patterns
-    'db.actor': 'called from main menu or during loading',
-    'db.storage': 'storage not initialized',  # db.storage[id] can be nil
-    
-    # story object helpers
-    'get_story_object': 'no object with that story_id',
-    'get_object_by_name': 'object not found or offline',
-}
-
-# Method patterns that indicate the variable is being nil-checked
-# These patterns mean the variable is safe to use after the check
-NIL_CHECK_PATTERNS = {
-    'if {var} then',
-    'if {var} and',
-    'if not {var} then return',
-    'if not {var} then return end',
-    'if {var} == nil then return',
-    'if {var} == nil then return end', 
-    'if {var} ~= nil then',
-    '{var} and {var}:',
-    '{var} and {var}.',
-}
-
-# Callback parameters that are guaranteed non-nil by the engine
-# Format: (callback_name, param_index) - 0-indexed
-SAFE_CALLBACK_PARAMS = {
-    'actor_on_item_take': {0},      # item
-    'actor_on_item_drop': {0},      # item
-    'actor_on_item_use': {0},       # item
-    'actor_on_trade': {0, 1},       # item, sell_buy  
-    'npc_on_death_callback': {0, 1}, # npc, killer
-    'monster_on_death_callback': {0, 1}, # monster, killer
-    'npc_on_hit_callback': {0},     # npc
-    'monster_on_hit_callback': {0}, # monster
-    'on_before_hit': {0, 1, 2},     # obj, shit, bone_id
-    'physic_object_on_hit_callback': {0}, # obj
-    'actor_on_before_death': {0, 1}, # who, flags
-    'save_state': {0},              # m_data
-    'load_state': {0},              # m_data
-}
-
-
-@dataclass
-class Scope:
-    """Represents a variable scope (function, loop, block)."""
-    name: str
-    start_line: int
-    end_line: int = -1
-    parent: Optional['Scope'] = None
-    scope_type: str = 'block'  # 'function', 'loop', 'block'
-    is_hot_callback: bool = False
-
-    # variables declared in this scope
-    locals: Set[str] = field(default_factory=set)
-
-    # cached globals in this scope
-    cached_globals: Set[str] = field(default_factory=set)
-
-    # function aliases: local_name -> canonical_name (e.g., "tinsert" -> "table.insert")
-    func_aliases: Dict[str, str] = field(default_factory=dict)
-
-    def __hash__(self):
-        # use object's actual id for hashing
-        return id(self)
-
-    def __eq__(self, other):
-        if isinstance(other, Scope):
-            return self is other
-        return False
-
-
-@dataclass
-class CallInfo:
-    """Information about a function call."""
-    full_name: str          # "table.insert", "db.actor", "pairs"
-    module: Optional[str]   # "table", "db", None
-    func: str               # "insert", "actor", "pairs"
-    args: List[Any]         # AST nodes of arguments
-    line: int
-    node: Node
-    scope: Scope
-    in_loop: bool = False
-    loop_depth: int = 0
-    parent_if_node: Optional[Node] = None  # which If statement contains this call
-    branch_index: int = -1  # 0=main if, 1=elseif[0], 2=elseif[1], etc., -1=else or not in if
-
-
-@dataclass
-class AssignInfo:
-    """Information about an assignment."""
-    target: str             # variable name
-    value_type: str         # 'call', 'index', 'concat', 'literal', 'other'
-    value_repr: str         # string representation
-    line: int
-    node: Node
-    scope: Scope
-    is_local: bool = False
-    in_loop: bool = False
-
-
-@dataclass
-class ConcatInfo:
-    """Information about string concatenation."""
-    target: Optional[str]   # variable being assigned to
-    left_var: Optional[str]  # left operand if it's a variable
-    line: int
-    scope: Scope
-    in_loop: bool = False
-    loop_depth: int = 0
-    loop_scope: Optional[Scope] = None  # the innermost loop scope
-    right_expr: Optional[str] = None    # string repr of right side of concat
-
-
-@dataclass
-class NilSourceInfo:
-    """Information about a variable assigned from a nil-returning function."""
-    var_name: str           # variable name
-    source_call: str        # the call that might return nil (e.g. "level.object_by_id(id)")
-    source_func: str        # just the function name (e.g. "level.object_by_id")
-    assign_line: int        # line where assignment happened
-    scope: Scope            # scope of the variable
-    is_local: bool          # whether it's a local variable
-    is_guarded: bool = False  # whether a nil check was found after assignment
-
-
-@dataclass 
-class NilAccessInfo:
-    """Information about accessing a potentially nil variable."""
-    var_name: str           # the variable being accessed
-    access_type: str        # 'method' or 'index'
-    access_call: str        # full call (e.g. "obj:section()")
-    access_line: int
-    nil_source: NilSourceInfo  # the nil source info
-    is_safe_to_fix: bool = False  # whether this can be auto-fixed
-
-
-@dataclass
-class DeadCodeInfo:
-    """Information about dead/unreachable code."""
-    dead_type: str          # 'after_return', 'after_break', 'if_false', 'while_false', 'unused_local_var', 'unused_local_func'
-    start_line: int
-    end_line: int
-    scope_name: str
-    description: str
-    is_safe_to_remove: bool = False  # True only for 100% safe cases
-    code_preview: str = ""
-    node: Optional[Node] = None
-
-
-@dataclass
-class LocalVarInfo:
-    """Information about a local variable for dead code analysis."""
-    name: str
-    assign_line: int
-    scope: Scope
-    is_read: bool = False       # has the variable been read?
-    is_function: bool = False   # is it a local function?
-    read_lines: List[int] = field(default_factory=list)
-    is_loop_var: bool = False   # is it a for loop variable?
-    is_param: bool = False      # is it a function parameter?
-
-
-@dataclass
-class PerFrameCallbackInfo:
-    """Information about a per-frame callback function for performance analysis."""
-    name: str
-    start_line: int
-    end_line: int
-    scope: Scope
-    # Collected during analysis pass
-    expensive_calls: List[CallInfo] = field(default_factory=list)
-    loop_count: int = 0
-    uncached_globals: List[str] = field(default_factory=list)
-
-
-@dataclass
-class DistanceComparisonInfo:
-    """Information about distance_to() used in comparison (can be optimized to distance_to_sqr())."""
-    line: int
-    source_obj: str          # the object calling distance_to (e.g., "pos", "actor:position()")
-    target_obj: str          # the argument to distance_to (e.g., "target_pos")
-    comparison_op: str       # '<', '<=', '>', '>='
-    threshold_value: float   # the numeric threshold (e.g., 10)
-    threshold_node: Node     # the AST node for the threshold (for replacement)
-    full_node: Node          # the full comparison node
-    invoke_node: Node        # the distance_to invoke node
-
-
-@dataclass
-class VectorAllocationInfo:
-    """Information about vector() allocation in a loop."""
-    line: int
-    call_node: Node
-    loop_depth: int
-    scope: Scope
-    in_per_frame_callback: bool = False
-
+from models import (
+    Finding, detect_file_encoding, Scope, CallInfo, AssignInfo,
+    ConcatInfo, NilSourceInfo, NilAccessInfo, DeadCodeInfo,
+    LocalVarInfo, PerFrameCallbackInfo, DistanceComparisonInfo,
+    VectorAllocationInfo, Assignment
+)
+from utils import node_to_string, iter_children
+from constants import (
+    HOT_CALLBACKS, PER_FRAME_CALLBACKS, CACHEABLE_BARE_GLOBALS,
+    BARE_GLOBALS_UNSAFE_TO_CACHE, CACHEABLE_MODULE_FUNCS,
+    DEBUG_FUNCTIONS, DIRECT_REPLACEMENT_FUNCS, NIL_RETURNING_FUNCTIONS,
+    NIL_CHECK_PATTERNS, SAFE_CALLBACK_PARAMS, LUAJIT_NYI_FUNCS
+)
 
 class ASTAnalyzer:
-    """AST-based Lua code analyzer."""
+    """
+    AST-based Lua code analyzer.
+
+    This class parses Lua source code into an Abstract Syntax Tree (AST) and
+    identifies various patterns that can be optimized or that indicate potential
+    bugs (like nil access or dead code). It uses the visitor pattern to traverse
+    the AST and collect information about function calls, assignments, and variable scopes.
+    """
 
     def __init__(self, cache_threshold: int = 4, experimental: bool = False):
         self.cache_threshold = cache_threshold
@@ -354,6 +58,11 @@ class ASTAnalyzer:
     def reset(self):
         """Reset analyzer state for reuse."""
         self.findings: List[Finding] = []
+        self.parent_map: Dict[int, Node] = {}
+        self.comparisons: List[Tuple[Node, int]] = []
+        self.exposures: List[Tuple[Node, int]] = []
+        self.index_accesses: List[Tuple[Node, int, Scope, bool]] = []
+        self.active_assignments: Dict[Tuple[int, str], Any] = {}
         self.scopes: List[Scope] = []
         self.current_scope: Optional[Scope] = None
         self.global_scope: Optional[Scope] = None
@@ -414,6 +123,8 @@ class ASTAnalyzer:
 
         # store AST tree for dead code analysis
         self._ast_tree = tree
+        from utils import get_parent_map
+        self.parent_map = get_parent_map(tree)
 
         # create global scope
         self.global_scope = Scope(
@@ -456,134 +167,6 @@ class ASTAnalyzer:
             return self.source_lines[line - 1].strip()
         return ""
 
-    def _node_to_string(self, node: Node) -> str:
-        """Convert an AST node to its string representation."""
-        if isinstance(node, Name):
-            return node.id
-        elif isinstance(node, Number):
-            return str(node.n)
-        elif isinstance(node, String):
-            s = node.s
-            if isinstance(s, bytes):
-                s = s.decode('utf-8', errors='replace')
-            # Escape special characters for Lua string literal
-            # Must re-escape because luaparser stores decoded values
-            escaped = s.replace('\\', '\\\\')  # backslash first!
-            escaped = escaped.replace('\a', '\\a')  # bell
-            escaped = escaped.replace('\b', '\\b')  # backspace
-            escaped = escaped.replace('\f', '\\f')  # form feed
-            escaped = escaped.replace('\n', '\\n')  # newline
-            escaped = escaped.replace('\r', '\\r')  # carriage return
-            escaped = escaped.replace('\t', '\\t')  # tab
-            escaped = escaped.replace('\v', '\\v')  # vertical tab
-            escaped = escaped.replace('\0', '\\0')  # null
-            # Choose quote style and escape the chosen quote
-            if '"' in escaped and "'" not in escaped:
-                escaped = escaped.replace("'", "\\'")
-                return f"'{escaped}'"
-            else:
-                escaped = escaped.replace('"', '\\"')
-                return f'"{escaped}"'
-        elif isinstance(node, (TrueExpr,)):
-            return "true"
-        elif isinstance(node, (FalseExpr,)):
-            return "false"
-        elif isinstance(node, (Nil,)):
-            return "nil"
-        elif isinstance(node, Index):
-            value = self._node_to_string(node.value)
-            idx = self._node_to_string(node.idx)
-            # determine bracket vs dot notation:
-            # - dot notation (t.field): idx.first_token is None
-            # - bracket notation (t[key]): idx.first_token has a value
-            idx_token = getattr(node.idx, 'first_token', None)
-            if idx_token is not None and str(idx_token) != 'None':
-                # bracket notation: t[key]
-                return f"{value}[{idx}]"
-            else:
-                # dot notation: t.field
-                return f"{value}.{idx}"
-        elif isinstance(node, Call):
-            func = self._node_to_string(node.func)
-            args = ", ".join(self._node_to_string(a) for a in node.args)
-            return f"{func}({args})"
-        elif isinstance(node, Invoke):
-            source = self._node_to_string(node.source)
-            func = self._node_to_string(node.func)
-            args = ", ".join(self._node_to_string(a) for a in node.args)
-            return f"{source}:{func}({args})"
-        elif isinstance(node, ULengthOP):
-            return f"#{self._node_to_string(node.operand)}"
-        elif isinstance(node, UMinusOp):
-            return f"-{self._node_to_string(node.operand)}"
-        elif isinstance(node, ULNotOp):
-            return f"not {self._node_to_string(node.operand)}"
-        elif isinstance(node, UBNotOp):
-            return f"~{self._node_to_string(node.operand)}"
-        elif isinstance(node, Concat):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} .. {right}"
-        elif isinstance(node, OrLoOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"({left} or {right})"
-        elif isinstance(node, AndLoOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"({left} and {right})"
-        elif isinstance(node, AddOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} + {right}"
-        elif isinstance(node, SubOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} - {right}"
-        elif isinstance(node, MultOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} * {right}"
-        elif isinstance(node, FloatDivOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} / {right}"
-        elif isinstance(node, ModOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} % {right}"
-        elif isinstance(node, ExpoOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} ^ {right}"
-        elif isinstance(node, EqToOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} == {right}"
-        elif isinstance(node, NotEqToOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} ~= {right}"
-        elif isinstance(node, LessThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} < {right}"
-        elif isinstance(node, GreaterThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} > {right}"
-        elif isinstance(node, LessOrEqThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} <= {right}"
-        elif isinstance(node, GreaterOrEqThanOp):
-            left = self._node_to_string(node.left)
-            right = self._node_to_string(node.right)
-            return f"{left} >= {right}"
-        elif isinstance(node, Table):
-            return "{...}"
-        else:
-            return f"<{type(node).__name__}>"
 
     def _get_call_name(self, node: Call) -> Tuple[Optional[str], str, str]:
         """Get module, function, and full name from a Call node."""
@@ -650,6 +233,42 @@ class ASTAnalyzer:
             scope = scope.parent
         return None
 
+    def _find_local_key(self, name: str) -> Optional[Tuple[int, str]]:
+        """Find the key (scope_id, name) for a local variable in scope chain."""
+        scope = self.current_scope
+        while scope:
+            key = (id(scope), name)
+            if key in self.local_vars:
+                return key
+            scope = scope.parent
+        return None
+
+    def _register_local(self, var_name: str, line: int, is_param: bool = False, is_loop_var: bool = False):
+        """Centralized helper to register a local variable or parameter."""
+        if not self.current_scope:
+            return
+
+        self.current_scope.locals.add(var_name)
+
+        # Track for diagnostics (shadowing and unused detection)
+        if not var_name.startswith('_'):
+            key = (id(self.current_scope), var_name)
+            info = LocalVarInfo(
+                name=var_name,
+                assign_line=line,
+                scope=self.current_scope,
+                is_read=False,
+                is_function=False,
+                is_loop_var=is_loop_var,
+                is_param=is_param,
+                assignments=[]
+            )
+            # Initial assignment (declaration)
+            assign = Assignment(line=line, node=None)
+            info.assignments.append(assign)
+            self.active_assignments[key] = assign
+            self.local_vars[key] = info
+
     def _visit(self, node: Node):
         """Visit a node and dispatch to specific handler."""
         if node is None:
@@ -662,21 +281,10 @@ class ASTAnalyzer:
             self._visit_children(node)
 
     def _visit_children(self, node: Node):
-        """Visit all children of a node."""
-        try:
-            node_dict = vars(node) if hasattr(node, '__dict__') else {}
-        except TypeError:
-            node_dict = {}
-
-        for key, value in node_dict.items():
-            if key.startswith('_'):
-                continue
-            if isinstance(value, Node):
-                self._visit(value)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, Node):
-                        self._visit(item)
+        """Visit all children of a node using optimized traversal."""
+        for child in iter_children(node):
+            if isinstance(child, Node):
+                self._visit(child)
 
     def _visit_Chunk(self, node: Chunk):
         self._visit(node.body)
@@ -688,7 +296,7 @@ class ASTAnalyzer:
     def _visit_Function(self, node: Function):
         """Handle global function definition."""
         line = self._get_line(node)
-        func_name = self._node_to_string(node.name) if node.name else '<anon>'
+        func_name = node_to_string(node.name) if node.name else '<anon>'
 
         is_hot = func_name in HOT_CALLBACKS
         is_per_frame = func_name in PER_FRAME_CALLBACKS
@@ -709,7 +317,7 @@ class ASTAnalyzer:
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
                 if isinstance(arg, Name):
-                    self.current_scope.locals.add(arg.id)
+                    self._register_local(arg.id, line, is_param=True)
 
         self._visit(node.body)
 
@@ -754,7 +362,7 @@ class ASTAnalyzer:
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
                 if isinstance(arg, Name):
-                    self.current_scope.locals.add(arg.id)
+                    self._register_local(arg.id, line, is_param=True)
 
         self._visit(node.body)
 
@@ -768,9 +376,9 @@ class ASTAnalyzer:
 
         # get method name
         if isinstance(node.name, Index):
-            func_name = self._node_to_string(node.name)
+            func_name = node_to_string(node.name)
         else:
-            func_name = self._node_to_string(node.name) if node.name else '<method>'
+            func_name = node_to_string(node.name) if node.name else '<method>'
 
         is_hot = func_name in HOT_CALLBACKS
 
@@ -778,12 +386,12 @@ class ASTAnalyzer:
         self._enter_scope(func_name, line, 'function', is_hot)
 
         # 'self' is implicit first param
-        self.current_scope.locals.add('self')
+        self._register_local('self', line, is_param=True)
 
         if hasattr(node, 'args') and node.args:
             for arg in node.args:
                 if isinstance(arg, Name):
-                    self.current_scope.locals.add(arg.id)
+                    self._register_local(arg.id, line, is_param=True)
 
         self._visit(node.body)
 
@@ -807,32 +415,6 @@ class ASTAnalyzer:
                             pass
         return self._get_line(node)
 
-    def _iter_children(self, node):
-        """Iterate over all child nodes of an AST node."""
-        if node is None:
-            return
-        
-        # Handle lists
-        if isinstance(node, list):
-            for item in node:
-                yield item
-            return
-        
-        # For AST nodes, iterate over known child attributes
-        child_attrs = [
-            'body', 'test', 'orelse', 'targets', 'values', 'iter',
-            'func', 'args', 'value', 'idx', 'key', 'left', 'right',
-            'operand', 'fields', 'keys', 'source', 'step', 'start', 'stop',
-        ]
-        
-        for attr in child_attrs:
-            child = getattr(node, attr, None)
-            if child is not None:
-                if isinstance(child, list):
-                    for item in child:
-                        yield item
-                else:
-                    yield child
 
     def _visit_Forin(self, node: Forin):
         """Handle for-in loop."""
@@ -849,22 +431,10 @@ class ASTAnalyzer:
         for target in node.targets:
             if isinstance(target, Name):
                 var_name = target.id
-                self.current_scope.locals.add(var_name)
+                self._register_local(var_name, line, is_loop_var=True)
                 
                 # Mark as assignment target (not a read)
                 self.assignment_target_ids.add(id(target))
-                
-                # Track for unused variable detection (skip _ prefixed)
-                if not var_name.startswith('_'):
-                    key = (id(self.current_scope), var_name)
-                    self.local_vars[key] = LocalVarInfo(
-                        name=var_name,
-                        assign_line=line,
-                        scope=self.current_scope,
-                        is_read=False,
-                        is_function=False,
-                        is_loop_var=True,
-                    )
 
         self._visit(node.body)
 
@@ -887,22 +457,10 @@ class ASTAnalyzer:
 
         if isinstance(node.target, Name):
             var_name = node.target.id
-            self.current_scope.locals.add(var_name)
+            self._register_local(var_name, line, is_loop_var=True)
             
             # Mark as assignment target (not a read)
             self.assignment_target_ids.add(id(node.target))
-            
-            # Track for unused variable detection (skip _ prefixed)
-            if not var_name.startswith('_'):
-                key = (id(self.current_scope), var_name)
-                self.local_vars[key] = LocalVarInfo(
-                    name=var_name,
-                    assign_line=line,
-                    scope=self.current_scope,
-                    is_read=False,
-                    is_function=False,
-                    is_loop_var=True,
-                )
 
         self._visit(node.body)
 
@@ -990,21 +548,10 @@ class ASTAnalyzer:
         for target in node.targets:
             if isinstance(target, Name):
                 var_name = target.id
-                self.current_scope.locals.add(var_name)
+                self._register_local(var_name, line)
                 
                 # Mark this Name node as an assignment target (not a read)
                 self.assignment_target_ids.add(id(target))
-                
-                # Track for unused variable detection (skip _ prefixed)
-                if not var_name.startswith('_'):
-                    key = (id(self.current_scope), var_name)
-                    self.local_vars[key] = LocalVarInfo(
-                        name=var_name,
-                        assign_line=line,
-                        scope=self.current_scope,
-                        is_read=False,
-                        is_function=False,
-                    )
 
         # check for caching pattern: local xyz = module.func
         is_new_alias = False
@@ -1091,6 +638,34 @@ class ASTAnalyzer:
                 return  # Only remove from innermost scope where it exists
             scope = scope.parent
 
+    def _infer_type(self, node: Node) -> Optional[str]:
+        """Infer the Lua type of an expression node."""
+        if isinstance(node, (Number, AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp, UMinusOp)):
+            return 'number'
+        if isinstance(node, (String, Concat)):
+            return 'string'
+        if isinstance(node, (TrueExpr, FalseExpr, AndLoOp, OrLoOp, ULNotOp, LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp, EqToOp, NotEqToOp)):
+            return 'boolean'
+        if isinstance(node, Table):
+            return 'table'
+        if isinstance(node, (Function, LocalFunction)):
+            return 'function'
+        if isinstance(node, Nil):
+            return 'nil'
+        if isinstance(node, ULengthOP):
+            return 'number'
+        if isinstance(node, Call):
+            _, _, full_name = self._get_call_name(node)
+            if full_name in ('math.floor', 'math.ceil', 'math.abs', 'math.sqrt', 'math.sin', 'math.cos', 'math.random', 'math.pow', 'tonumber', 'string.len'):
+                return 'number'
+            if full_name in ('tostring', 'string.format', 'string.sub', 'string.gsub', 'string.lower', 'string.upper'):
+                return 'string'
+        if isinstance(node, Name):
+            key = self._find_local_key(node.id)
+            if key and key in self.active_assignments:
+                return self.active_assignments[key].inferred_type
+        return None
+
     def _is_in_locals(self, name: str) -> bool:
         """Check if name is in any scope's locals."""
         scope = self.current_scope
@@ -1102,15 +677,30 @@ class ASTAnalyzer:
 
     def _record_assignment(self, target: str, value: Node, line: int, is_local: bool):
         """Record an assignment for analysis."""
+        # Track dead assignments
+        key = self._find_local_key(target)
+        if key:
+            # If there was a previous assignment that was never used
+            if key in self.active_assignments:
+                prev_assign = self.active_assignments[key]
+                if not prev_assign.is_used and not self.loop_depth > 0:
+                    # Ignore assignments in loops for now as they are complex
+                    # (might be used in next iteration)
+                    pass
+
+            new_assign = Assignment(line=line, node=value, inferred_type=self._infer_type(value))
+            self.local_vars[key].assignments.append(new_assign)
+            self.active_assignments[key] = new_assign
+
         if isinstance(value, Call):
             value_type = 'call'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
         elif isinstance(value, Index):
             value_type = 'index'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
         elif isinstance(value, Concat):
             value_type = 'concat'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
 
             # record concat info
             left_var = None
@@ -1118,7 +708,7 @@ class ASTAnalyzer:
                 left_var = value.left.id
             
             # get the right side expression
-            right_expr = self._node_to_string(value.right)
+            right_expr = node_to_string(value.right)
             
             # find innermost loop scope
             loop_scope = None
@@ -1143,10 +733,10 @@ class ASTAnalyzer:
             ))
         elif isinstance(value, (Number, String, TrueExpr, FalseExpr, Nil)):
             value_type = 'literal'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
         else:
             value_type = 'other'
-            value_repr = self._node_to_string(value)
+            value_repr = node_to_string(value)
 
         self.assigns.append(AssignInfo(
             target=target,
@@ -1182,7 +772,7 @@ class ASTAnalyzer:
         
         # Check for index access - e.g., db.actor, alife():object(id)
         elif isinstance(value, Index):
-            full_name = self._node_to_string(value)
+            full_name = node_to_string(value)
             # check direct matches like db.actor
             if full_name in NIL_RETURNING_FUNCTIONS:
                 source_func = full_name
@@ -1407,7 +997,7 @@ class ASTAnalyzer:
             
             # Track RegisterScriptCallback for unused variable/function detection
             if full_name == 'RegisterScriptCallback' and len(node.args) >= 2:
-                callback_func = self._node_to_string(node.args[1])
+                callback_func = node_to_string(node.args[1])
                 if callback_func:
                     self.callback_registrations.add(callback_func)
             
@@ -1440,8 +1030,8 @@ class ASTAnalyzer:
         line = self._get_line(node)
 
         # record as call
-        source = self._node_to_string(node.source)
-        func = node.func.id if isinstance(node.func, Name) else self._node_to_string(node.func)
+        source = node_to_string(node.source)
+        func = node.func.id if isinstance(node.func, Name) else node_to_string(node.func)
         full_name = f"{source}:{func}"
 
         self.calls.append(CallInfo(
@@ -1489,6 +1079,17 @@ class ASTAnalyzer:
 
     # visitor pass-through for other nodes
     def _visit_Index(self, node: Index):
+        # track index access for optimization
+        line = self._get_line(node)
+        is_write = False
+        # check if this is a write
+        parent = self.parent_map.get(id(node))
+        if isinstance(parent, (Assign, LocalAssign)):
+            if node in parent.targets:
+                is_write = True
+
+        self.index_accesses.append((node, line, self.current_scope, is_write))
+
         self._visit(node.value)
         self._visit(node.idx)
 
@@ -1506,33 +1107,33 @@ class ASTAnalyzer:
             self._visit(val)
 
     # binary ops
-    def _visit_AddOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_SubOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_MultOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_FloatDivOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_ModOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_ExpoOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_AndLoOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_OrLoOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_EqToOp(self, node): self._visit(node.left); self._visit(node.right)
-    def _visit_NotEqToOp(self, node): self._visit(node.left); self._visit(node.right)
+    def _visit_AddOp(self, node: AddOp): self._visit(node.left); self._visit(node.right)
+    def _visit_SubOp(self, node: SubOp): self._visit(node.left); self._visit(node.right)
+    def _visit_MultOp(self, node: MultOp): self._visit(node.left); self._visit(node.right)
+    def _visit_FloatDivOp(self, node: FloatDivOp): self._visit(node.left); self._visit(node.right)
+    def _visit_ModOp(self, node: ModOp): self._visit(node.left); self._visit(node.right)
+    def _visit_ExpoOp(self, node: ExpoOp): self._visit(node.left); self._visit(node.right)
+    def _visit_AndLoOp(self, node: AndLoOp): self._visit(node.left); self._visit(node.right)
+    def _visit_OrLoOp(self, node: OrLoOp): self._visit(node.left); self._visit(node.right)
+    def _visit_EqToOp(self, node: EqToOp): self._visit(node.left); self._visit(node.right)
+    def _visit_NotEqToOp(self, node: NotEqToOp): self._visit(node.left); self._visit(node.right)
     
-    def _visit_LessThanOp(self, node):
+    def _visit_LessThanOp(self, node: LessThanOp):
         self._check_distance_comparison(node, '<')
         self._visit(node.left)
         self._visit(node.right)
-    
-    def _visit_GreaterThanOp(self, node):
+
+    def _visit_GreaterThanOp(self, node: GreaterThanOp):
         self._check_distance_comparison(node, '>')
         self._visit(node.left)
         self._visit(node.right)
-    
-    def _visit_LessOrEqThanOp(self, node):
+
+    def _visit_LessOrEqThanOp(self, node: LessOrEqThanOp):
         self._check_distance_comparison(node, '<=')
         self._visit(node.left)
         self._visit(node.right)
-    
-    def _visit_GreaterOrEqThanOp(self, node):
+
+    def _visit_GreaterOrEqThanOp(self, node: GreaterOrEqThanOp):
         self._check_distance_comparison(node, '>=')
         self._visit(node.left)
         self._visit(node.right)
@@ -1569,8 +1170,8 @@ class ASTAnalyzer:
         threshold_value = threshold_node.n
         
         # extract source and target
-        source_obj = self._node_to_string(invoke_node.source)
-        target_obj = self._node_to_string(invoke_node.args[0]) if invoke_node.args else ""
+        source_obj = node_to_string(invoke_node.source)
+        target_obj = node_to_string(invoke_node.args[0]) if invoke_node.args else ""
         
         self.distance_comparisons.append(DistanceComparisonInfo(
             line=self._get_line(node),
@@ -1584,17 +1185,22 @@ class ASTAnalyzer:
         ))
 
     # unary ops
-    def _visit_UMinusOp(self, node): self._visit(node.operand)
-    def _visit_UBNotOp(self, node): self._visit(node.operand)
-    def _visit_ULNotOp(self, node): self._visit(node.operand)
-    def _visit_ULengthOP(self, node): self._visit(node.operand)
+    def _visit_UMinusOp(self, node: UMinusOp): self._visit(node.operand)
+    def _visit_UBNotOp(self, node: UBNotOp): self._visit(node.operand)
+    def _visit_ULNotOp(self, node: ULNotOp): self._visit(node.operand)
+    def _visit_ULengthOP(self, node: ULengthOP): self._visit(node.operand)
 
     # terminal nodes - no children
-    def _visit_Name(self, node):
+    def _visit_Name(self, node: Name):
         """Handle Name node - track variable reads for unused detection."""
         # Only count as read if NOT an assignment target
         if id(node) not in self.assignment_target_ids:
             var_name = node.id
+            # Mark active assignment as used
+            key = self._find_local_key(var_name)
+            if key and key in self.active_assignments:
+                self.active_assignments[key].is_used = True
+
             # Find which scope this variable belongs to (walk up scope chain)
             scope = self.current_scope
             while scope:
@@ -1625,11 +1231,19 @@ class ASTAnalyzer:
     def _analyze_patterns(self):
         """Analyze collected data and generate findings."""
         self._analyze_table_insert()
+        self._analyze_table_remove()
         self._analyze_deprecated_funcs()
         self._analyze_math_pow()
+        self._analyze_math_atan2()
+        self._analyze_math_mod()
+        self._analyze_math_log()
+        self._analyze_math_deg_rad()
+        self._analyze_math_random_0_1()
+        self._analyze_string_rep()
         self._analyze_uncached_globals()
         self._analyze_repeated_calls_in_scope()
         self._analyze_string_concat_in_loop()
+        self._analyze_string_format_in_loop()
         self._analyze_debug_statements()
         self._analyze_global_writes()
         self._analyze_nil_access()
@@ -1637,25 +1251,960 @@ class ASTAnalyzer:
         self._analyze_per_frame_callbacks()
         self._analyze_distance_to_comparisons()
         self._analyze_vector_allocations_in_loops()
+        self._analyze_plain_string_find()
+        self._analyze_pairs_on_array()
+        self._analyze_ipairs_hot_loop()
+        self._analyze_math_min_max()
+        self._analyze_redundant_tostring()
+        self._analyze_slow_loop_funcs()
+        self._analyze_luajit_nyi()
+        self._analyze_redundant_boolean_comp()
+        self._analyze_math_random_1()
+        self._analyze_redundant_return_bool()
+        self._analyze_string_format_to_concat()
+        self._analyze_table_concat_literal()
+        self._analyze_string_sub_to_byte()
+        self._analyze_string_sub_to_byte_simple()
+        self._analyze_string_lower_case()
+        self._analyze_math_abs_positive()
+        self._analyze_constant_folding()
+        self._analyze_expo_to_mult()
+        self._analyze_table_new_in_loop()
+        self._analyze_repeated_member_access_in_loop()
+        self._analyze_string_match_existence()
+        self._analyze_unpack_to_indexing()
+        self._analyze_divide_by_constant()
+        self._analyze_if_nil_assign()
+        self._analyze_redundant_tonumber_tostring()
+        self._analyze_string_byte_1()
+        self._analyze_pairs_to_next()
+        self._analyze_return_ternary()
 
-    def _analyze_table_insert(self):
-        """Find table.insert(t, v) that can be t[#t+1] = v."""
+    def _analyze_redundant_tonumber_tostring(self):
+        """Find redundant tonumber() or tostring() calls."""
         for call in self.calls:
-            if call.full_name == 'table.insert' and len(call.args) == 2:
-                # 2-arg form: table.insert(t, v)
-                table_name = self._node_to_string(call.args[0])
-                value = self._node_to_string(call.args[1])
+            if call.full_name in ('tonumber', 'tostring') and len(call.args) == 1:
+                arg = call.args[0]
+                inferred = self._infer_type(arg)
 
+                if (call.full_name == 'tonumber' and inferred == 'number') or \
+                   (call.full_name == 'tostring' and inferred == 'string'):
+                    arg_str = node_to_string(arg)
+                    self.findings.append(Finding(
+                        pattern_name='redundant_type_conversion',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'Redundant {call.full_name}({arg_str})',
+                        details={
+                            'func': call.full_name,
+                            'arg_str': arg_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_string_byte_1(self):
+        """Find string.byte(s, 1) and suggest string.byte(s)."""
+        for call in self.calls:
+            if call.full_name == 'string.byte' and len(call.args) == 2:
+                if isinstance(call.args[1], Number) and call.args[1].n == 1:
+                    s_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='string_byte_1',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'string.byte({s_str}, 1) -> string.byte({s_str})',
+                        details={
+                            's_str': s_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_pairs_to_next(self):
+        """Suggest next, t instead of pairs(t) in hot loops for LuaJIT."""
+        for call in self.calls:
+            if call.full_name == 'pairs' and (call.scope.is_hot_callback or call.in_loop):
+                table_name = node_to_string(call.args[0]) if call.args else "t"
                 self.findings.append(Finding(
-                    pattern_name='table_insert_append',
-                    severity='GREEN',
+                    pattern_name='pairs_to_next',
+                    severity='YELLOW',
                     line_num=call.line,
-                    message=f'table.insert({table_name}, v) -> {table_name}[#{table_name}+1] = v',
+                    message=f'pairs({table_name}) in hot loop -> next, {table_name}, nil is faster in LuaJIT',
                     details={
                         'table': table_name,
-                        'value': value,
-                        'full_match': f'table.insert({table_name}, {value})',
                         'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_return_ternary(self):
+        """Find if cond then return a else return b end and suggest ternary return."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, If) and node.orelse and isinstance(node.orelse, Block):
+                if len(node.body.body) == 1 and len(node.orelse.body) == 1:
+                    stmt1 = node.body.body[0]
+                    stmt2 = node.orelse.body[0]
+
+                    if isinstance(stmt1, Return) and isinstance(stmt2, Return):
+                        if len(stmt1.values) == 1 and len(stmt2.values) == 1:
+                            v1 = stmt1.values[0]
+                            v2 = stmt2.values[0]
+
+                            # check if they are simple enough for ternary
+                            # AND v1 must be truthy for Lua ternary pattern to work
+                            if self._is_simple_expr(v1) and self._is_simple_expr(v2) and self._is_guaranteed_truthy(v1):
+                                cond_str = node_to_string(node.test)
+                                v1_str = node_to_string(v1)
+                                v2_str = node_to_string(v2)
+
+                                self.findings.append(Finding(
+                                    pattern_name='return_ternary_simplification',
+                                    severity='YELLOW',
+                                    line_num=self._get_line(node),
+                                    message=f'if {cond_str} then return {v1_str} else return {v2_str} end -> return {cond_str} and {v1_str} or {v2_str}',
+                                    details={
+                                        'cond': cond_str,
+                                        'v1': v1_str,
+                                        'v2': v2_str,
+                                        'node': node,
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+
+    def _analyze_string_match_existence(self):
+        """Find string.match() used in boolean context with plain patterns."""
+        lua_regex_chars = set('^$()%.[]*+-?')
+        for call in self.calls:
+            if call.full_name == 'string.match' and len(call.args) == 2:
+                # check if it's in a boolean context
+                is_bool_context = False
+                parent = self.parent_map.get(id(call.node))
+                if isinstance(parent, (If, While, Repeat)) and getattr(parent, 'test', None) == call.node:
+                    is_bool_context = True
+                elif isinstance(parent, (AndLoOp, OrLoOp, ULNotOp)):
+                    is_bool_context = True
+
+                if is_bool_context:
+                    pattern_node = call.args[1]
+                    if isinstance(pattern_node, String):
+                        pattern_text = pattern_node.s
+                        if isinstance(pattern_text, bytes):
+                            pattern_text = pattern_text.decode('utf-8', errors='replace')
+
+                        if not any(c in lua_regex_chars for c in pattern_text):
+                            self.findings.append(Finding(
+                                pattern_name='string_match_existence',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'string.match(s, "{pattern_text}") in boolean context -> use string.find(s, "{pattern_text}", 1, true)',
+                                details={
+                                    'pattern': pattern_text,
+                                    's_str': node_to_string(call.args[0]),
+                                    'node': call.node,
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+
+    def _analyze_unpack_to_indexing(self):
+        """Find local a, b = unpack(t) and suggest direct indexing."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, LocalAssign) and len(node.targets) >= 2 and len(node.values) == 1:
+                val = node.values[0]
+                if isinstance(val, Call):
+                    _, _, full_name = self._get_call_name(val)
+                    if full_name == 'unpack' and len(val.args) == 1:
+                        if len(node.targets) <= 4:
+                            table_name = node_to_string(val.args[0])
+                            self.findings.append(Finding(
+                                pattern_name='unpack_to_indexing',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'unpack({table_name}) to multiple locals -> use direct indexing',
+                                details={
+                                    'table': table_name,
+                                    'targets': [node_to_string(t) for t in node.targets],
+                                    'node': node,
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
+    def _analyze_divide_by_constant(self):
+        """Find division by constant and suggest multiplication."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, FloatDivOp):
+                if isinstance(node.right, Number) and node.right.n != 0:
+                    divisor = node.right.n
+                    # suggest for common ones
+                    if divisor in (2, 4, 5, 8, 10, 16, 20, 25, 32, 40, 50, 64, 100, 128, 256, 512, 1024):
+                        reciprocal = 1.0 / divisor
+                        # format nicely
+                        if reciprocal == int(reciprocal):
+                            rec_str = str(int(reciprocal))
+                        else:
+                            rec_str = f"{reciprocal:.6g}"
+
+                        self.findings.append(Finding(
+                            pattern_name='divide_by_constant',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Division by {divisor} -> multiply by {rec_str}',
+                            details={
+                                'divisor': divisor,
+                                'reciprocal': rec_str,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_if_nil_assign(self):
+        """Find if x == nil then x = val end patterns."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, If) and not node.orelse:
+                # check condition: x == nil or not x
+                is_nil_check = False
+                var_name = None
+
+                test = node.test
+                if isinstance(test, EqToOp):
+                    if isinstance(test.left, Name) and isinstance(test.right, Nil):
+                        var_name = test.left.id
+                        is_nil_check = True
+                    elif isinstance(test.right, Name) and isinstance(test.left, Nil):
+                        var_name = test.right.id
+                        is_nil_check = True
+                elif isinstance(test, ULNotOp) and isinstance(test.operand, Name):
+                    var_name = test.operand.id
+                    is_nil_check = True
+
+                if is_nil_check and var_name:
+                    # check body: x = val
+                    if isinstance(node.body, Block) and len(node.body.body) == 1:
+                        stmt = node.body.body[0]
+                        if isinstance(stmt, Assign) and len(stmt.targets) == 1 and len(stmt.values) == 1:
+                            target = stmt.targets[0]
+                            if isinstance(target, Name) and target.id == var_name:
+                                val_str = node_to_string(stmt.values[0])
+                                self.findings.append(Finding(
+                                    pattern_name='if_nil_assign',
+                                    severity='YELLOW',
+                                    line_num=self._get_line(node),
+                                    message=f'if {var_name} == nil then {var_name} = {val_str} end -> {var_name} = {var_name} or {val_str}',
+                                    details={
+                                        'var': var_name,
+                                        'val': val_str,
+                                        'node': node,
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+
+    def _analyze_plain_string_find(self):
+        """Find string.find() with plain strings that can use plain=true flag."""
+        lua_regex_chars = set('^$()%.[]*+-?')
+        for call in self.calls:
+            if call.full_name == 'string.find' and len(call.args) == 2:
+                pattern_node = call.args[1]
+                if isinstance(pattern_node, String):
+                    pattern_text = pattern_node.s
+                    if isinstance(pattern_text, bytes):
+                        pattern_text = pattern_text.decode('utf-8', errors='replace')
+
+                    if not any(c in lua_regex_chars for c in pattern_text):
+                        self.findings.append(Finding(
+                            pattern_name='string_find_plain',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.find("{pattern_text}") -> use plain=true for performance',
+                            details={
+                                'pattern': pattern_text,
+                                'full_match': f'string.find({node_to_string(call.args[0])}, "{pattern_text}")',
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+    def _analyze_pairs_on_array(self):
+        """Find pairs() used in hot callbacks where ipairs() or numeric loops might be faster."""
+        for call in self.calls:
+            if call.full_name == 'pairs' and call.scope.is_hot_callback:
+                table_name = node_to_string(call.args[0]) if call.args else "table"
+                self.findings.append(Finding(
+                    pattern_name='pairs_on_array',
+                    severity='YELLOW',
+                    line_num=call.line,
+                    message=f'pairs({table_name}) in hot callback -> check if ipairs() or numeric loop is possible',
+                    details={
+                        'table': table_name,
+                        'function': call.scope.name,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_ipairs_hot_loop(self):
+        """Find ipairs() used in hot callbacks where numeric loops are faster."""
+        for call in self.calls:
+            if call.full_name == 'ipairs' and call.scope.is_hot_callback:
+                table_name = node_to_string(call.args[0]) if call.args else "table"
+
+                # check if it's used in a Forin loop
+                parent_loop = None
+                curr = call.node
+                while True:
+                    curr = self.parent_map.get(id(curr))
+                    if not curr: break
+                    if isinstance(curr, Forin):
+                        parent_loop = curr
+                        break
+
+                if parent_loop and len(parent_loop.targets) == 2:
+                    k_var = node_to_string(parent_loop.targets[0])
+                    v_var = node_to_string(parent_loop.targets[1])
+
+                    # only auto-fix if table is a simple variable (to avoid double evaluation)
+                    is_simple_table = self._is_simple_expr(call.args[0]) if call.args else False
+                    severity = 'GREEN' if is_simple_table else 'YELLOW'
+
+                    self.findings.append(Finding(
+                        pattern_name='ipairs_hot_loop',
+                        severity=severity,
+                        line_num=call.line,
+                        message=f'ipairs({table_name}) in hot callback -> for i=1, #{table_name} do is faster in LuaJIT',
+                        details={
+                            'table': table_name,
+                            'k_var': k_var,
+                            'v_var': v_var,
+                            'node': call.node,
+                            'loop_node': parent_loop,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                else:
+                    self.findings.append(Finding(
+                        pattern_name='ipairs_hot_loop',
+                        severity='YELLOW',
+                        line_num=call.line,
+                        message=f'ipairs({table_name}) in hot callback -> for i=1, #{table_name} do is faster in LuaJIT',
+                        details={
+                            'table': table_name,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_math_min_max(self):
+        """Find math.min(a, b) and math.max(a, b) with simple arguments."""
+        for call in self.calls:
+            if call.full_name in ('math.min', 'math.max') and len(call.args) == 2:
+                arg1 = call.args[0]
+                arg2 = call.args[1]
+
+                if self._is_simple_expr(arg1) and self._is_simple_expr(arg2):
+                    a_str = node_to_string(arg1)
+                    b_str = node_to_string(arg2)
+                    op = '<' if call.full_name == 'math.min' else '>'
+
+                    self.findings.append(Finding(
+                        pattern_name='math_min_max_inline',
+                        severity='YELLOW',
+                        line_num=call.line,
+                        message=f'{call.full_name}({a_str}, {b_str}) -> {a_str} {op} {b_str} and {a_str} or {b_str}',
+                        details={
+                            'func': call.full_name,
+                            'arg1': a_str,
+                            'arg2': b_str,
+                            'op': op,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_slow_loop_funcs(self):
+        """Find potentially slow operations in hot loops."""
+        for call in self.calls:
+            if call.in_loop and call.full_name in ('table.insert', 'table.remove'):
+                is_slow = False
+                if call.full_name == 'table.insert' and len(call.args) == 3:
+                    is_slow = True
+                elif call.full_name == 'table.remove' and len(call.args) >= 2:
+                    is_slow = True
+
+                if is_slow:
+                    severity = 'RED' if call.scope.is_hot_callback else 'YELLOW'
+                    self.findings.append(Finding(
+                        pattern_name='slow_loop_operation',
+                        severity=severity,
+                        line_num=call.line,
+                        message=f'Potentially slow operation {call.full_name}() in loop (O(N))',
+                        details={'func': call.full_name},
+                        source_line=self._get_source_line(call.line)
+                    ))
+
+    def _analyze_string_sub_to_byte_simple(self):
+        """Find string.sub(s, i, i) calls that can be optimized to string.char(string.byte(s, i))."""
+        for call in self.calls:
+            if call.full_name == 'string.sub' and len(call.args) >= 2:
+                arg1 = call.args[0]
+                arg2 = call.args[1]
+                arg3 = call.args[2] if len(call.args) > 2 else None
+
+                # string.sub(s, i, i)
+                is_single_char = False
+                if arg3 is not None:
+                    if node_to_string(arg2) == node_to_string(arg3):
+                        is_single_char = True
+                elif isinstance(arg2, Number) and arg2.n == 1:
+                    # string.sub(s, 1)
+                    is_single_char = True
+
+                if is_single_char:
+                    s_str = node_to_string(arg1)
+                    i_str = node_to_string(arg2)
+
+                    # if i is 1, we can just use string.byte(s)
+                    if i_str == "1":
+                        msg = f'string.sub({s_str}, 1, 1) -> string.char(string.byte({s_str}))'
+                    else:
+                        msg = f'string.sub({s_str}, {i_str}, {i_str}) -> string.char(string.byte({s_str}, {i_str}))'
+
+                    self.findings.append(Finding(
+                        pattern_name='string_sub_to_byte_simple',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=msg,
+                        details={
+                            's_str': s_str,
+                            'i_str': i_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_string_sub_to_byte(self):
+        """Find string.sub(s, n, n) == "c" that can be string.byte(s, n) == code."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                call = None
+                const_str = None
+
+                if isinstance(node.left, Call) and isinstance(node.right, String):
+                    call = node.left
+                    const_str = node.right.s
+                elif isinstance(node.right, Call) and isinstance(node.left, String):
+                    call = node.right
+                    const_str = node.left.s
+
+                if call and const_str and len(const_str) == 1:
+                    _, _, full_name = self._get_call_name(call)
+                    if full_name == 'string.sub' and len(call.args) >= 2:
+                        # check if it's string.sub(s, n, n)
+                        s_str = node_to_string(call.args[0])
+                        n_str = node_to_string(call.args[1])
+                        m_str = node_to_string(call.args[2]) if len(call.args) > 2 else None
+
+                        if n_str == m_str or (m_str is None and n_str == "1"):
+                            byte_val = ord(const_str)
+                            op = '==' if isinstance(node, EqToOp) else '~='
+
+                            self.findings.append(Finding(
+                                pattern_name='string_sub_to_byte',
+                                severity='YELLOW',
+                                line_num=self._get_line(node),
+                                message=f'string.sub({s_str}, {n_str}) {op} "{const_str}" -> string.byte({s_str}, {n_str}) {op} {byte_val}',
+                                details={
+                                    's_str': s_str,
+                                    'n_str': n_str,
+                                    'op': op,
+                                    'byte_val': byte_val,
+                                    'node': node,
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
+    def _analyze_table_new_in_loop(self):
+        """Find table re-initialization in loops."""
+        for assign in self.assigns:
+            if assign.in_loop and assign.value_type == 'other' and isinstance(assign.node, Table):
+                # check if the table is empty
+                if not assign.node.fields:
+                    self.findings.append(Finding(
+                        pattern_name='table_new_in_loop',
+                        severity='YELLOW',
+                        line_num=assign.line,
+                        message=f'Table re-initialization {assign.target} = {{}} in loop -> use table.clear()',
+                        details={
+                            'target': assign.target,
+                            'node': assign.node,
+                        },
+                        source_line=self._get_source_line(assign.line),
+                    ))
+
+    def _analyze_expo_to_mult(self):
+        """Find x^2, x^3 etc. that can be simplified to multiplication."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, ExpoOp):
+                if isinstance(node.right, Number) and node.right.n in (2, 3):
+                    base_str = node_to_string(node.left)
+                    exponent = int(node.right.n)
+
+                    if self._is_simple_expr(node.left):
+                        replacement = '*'.join([base_str] * exponent)
+                        self.findings.append(Finding(
+                            pattern_name='expo_to_mult',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Exponent to multiplication: {base_str}^{exponent} -> {replacement}',
+                            details={
+                                'replacement': replacement,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                    else:
+                        # Complex expression like (a+b)^2
+                        self.findings.append(Finding(
+                            pattern_name='expo_to_mult_complex',
+                            severity='YELLOW',
+                            line_num=self._get_line(node),
+                            message=f'Exponent to multiplication: ({base_str})^{exponent} -> use local variable for base to avoid redundant calculation',
+                            details={
+                                'base_str': base_str,
+                                'exponent': exponent,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_constant_folding(self):
+        """Find arithmetic operations on numeric literals and constants that can be folded."""
+        import math as py_math
+        ops = {
+            AddOp: "+", SubOp: "-", MultOp: "*", FloatDivOp: "/",
+            ModOp: "%", ExpoOp: "^"
+        }
+
+        def get_const_val(node):
+            if isinstance(node, Number):
+                return node.n
+            if isinstance(node, Index):
+                full_name = node_to_string(node)
+                if full_name == 'math.pi':
+                    return py_math.pi
+                if full_name == 'math.huge':
+                    return float('inf')
+            return None
+
+        # Fold math.deg and math.rad with constant arguments
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, Call):
+                _, _, full_name = self._get_call_name(node)
+                if full_name in ('math.deg', 'math.rad') and len(node.args) == 1:
+                    arg_val = get_const_val(node.args[0])
+                    if arg_val is not None:
+                        if full_name == 'math.deg':
+                            result = py_math.degrees(arg_val)
+                        else:
+                            result = py_math.radians(arg_val)
+
+                        res_str = f"{result:.10g}" if result != int(result) else str(int(result))
+                        self.findings.append(Finding(
+                            pattern_name='constant_folding',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Constant folding: {full_name}({arg_val}) -> {res_str}',
+                            details={'result': res_str, 'node': node},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, tuple(ops.keys())):
+                l_val = get_const_val(node.left)
+                r_val = get_const_val(node.right)
+
+                if l_val is not None and r_val is not None:
+                    op_str = ops[type(node)]
+
+                    try:
+                        if isinstance(node, AddOp): result = l_val + r_val
+                        elif isinstance(node, SubOp): result = l_val - r_val
+                        elif isinstance(node, MultOp): result = l_val * r_val
+                        elif isinstance(node, FloatDivOp):
+                            if r_val == 0: continue
+                            result = l_val / r_val
+                        elif isinstance(node, ModOp):
+                            if r_val == 0: continue
+                            result = l_val % r_val
+                        elif isinstance(node, ExpoOp):
+                            if l_val == 0 and r_val < 0: continue
+                            result = l_val ** r_val
+                        else: continue
+
+                        # format result: int if possible, else limited precision
+                        if result == int(result):
+                            res_str = str(int(result))
+                        else:
+                            # use enough precision for floats
+                            res_str = f"{result:.10g}"
+
+                        self.findings.append(Finding(
+                            pattern_name='constant_folding',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Constant folding: {l_val} {op_str} {r_val} -> {res_str}',
+                            details={
+                                'result': res_str,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                    except (ArithmeticError, ValueError):
+                        continue
+
+    def _analyze_repeated_member_access_in_loop(self):
+        """Find repeated member access (e.g., self.object) in loops."""
+        # track access counts per loop scope
+        loop_accesses = defaultdict(lambda: defaultdict(list))
+
+        for node, line, scope, is_write in self.index_accesses:
+            if not is_write:
+                # check if it's a member access like self.xxx
+                if isinstance(node, Index) and isinstance(node.value, Name) and node.value.id == 'self':
+                    # find enclosing loop
+                    curr = scope
+                    while curr and curr.scope_type != 'loop':
+                        curr = curr.parent
+
+                    if curr:
+                        member_name = node_to_string(node)
+                        loop_accesses[id(curr)][member_name].append((node, line))
+
+        for loop_id, members in loop_accesses.items():
+            for member, accesses in members.items():
+                if len(accesses) >= 3:
+                    first_node, first_line = accesses[0]
+                    self.findings.append(Finding(
+                        pattern_name='repeated_member_access_in_loop',
+                        severity='YELLOW',
+                        line_num=first_line,
+                        message=f'Repeated access to {member} in loop ({len(accesses)}x) -> localize it',
+                        details={
+                            'member': member,
+                            'count': len(accesses),
+                            'lines': [a[1] for a in accesses],
+                        },
+                        source_line=self._get_source_line(first_line),
+                    ))
+
+    def _analyze_luajit_nyi(self):
+        """Find LuaJIT NYI functions in hot callbacks or loops."""
+        for call in self.calls:
+            is_nyi = False
+            if call.full_name in LUAJIT_NYI_FUNCS:
+                # Some functions are only NYI with specific arguments
+                if call.full_name == 'table.insert' and len(call.args) < 3:
+                    is_nyi = False # table.insert(t, v) is NOT NYI
+                elif call.full_name == 'table.remove' and len(call.args) < 2:
+                    is_nyi = False # table.remove(t) is NOT NYI
+                else:
+                    is_nyi = True
+
+            if is_nyi:
+                is_hot = call.scope.is_hot_callback
+                in_loop = call.in_loop
+
+                if is_hot or in_loop:
+                    severity = 'RED' if is_hot and in_loop else 'YELLOW'
+                    context = "hot callback" if is_hot else "loop"
+                    if is_hot and in_loop: context = "hot loop"
+
+                    self.findings.append(Finding(
+                        pattern_name='luajit_nyi_warning',
+                        severity=severity,
+                        line_num=call.line,
+                        message=f'LuaJIT NYI: {call.full_name}() in {context} aborts JIT compilation',
+                        details={'func': call.full_name},
+                        source_line=self._get_source_line(call.line)
+                    ))
+
+    def _analyze_string_lower_case(self):
+        """Find string.lower(s) == "UPPER" which is always false."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                call = None
+                const_str = None
+
+                left = node.left
+                right = node.right
+
+                if isinstance(left, Call) and isinstance(right, String):
+                    call = left
+                    const_str = right.s
+                elif isinstance(right, Call) and isinstance(left, String):
+                    call = right
+                    const_str = left.s
+
+                if call and const_str:
+                    if isinstance(const_str, bytes):
+                        const_str = const_str.decode('utf-8', errors='replace')
+
+                    _, _, full_name = self._get_call_name(call)
+                    if full_name == 'string.lower':
+                        if any(c.isupper() for c in const_str):
+                            is_eq = isinstance(node, EqToOp)
+                            severity = 'RED' if is_eq else 'YELLOW'
+                            msg = f'string.lower() comparison with uppercase string "{const_str}" is always {"false" if is_eq else "true"}'
+                            self.findings.append(Finding(
+                                pattern_name='always_false_comparison',
+                                severity=severity,
+                                line_num=self._get_line(node),
+                                message=msg,
+                                details={'const': const_str},
+                                source_line=self._get_source_line(self._get_line(node))
+                            ))
+
+    def _analyze_string_format_to_concat(self):
+        """Find string.format("%s...", ...) that can be concatenation."""
+        for call in self.calls:
+            if call.full_name == 'string.format' and len(call.args) >= 2:
+                fmt_node = call.args[0]
+                if isinstance(fmt_node, String):
+                    fmt = fmt_node.s
+                    if isinstance(fmt, bytes):
+                        fmt = fmt.decode('utf-8', errors='replace')
+
+                    # only handle simple %s and constant text
+                    placeholders = re.findall(r'%[0-9.]*[a-zA-Z%]', fmt)
+                    if placeholders and all(p == '%s' for p in placeholders) and len(placeholders) == len(call.args) - 1:
+                        # build concatenation string
+                        parts = fmt.split('%s')
+                        concat_parts = []
+                        arg_idx = 1
+                        for i, part in enumerate(parts):
+                            if part:
+                                # escape quotes if needed, but for now just use it
+                                concat_parts.append(f'"{part}"')
+                            if i < len(parts) - 1:
+                                arg_node = call.args[arg_idx]
+                                arg_str = node_to_string(arg_node)
+                                # numbers are safe to concat directly in Lua
+                                if not isinstance(arg_node, (Number, String, Name, Index)):
+                                    arg_str = f'({arg_str})'
+
+                                # to match string.format, we should technically use tostring()
+                                # but usually %s is used on things that are already strings or numbers
+                                concat_parts.append(arg_str)
+                                arg_idx += 1
+
+                        replacement = ' .. '.join(concat_parts)
+                        self.findings.append(Finding(
+                            pattern_name='string_format_to_concat',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.format("{fmt}", ...) -> concatenation: {replacement}',
+                            details={
+                                'replacement': replacement,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+    def _analyze_redundant_return_bool(self):
+        """Find if cond then return true else return false end."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, If) and node.orelse and isinstance(node.orelse, Block):
+                # check if body is 'return true' and orelse is 'return false'
+                if len(node.body.body) == 1 and len(node.orelse.body) == 1:
+                    stmt1 = node.body.body[0]
+                    stmt2 = node.orelse.body[0]
+
+                    if isinstance(stmt1, Return) and isinstance(stmt2, Return):
+                        if len(stmt1.values) == 1 and len(stmt2.values) == 1:
+                            val1 = stmt1.values[0]
+                            val2 = stmt2.values[0]
+
+                            if isinstance(val1, TrueExpr) and isinstance(val2, FalseExpr):
+                                cond_str = node_to_string(node.test)
+                                self.findings.append(Finding(
+                                    pattern_name='redundant_return_bool',
+                                    severity='YELLOW',
+                                    line_num=self._get_line(node),
+                                    message=f'if {cond_str} then return true else return false end -> return {cond_str}',
+                                    details={
+                                        'cond_str': cond_str,
+                                        'node': node,
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+
+    def _analyze_redundant_boolean_comp(self):
+        """Find redundant boolean comparisons like x == true or x == false."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                left = node.left
+                right = node.right
+
+                target_node = None
+                bool_val = None
+
+                if isinstance(right, (TrueExpr, FalseExpr)):
+                    target_node = left
+                    bool_val = isinstance(right, TrueExpr)
+                elif isinstance(left, (TrueExpr, FalseExpr)):
+                    target_node = right
+                    bool_val = isinstance(left, TrueExpr)
+
+                if target_node:
+                    op = '==' if isinstance(node, EqToOp) else '~='
+                    target_str = node_to_string(target_node)
+
+                    # Result is true if (val == true) or (val ~= false)
+                    # Result is false if (val == false) or (val ~= true)
+                    # We want to simplify this.
+
+                    self.findings.append(Finding(
+                        pattern_name='redundant_boolean_comp',
+                        severity='GREEN',
+                        line_num=self._get_line(node),
+                        message=f'Redundant boolean comparison: {target_str} {op} {str(bool_val).lower()}',
+                        details={
+                            'target_node': target_node,
+                            'bool_val': bool_val,
+                            'op': op,
+                            'full_node': node
+                        },
+                        source_line=self._get_source_line(self._get_line(node))
+                    ))
+
+    def _analyze_redundant_tostring(self):
+        """Find tostring(s) where s is already a string literal."""
+        for call in self.calls:
+            if call.full_name == 'tostring' and len(call.args) == 1:
+                arg = call.args[0]
+                if isinstance(arg, String):
+                    s_val = node_to_string(arg)
+                    self.findings.append(Finding(
+                        pattern_name='redundant_tostring',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'redundant tostring({s_val})',
+                        details={
+                            'value': s_val,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_string_format_in_loop(self):
+        """Find string.format() used in loops (can be expensive)."""
+        for call in self.calls:
+            if call.full_name == 'string.format' and call.in_loop:
+                self.findings.append(Finding(
+                    pattern_name='string_format_in_loop',
+                    severity='YELLOW',
+                    line_num=call.line,
+                    message='string.format() in loop -> consider simple concatenation or pre-calculating',
+                    details={
+                        'loop_depth': call.loop_depth,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_table_insert(self):
+        """Find table.insert(t, v) and table.insert(t, 1, v) patterns."""
+        for call in self.calls:
+            if call.full_name == 'table.insert':
+                if len(call.args) == 3:
+                    # check for table.insert(t, #t+1, v)
+                    pos_node = call.args[1]
+                    table_node = call.args[0]
+                    table_name = node_to_string(table_node)
+
+                    if isinstance(pos_node, AddOp):
+                        # check if it's #t + 1
+                        left = pos_node.left
+                        right = pos_node.right
+                        if isinstance(left, ULengthOP) and isinstance(right, Number) and right.n == 1:
+                            if node_to_string(left.operand) == table_name:
+                                self.findings.append(Finding(
+                                    pattern_name='table_insert_append_len',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'table.insert({table_name}, #{table_name}+1, v) -> {table_name}[#{table_name}+1] = v',
+                                    details={
+                                        'table': table_name,
+                                        'value': node_to_string(call.args[2]),
+                                        'node': call.node,
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
+                                continue
+
+                if len(call.args) == 2:
+                    # 2-arg form: table.insert(t, v)
+                    table_name = node_to_string(call.args[0])
+                    value = node_to_string(call.args[1])
+
+                    self.findings.append(Finding(
+                        pattern_name='table_insert_append',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'table.insert({table_name}, v) -> {table_name}[#{table_name}+1] = v',
+                        details={
+                            'table': table_name,
+                            'value': value,
+                            'full_match': f'table.insert({table_name}, {value})',
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                elif len(call.args) == 3:
+                    # 3-arg form: table.insert(t, pos, v)
+                    pos_node = call.args[1]
+                    if isinstance(pos_node, Number) and pos_node.n == 1:
+                        table_name = node_to_string(call.args[0])
+                        self.findings.append(Finding(
+                            pattern_name='table_insert_front',
+                            severity='YELLOW',
+                            line_num=call.line,
+                            message=f'table.insert({table_name}, 1, v) is O(n) -> avoid inserting at front of large tables',
+                            details={
+                                'table': table_name,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+    def _analyze_table_remove(self):
+        """Find table.remove(t) patterns that can be t[#t] = nil."""
+        for call in self.calls:
+            if call.full_name == 'table.remove' and len(call.args) == 1:
+                # SAFETY: only safe to auto-fix if return value is NOT used
+                # We check this by seeing if the call is part of an assignment or other expression
+                # This is a bit complex without full data-flow, so we'll just check if it's
+                # a standalone statement in a block.
+
+                is_standalone = False
+                parent = self.parent_map.get(id(call.node))
+                if isinstance(parent, Block):
+                    is_standalone = True
+
+                # Severity YELLOW if potentially unsafe, GREEN if standalone
+                severity = 'GREEN' if is_standalone else 'YELLOW'
+
+                table_name = node_to_string(call.args[0])
+                self.findings.append(Finding(
+                    pattern_name='table_remove_last',
+                    severity=severity,
+                    line_num=call.line,
+                    message=f'table.remove({table_name}) -> {table_name}[#{table_name}] = nil',
+                    details={
+                        'table': table_name,
+                        'full_match': f'table.remove({table_name})',
+                        'node': call.node,
+                        'is_standalone': is_standalone,
                     },
                     source_line=self._get_source_line(call.line),
                 ))
@@ -1664,7 +2213,7 @@ class ASTAnalyzer:
         """Find deprecated functions: table.getn, string.len."""
         for call in self.calls:
             if call.full_name == 'table.getn' and len(call.args) == 1:
-                arg = self._node_to_string(call.args[0])
+                arg = node_to_string(call.args[0])
                 self.findings.append(Finding(
                     pattern_name='table_getn',
                     severity='GREEN',
@@ -1679,7 +2228,7 @@ class ASTAnalyzer:
                 ))
 
             elif call.full_name == 'string.len' and len(call.args) == 1:
-                arg = self._node_to_string(call.args[0])
+                arg = node_to_string(call.args[0])
                 self.findings.append(Finding(
                     pattern_name='string_len',
                     severity='GREEN',
@@ -1693,11 +2242,253 @@ class ASTAnalyzer:
                     source_line=self._get_source_line(call.line),
                 ))
 
+    def _analyze_math_random_1(self):
+        """Find math.random(1, N) that can be math.random(N)."""
+        for call in self.calls:
+            if call.full_name == 'math.random' and len(call.args) == 2:
+                arg1 = call.args[0]
+                if isinstance(arg1, Number) and arg1.n == 1:
+                    n_str = node_to_string(call.args[1])
+                    self.findings.append(Finding(
+                        pattern_name='math_random_1',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.random(1, {n_str}) -> math.random({n_str})',
+                        details={
+                            'n_str': n_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_math_abs_positive(self):
+        """Find math.abs() on values that are always positive."""
+        positive_funcs = {'time_global', 'device().time_global', 'level.get_time_days',
+                         'math.random', 'math.sqrt', 'math.exp'}
+        for call in self.calls:
+            if call.full_name == 'math.abs' and len(call.args) == 1:
+                arg = call.args[0]
+                is_positive = False
+                if isinstance(arg, Number) and arg.n >= 0:
+                    is_positive = True
+                elif isinstance(arg, ULengthOP):
+                    is_positive = True
+                elif isinstance(arg, Call):
+                    _, _, full_name = self._get_call_name(arg)
+                    if full_name in positive_funcs:
+                        is_positive = True
+
+                if is_positive:
+                    arg_str = node_to_string(arg)
+                    self.findings.append(Finding(
+                        pattern_name='math_abs_positive',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.abs({arg_str}) is redundant',
+                        details={
+                            'arg_str': arg_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_table_concat_literal(self):
+        """Find table.concat({a, b}) that can be a .. b."""
+        for call in self.calls:
+            if call.full_name == 'table.concat' and len(call.args) >= 1:
+                arg1 = call.args[0]
+                if isinstance(arg1, Table) and len(arg1.fields) >= 2 and len(arg1.fields) <= 4:
+                    # check if all fields are simple values (no complex expressions)
+                    all_simple = True
+                    parts = []
+                    for field in arg1.fields:
+                        if field.key: # named key {k=v} - not handled by concat on array
+                            all_simple = False
+                            break
+                        if not self._is_simple_expr(field.value) and not isinstance(field.value, (Call, Invoke)):
+                            # expressions like a+b might need parens, skip for now
+                            all_simple = False
+                            break
+                        parts.append(node_to_string(field.value))
+
+                    if all_simple:
+                        sep = '""'
+                        if len(call.args) >= 2:
+                            if isinstance(call.args[1], String):
+                                sep = node_to_string(call.args[1])
+                            else:
+                                all_simple = False # complex separator
+
+                        if all_simple:
+                            # if separator is "", just join with ..
+                            # otherwise join with .. sep ..
+                            if sep in ('""', "''"):
+                                replacement = ' .. '.join(parts)
+                            else:
+                                replacement = f' .. {sep} .. '.join(parts)
+
+                            self.findings.append(Finding(
+                                pattern_name='table_concat_literal',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'table.concat({{...}}) -> concatenation: {replacement}',
+                                details={
+                                    'replacement': replacement,
+                                    'node': call.node,
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+
+    def _analyze_math_random_0_1(self):
+        """Find math.random(0, 1) and suggest math.random()."""
+        for call in self.calls:
+            if call.full_name == 'math.random' and len(call.args) == 2:
+                arg1 = call.args[0]
+                arg2 = call.args[1]
+                if isinstance(arg1, Number) and arg1.n == 0 and \
+                   isinstance(arg2, Number) and arg2.n == 1:
+                    self.findings.append(Finding(
+                        pattern_name='math_random_0_1',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message='math.random(0, 1) -> math.random()',
+                        details={'node': call.node},
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_math_deg_rad(self):
+        """Find math.deg(x) or math.rad(x) and suggest multiplication by constant."""
+        import math as py_math
+        for call in self.calls:
+            if call.full_name in ('math.deg', 'math.rad') and len(call.args) == 1:
+                arg = call.args[0]
+                if isinstance(arg, Number):
+                    continue # handled by constant folding
+
+                x_str = node_to_string(arg)
+
+                if call.full_name == 'math.deg':
+                    # x * (180 / pi)
+                    const = 180 / py_math.pi
+                    msg = f'math.deg({x_str}) -> {x_str} * {const:.10g}'
+                    pattern = 'math_deg_to_mult'
+                else:
+                    # x * (pi / 180)
+                    const = py_math.pi / 180
+                    msg = f'math.rad({x_str}) -> {x_str} * {const:.10g}'
+                    pattern = 'math_rad_to_mult'
+
+                self.findings.append(Finding(
+                    pattern_name=pattern,
+                    severity='GREEN',
+                    line_num=call.line,
+                    message=msg,
+                    details={
+                        'x_str': x_str,
+                        'const': f'{const:.10g}',
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_string_rep(self):
+        """Find string.rep(s, 2) and suggest s .. s."""
+        for call in self.calls:
+            if call.full_name == 'string.rep' and len(call.args) == 2:
+                count_node = call.args[1]
+                if isinstance(count_node, Number) and count_node.n == 2:
+                    s_str = node_to_string(call.args[0])
+                    if self._is_simple_expr(call.args[0]):
+                        replacement = f'{s_str} .. {s_str}'
+                        self.findings.append(Finding(
+                            pattern_name='string_rep_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.rep({s_str}, 2) -> {replacement}',
+                            details={
+                                'replacement': replacement,
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+    def _analyze_math_log(self):
+        """Find math.log(x, base) and suggest math.log(x) if base is e."""
+        for call in self.calls:
+            if call.full_name == 'math.log' and len(call.args) == 2:
+                base_node = call.args[1]
+                is_e = False
+
+                # check for math.exp(1)
+                if isinstance(base_node, Call):
+                    _, _, full_name = self._get_call_name(base_node)
+                    if full_name == 'math.exp' and len(base_node.args) == 1:
+                        arg = base_node.args[0]
+                        if isinstance(arg, Number) and arg.n == 1:
+                            is_e = True
+
+                # check for numeric value of e (approx)
+                elif isinstance(base_node, Number):
+                    if 2.71828 <= base_node.n <= 2.71829:
+                        is_e = True
+
+                if is_e:
+                    x_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='math_log_base_e',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.log({x_str}, e) -> math.log({x_str})',
+                        details={
+                            'x_str': x_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_math_mod(self):
+        """Find math.mod(x, y) and suggest x % y."""
+        for call in self.calls:
+            if call.full_name == 'math.mod' and len(call.args) == 2:
+                x_str = node_to_string(call.args[0])
+                y_str = node_to_string(call.args[1])
+                self.findings.append(Finding(
+                    pattern_name='math_mod_to_percent',
+                    severity='GREEN',
+                    line_num=call.line,
+                    message=f'math.mod({x_str}, {y_str}) -> {x_str} % {y_str}',
+                    details={
+                        'x_str': x_str,
+                        'y_str': y_str,
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
+
+    def _analyze_math_atan2(self):
+        """Find math.atan2(y, 1) and suggest math.atan(y)."""
+        for call in self.calls:
+            if call.full_name == 'math.atan2' and len(call.args) == 2:
+                arg2 = call.args[1]
+                if isinstance(arg2, Number) and arg2.n == 1:
+                    y_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='math_atan2_to_atan',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.atan2({y_str}, 1) -> math.atan({y_str})',
+                        details={
+                            'y_str': y_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
     def _analyze_math_pow(self):
         """Find math.pow that can be simplified."""
         for call in self.calls:
             if call.full_name == 'math.pow' and len(call.args) == 2:
-                base = self._node_to_string(call.args[0])
+                base = node_to_string(call.args[0])
                 exp_node = call.args[1]
 
                 # check for simple cases
@@ -1710,7 +2501,7 @@ class ASTAnalyzer:
                             pattern_name='math_pow_simple',
                             severity='GREEN',
                             line_num=call.line,
-                            message=f'{full_match} -> {base}^0.5',
+                            message=f'{full_match} -> math.sqrt({base})',
                             details={
                                 'base': base,
                                 'exponent': exp,
@@ -1741,7 +2532,17 @@ class ASTAnalyzer:
 
     def _is_simple_expr(self, node: Node) -> bool:
         """Check if node is a simple expression (safe to repeat)."""
-        return isinstance(node, (Name, Number))
+        return isinstance(node, (Name, Number, String, TrueExpr, FalseExpr))
+
+    def _is_guaranteed_truthy(self, node: Node) -> bool:
+        """Check if node is guaranteed to be truthy in Lua."""
+        if isinstance(node, (Number, String, TrueExpr, Table, Function, LocalFunction)):
+            return True
+        # also check inferred type
+        inferred = self._infer_type(node)
+        if inferred in ('number', 'string', 'table', 'function'):
+            return True
+        return False
     
     def _count_calls_branch_aware(self, calls: List[CallInfo]) -> int:
         """
@@ -2076,6 +2877,28 @@ class ASTAnalyzer:
         # Phase 2: Warning patterns (not auto-fixable)
         self._detect_unused_local_vars()
         self._detect_unused_local_funcs()
+        self._detect_dead_assignments()
+
+    def _detect_dead_assignments(self):
+        """Detect variables assigned a value that is never read."""
+        for (scope_id, name), info in self.local_vars.items():
+            if info.is_loop_var:
+                continue
+
+            for assign in info.assignments:
+                if not assign.is_used and assign.node is not None:
+                    # node is None for initial declaration "local x"
+                    self.findings.append(Finding(
+                        pattern_name='dead_assignment',
+                        severity='YELLOW',
+                        line_num=assign.line,
+                        message=f'Value assigned to "{name}" is never read',
+                        details={
+                            'name': name,
+                            'line': assign.line,
+                        },
+                        source_line=self._get_source_line(assign.line),
+                    ))
 
     def _detect_code_after_return(self):
         """Detect unreachable code after unconditional return statements."""
@@ -2197,11 +3020,11 @@ class ASTAnalyzer:
     def _get_func_name(self, node: Node) -> str:
         """Get function name from function node."""
         if isinstance(node, Function):
-            return self._node_to_string(node.name) if node.name else '<anon>'
+            return node_to_string(node.name) if node.name else '<anon>'
         elif isinstance(node, LocalFunction):
             return node.name.id if isinstance(node.name, Name) else '<anon>'
         elif isinstance(node, Method):
-            source = self._node_to_string(node.source)
+            source = node_to_string(node.source)
             method = node.name.id if isinstance(node.name, Name) else ""
             return f"{source}:{method}"
         return '<unknown>'
@@ -2356,7 +3179,7 @@ class ASTAnalyzer:
                 check_if_node(node)
             
             # Recurse into children
-            for child in self._iter_children(node):
+            for child in iter_children(node):
                 walk(child)
         
         walk(self._ast_tree)
@@ -2451,7 +3274,7 @@ class ASTAnalyzer:
                 check_condition(node.test, 'while', line)
             
             # Recurse into children
-            for child in self._iter_children(node):
+            for child in iter_children(node):
                 walk(child)
         
         walk(self._ast_tree)
@@ -2464,11 +3287,28 @@ class ASTAnalyzer:
         """
         # Report unused locals from scope-aware tracking
         for (scope_id, name), info in self.local_vars.items():
-            # Skip functions (handled separately) and loop vars
-            if info.is_function or info.is_loop_var:
+            # Skip functions (handled separately)
+            if info.is_function:
                 continue
                 
             if not info.is_read:
+                # Special pattern for unused loop variables
+                if info.is_loop_var:
+                    scope_name = info.scope.name if info.scope else '<unknown>'
+                    self.findings.append(Finding(
+                        pattern_name='unused_loop_variable',
+                        severity='YELLOW',
+                        line_num=info.assign_line,
+                        message=f"Loop variable '{name}' is never used in {scope_name}",
+                        details={
+                            'var_name': name,
+                            'assign_line': info.assign_line,
+                            'scope_name': scope_name,
+                        },
+                        source_line=self._get_source_line(info.assign_line),
+                    ))
+                    continue
+
                 # Check if it's used as callback (RegisterScriptCallback)
                 if name in self.callback_registrations:
                     continue
@@ -2476,16 +3316,21 @@ class ASTAnalyzer:
                 # Get scope name for better error message
                 scope_name = info.scope.name if info.scope else '<unknown>'
                 
+                # Distinguish between parameters and regular locals
+                pattern = 'unused_parameter' if info.is_param else 'unused_local_variable'
+                msg_prefix = "Parameter" if info.is_param else "Local variable"
+
                 self.findings.append(Finding(
-                    pattern_name='unused_local_variable',
+                    pattern_name=pattern,
                     severity='YELLOW',  # warning only, don't auto-fix
                     line_num=info.assign_line,
-                    message=f"Local variable '{name}' is assigned but never used in {scope_name}",
+                    message=f"{msg_prefix} '{name}' is assigned but never used in {scope_name}",
                     details={
                         'var_name': name,
                         'assign_line': info.assign_line,
                         'scope_name': scope_name,
                         'is_safe_to_remove': False,  # not safe - might be intentional
+                        'is_param': info.is_param,
                     },
                     source_line=self._get_source_line(info.assign_line),
                 ))

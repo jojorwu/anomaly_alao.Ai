@@ -144,7 +144,7 @@ class Reporter:
                 )
                 self._jinja_env.filters['basename'] = lambda p: Path(p).name
 
-    def add_finding(self, mod_name: str, file_path: Path, finding: Finding):
+    def add_finding(self, mod_name: str, file_path: Path, finding: Finding) -> None:
         """Add a finding to the report."""
         self.findings[mod_name][str(file_path)].append(finding)
         self._all_findings_cache = None  # invalidate cache
@@ -205,6 +205,33 @@ class Reporter:
                     if f.severity in counts:
                         counts[f.severity] += 1
         return counts
+
+    def get_findings_summary(self) -> str:
+        """Return a formatted string representing the findings summary."""
+        green = self.count_by_severity("GREEN")
+        yellow = self.count_by_severity("YELLOW")
+        red = self.count_by_severity("RED")
+        debug = self.count_by_severity("DEBUG")
+
+        # count nil access findings
+        nil_count = sum(1 for f in self.all_findings if f.pattern_name == 'potential_nil_access')
+        nil_fixable = sum(1 for f in self.all_findings
+                         if f.pattern_name == 'potential_nil_access' and f.details.get('is_safe_to_fix'))
+
+        # count dead code findings
+        dead_code_count = sum(1 for f in self.all_findings if f.pattern_name.startswith('dead_code_'))
+        dead_code_fixable = sum(1 for f in self.all_findings
+                               if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
+        unused_count = sum(1 for f in self.all_findings if f.pattern_name.startswith('unused_'))
+
+        summary = f"{green} GREEN (auto-fixable), {yellow} YELLOW (review), {red} RED (info)"
+        if debug > 0:
+            summary += f", {debug} DEBUG (logging)"
+        if nil_count > 0:
+            summary += f", {nil_count} NIL ({nil_fixable} fixable)"
+        if dead_code_count > 0 or unused_count > 0:
+            summary += f", {dead_code_count + unused_count} DEAD-CODE ({dead_code_fixable} removable)"
+        return summary
 
     def print_summary(self):
         """Print a summary to stdout."""
@@ -280,7 +307,7 @@ class Reporter:
                                 if detail_str:
                                     print(f"        {detail_str}")
 
-    def save(self, path: Path, verbose: bool = False):
+    def save(self, path: Path, verbose: bool = False) -> None:
         """Save report to file (txt, html, or json)."""
         suffix = path.suffix.lower()
 
@@ -291,7 +318,7 @@ class Reporter:
         else:
             self._save_txt(path, verbose)
 
-    def _get_template_data(self) -> dict:
+    def _get_template_data(self) -> Dict[str, Any]:
         """Prepare data for template rendering."""
         findings_data = {}
         mod_breakdowns = {}
@@ -365,7 +392,7 @@ class Reporter:
                 result[key] = str(value)
         return result
 
-    def _save_json(self, path: Path, verbose: bool = False):
+    def _save_json(self, path: Path, verbose: bool = False) -> None:
         """Save as JSON."""
         if verbose:
             print("  Preparing JSON data...", end="", flush=True)
@@ -404,12 +431,15 @@ class Reporter:
         if verbose:
             print("\r  Writing file...              ", end="", flush=True)
 
-        path.write_text(json.dumps(data, indent=2, default=str), encoding='utf-8')
+        try:
+            path.write_text(json.dumps(data, indent=2, default=str), encoding='utf-8')
+        except (OSError, PermissionError) as e:
+            print(f"\n  [ERROR] Could not save JSON report: {e}")
 
         if verbose:
             print("\r  Done.                        ")
 
-    def _save_txt(self, path: Path, verbose: bool = False):
+    def _save_txt(self, path: Path, verbose: bool = False) -> None:
         """Save as plain text."""
         if verbose:
             print("  Generating text report...", end="", flush=True)
@@ -453,12 +483,15 @@ class Reporter:
         if verbose:
             print("\r  Writing file...              ", end="", flush=True)
 
-        path.write_text('\n'.join(lines), encoding='utf-8')
+        try:
+            path.write_text('\n'.join(lines), encoding='utf-8')
+        except (OSError, PermissionError) as e:
+            print(f"\n  [ERROR] Could not save text report: {e}")
 
         if verbose:
             print("\r  Done.                        ")
 
-    def _save_html(self, path: Path, verbose: bool = False):
+    def _save_html(self, path: Path, verbose: bool = False) -> None:
         """Save as HTML report using Jinja2 template if available."""
         if verbose:
             print("  Preparing template data...", end="", flush=True)
@@ -486,7 +519,10 @@ class Reporter:
             if verbose:
                 print("\r  Writing file...              ", end="", flush=True)
 
-            path.write_text(html_content, encoding='utf-8')
+            try:
+                path.write_text(html_content, encoding='utf-8')
+            except (OSError, PermissionError) as e:
+                print(f"\n  [ERROR] Could not save HTML report: {e}")
 
             if verbose:
                 print("\r  Done.                        ")

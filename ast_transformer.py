@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Set
 import shutil
 
+from luaparser.astnodes import Name, Index, Call, Invoke, Number
 from ast_analyzer import analyze_file, ASTAnalyzer, Scope
 from models import Finding
 
@@ -23,7 +24,14 @@ class SourceEdit:
 
 
 class ASTTransformer:
-    """Transform Lua source using AST-based analysis."""
+    """
+    Transform Lua source using AST-based analysis.
+
+    This class takes findings from an ASTAnalyzer and applies corresponding
+    transformations to the source code. It uses character-based offsets from the
+    AST to perform precise search-and-replace operations while maintaining code
+    integrity and formatting as much as possible.
+    """
 
     def __init__(self):
         self.source: str = ""
@@ -138,7 +146,7 @@ class ASTTransformer:
         """Generate source edits for a finding."""
         pattern = finding.pattern_name
 
-        if pattern == 'table_insert_append':
+        if pattern in ('table_insert_append', 'table_insert_append_len'):
             self._edit_table_insert(finding)
         elif pattern == 'table_getn':
             self._edit_table_getn(finding)
@@ -163,12 +171,675 @@ class ASTTransformer:
             self._edit_repeated_calls(finding)
         elif pattern == 'distance_to_comparison':
             self._edit_distance_to_comparison(finding)
+        elif pattern == 'string_find_plain':
+            self._edit_string_find_plain(finding)
+        elif pattern == 'table_remove_last':
+            if finding.severity == 'GREEN':
+                self._edit_table_remove_last(finding)
+        elif pattern == 'redundant_boolean_comp':
+            self._edit_redundant_boolean_comp(finding)
+        elif pattern == 'math_random_1':
+            self._edit_math_random_1(finding)
+        elif pattern == 'math_abs_positive':
+            self._edit_math_abs_positive(finding)
+        elif pattern == 'constant_folding':
+            self._edit_constant_folding(finding)
+        elif pattern == 'expo_to_mult':
+            self._edit_expo_to_mult(finding)
+        elif pattern == 'string_sub_to_byte_simple':
+            self._edit_string_sub_to_byte_simple(finding)
+        elif pattern == 'string_format_to_concat':
+            self._edit_string_format_to_concat(finding)
+        elif pattern == 'redundant_return_bool':
+            self._edit_redundant_return_bool(finding)
+        elif pattern == 'table_concat_literal':
+            self._edit_table_concat_literal(finding)
+        elif pattern == 'ipairs_hot_loop':
+            if finding.severity == 'GREEN':
+                self._edit_ipairs_hot_loop(finding)
+        elif pattern == 'math_min_max_inline':
+            self._edit_math_min_max_inline(finding)
+        elif pattern == 'string_sub_to_byte':
+            self._edit_string_sub_to_byte(finding)
+        elif pattern == 'string_match_existence':
+            self._edit_string_match_existence(finding)
+        elif pattern == 'unpack_to_indexing':
+            self._edit_unpack_to_indexing(finding)
+        elif pattern == 'divide_by_constant':
+            self._edit_divide_by_constant(finding)
+        elif pattern == 'if_nil_assign':
+            self._edit_if_nil_assign(finding)
+        elif pattern == 'redundant_type_conversion':
+            self._edit_redundant_type_conversion(finding)
+        elif pattern == 'string_byte_1':
+            self._edit_string_byte_1(finding)
+        elif pattern == 'return_ternary_simplification':
+            self._edit_return_ternary_simplification(finding)
+        elif pattern == 'math_atan2_to_atan':
+            self._edit_math_atan2(finding)
+        elif pattern == 'math_mod_to_percent':
+            self._edit_math_mod(finding)
+        elif pattern == 'math_log_base_e':
+            self._edit_math_log(finding)
+        elif pattern in ('math_deg_to_mult', 'math_rad_to_mult'):
+            self._edit_math_deg_rad(finding)
+        elif pattern == 'math_random_0_1':
+            self._edit_math_random_0_1(finding)
+        elif pattern == 'string_rep_simple':
+            self._edit_string_rep_simple(finding)
 
 
     # Edit methods using AST positions
 
+    def _edit_string_match_existence(self, finding: Finding):
+        """Convert string.match(s, "p") to string.find(s, "p", 1, true)."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str')
+        pattern = finding.details.get('pattern')
+
+        if not node or not s_str or pattern is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'string.find({s_str}, "{pattern}", 1, true)'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_unpack_to_indexing(self, finding: Finding):
+        """Convert local a, b = unpack(t) to local a, b = t[1], t[2]."""
+        node = finding.details.get('node')
+        table_name = finding.details.get('table')
+        targets = finding.details.get('targets')
+
+        if not node or not table_name or not targets:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # targets is a list of strings
+        target_str = ', '.join(targets)
+        indexing_str = ', '.join([f'{table_name}[{i+1}]' for i in range(len(targets))])
+
+        replacement = f'local {target_str} = {indexing_str}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_divide_by_constant(self, finding: Finding):
+        """Convert x / 2 to x * 0.5."""
+        node = finding.details.get('node')
+        reciprocal = finding.details.get('reciprocal')
+
+        if not node or reciprocal is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # get the left side
+        left_start, left_end = self._get_node_span(node.left)
+        if left_start is None:
+            return
+
+        left_str = self.source[left_start:left_end]
+
+        # wrap in parens if complex
+        if not isinstance(node.left, (Name, Number, Call, Invoke, Index)):
+            left_str = f'({left_str})'
+
+        replacement = f'{left_str} * {reciprocal}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_redundant_type_conversion(self, finding: Finding):
+        """Remove redundant tonumber() or tostring() call."""
+        node = finding.details.get('node')
+        arg_str = finding.details.get('arg_str')
+        if not node or arg_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=arg_str
+        ))
+
+    def _edit_string_byte_1(self, finding: Finding):
+        """Convert string.byte(s, 1) to string.byte(s)."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str')
+        if not node or s_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'string.byte({s_str})'
+        ))
+
+    def _edit_string_rep_simple(self, finding: Finding):
+        """Convert string.rep(s, 2) to s .. s."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_math_random_0_1(self, finding: Finding):
+        """Convert math.random(0, 1) to math.random()."""
+        node = finding.details.get('node')
+        if not node:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement='math.random()'
+        ))
+
+    def _edit_math_deg_rad(self, finding: Finding):
+        """Convert math.deg(x) or math.rad(x) to x * const."""
+        node = finding.details.get('node')
+        x_str = finding.details.get('x_str')
+        const = finding.details.get('const')
+        if not node or x_str is None or const is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # check if x needs parens
+        if not isinstance(node.args[0], (Name, Number, Call, Invoke, Index)):
+            x_str = f'({x_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'{x_str} * {const}'
+        ))
+
+    def _edit_math_log(self, finding: Finding):
+        """Convert math.log(x, base) to math.log(x)."""
+        node = finding.details.get('node')
+        x_str = finding.details.get('x_str')
+        if not node or x_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'math.log({x_str})'
+        ))
+
+    def _edit_math_mod(self, finding: Finding):
+        """Convert math.mod(x, y) to x % y."""
+        node = finding.details.get('node')
+        x_str = finding.details.get('x_str')
+        y_str = finding.details.get('y_str')
+        if not node or x_str is None or y_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # check if x needs parens
+        if not isinstance(node.args[0], (Name, Number, Call, Invoke, Index)):
+            x_str = f'({x_str})'
+        # check if y needs parens
+        if not isinstance(node.args[1], (Name, Number, Call, Invoke, Index)):
+            y_str = f'({y_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'{x_str} % {y_str}'
+        ))
+
+    def _edit_math_atan2(self, finding: Finding):
+        """Convert math.atan2(y, 1) to math.atan(y)."""
+        node = finding.details.get('node')
+        y_str = finding.details.get('y_str')
+        if not node or y_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'math.atan({y_str})'
+        ))
+
+    def _edit_return_ternary_simplification(self, finding: Finding):
+        """Convert if cond then return a else return b end to return cond and a or b."""
+        node = finding.details.get('node')
+        cond = finding.details.get('cond')
+        v1 = finding.details.get('v1')
+        v2 = finding.details.get('v2')
+
+        if not node or cond is None or v1 is None or v2 is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Optimization: use small-ternary
+        replacement = f'return {cond} and {v1} or {v2}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_if_nil_assign(self, finding: Finding):
+        """Convert if x == nil then x = val end to x = x or val."""
+        node = finding.details.get('node')
+        var = finding.details.get('var')
+        val = finding.details.get('val')
+
+        if not node or not var or not val:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'{var} = {var} or {val}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_redundant_boolean_comp(self, finding: Finding):
+        """Convert x == true to x, x == false to not x, etc."""
+        node = finding.details.get('full_node')
+        target_node = finding.details.get('target_node')
+        bool_val = finding.details.get('bool_val')
+        op = finding.details.get('op')
+
+        if not node or not target_node:
+            return
+
+        start, end = self._get_node_span(node)
+        target_start, target_end = self._get_node_span(target_node)
+
+        if start is None or target_start is None:
+            return
+
+        target_str = self.source[target_start:target_end]
+
+        # Simplify logic:
+        # (x == true)  -> x
+        # (x ~= true)  -> not x
+        # (x == false) -> not x
+        # (x ~= false) -> x
+
+        if (op == '==' and bool_val is True) or (op == '~=' and bool_val is False):
+            replacement = target_str
+        else:
+            # check if target_str needs parens for 'not'
+            # if it's just a Name or Index or Call, it's safe
+            # if it contains operators, wrap it
+            if isinstance(target_node, (Name, Index, Call, Invoke)):
+                replacement = f'not {target_str}'
+            else:
+                replacement = f'not ({target_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_table_remove_last(self, finding: Finding):
+        """Convert table.remove(t) to t[#t] = nil."""
+        node = finding.details.get('node')
+        if not node:
+            return
+
+        table_name = finding.details.get('table', '')
+        if not table_name:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'{table_name}[#{table_name}] = nil'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+        ))
+
+    def _edit_math_random_1(self, finding: Finding):
+        """Convert math.random(1, N) to math.random(N)."""
+        node = finding.details.get('node')
+        n_str = finding.details.get('n_str', '')
+        if not node or not n_str:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=f'math.random({n_str})'
+        ))
+
+    def _edit_math_min_max_inline(self, finding: Finding):
+        """Convert math.min(a, b) to a < b and a or b."""
+        node = finding.details.get('node')
+        arg1 = finding.details.get('arg1', '')
+        arg2 = finding.details.get('arg2', '')
+        op = finding.details.get('op', '')
+
+        if not node or not arg1 or not arg2 or not op:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Optimization: use small-ternary
+        replacement = f'{arg1} {op} {arg2} and {arg1} or {arg2}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_string_sub_to_byte(self, finding: Finding):
+        """Convert string.sub(s, n, n) == "c" to string.byte(s, n) == code."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str', '')
+        n_str = finding.details.get('n_str', '')
+        op = finding.details.get('op', '')
+        byte_val = finding.details.get('byte_val')
+
+        if not node or not s_str or not n_str or not op or byte_val is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'string.byte({s_str}, {n_str}) {op} {byte_val}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_table_concat_literal(self, finding: Finding):
+        """Convert table.concat({a, b}) to a .. b."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement', '')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_ipairs_hot_loop(self, finding: Finding):
+        """Convert for k, v in ipairs(t) do to for k=1, #t do local v = t[k]."""
+        loop_node = finding.details.get('loop_node')
+        table_name = finding.details.get('table', '')
+        k_var = finding.details.get('k_var', '')
+        v_var = finding.details.get('v_var', '')
+
+        if not loop_node or not table_name or not k_var or not v_var:
+            return
+
+        # 1. Replace the loop header
+        # get positions for "for k, v in ipairs(t) do"
+        # we can't easily get the header span, but we can replace from "for" to "do"
+        # actually, it's easier to just replace the whole node and reconstruct it
+        # but that loses formatting.
+        # Let's try replacing pieces.
+
+        # Iter span: ipairs(t)
+        iter_start = None
+        iter_end = None
+        for it in loop_node.iter:
+            s, e = self._get_node_span(it)
+            if iter_start is None or (s is not None and s < iter_start):
+                iter_start = s
+            if iter_end is None or (e is not None and e > iter_end):
+                iter_end = e
+
+        if iter_start is None or iter_end is None:
+            return
+
+        # Instead of finding targets span (which can be None in luaparser),
+        # we look backwards from iter_start to find 'for' and 'in'.
+
+        # Header text should look like: for k, v in ipairs(t) do
+        line_num = self.analyzer._get_line(loop_node)
+        header_start, header_end = self._get_line_span(line_num)
+        if header_start is None:
+            return
+
+        line_text = self.source[header_start:header_end]
+
+        # Find 'for' and 'do' positions in the header line
+        for_match = re.search(r'\bfor\b', line_text)
+        do_match = re.search(r'\bdo\b', line_text)
+
+        if not for_match or not do_match:
+            return
+
+        # Replace everything between 'for' and 'do'
+        replace_start = header_start + for_match.end()
+        replace_end = header_start + do_match.start()
+
+        self.edits.append(SourceEdit(
+            start_char=replace_start,
+            end_char=replace_end,
+            replacement=f' {k_var} = 1, #{table_name} ',
+            priority=10
+        ))
+
+        # 2. Insert "local v = table[k]" at the beginning of the body
+        if hasattr(loop_node, 'body') and hasattr(loop_node.body, 'body'):
+            body_first_stmt = loop_node.body.body[0] if loop_node.body.body else None
+            if body_first_stmt:
+                insert_pos = self._get_line_start(self.analyzer._get_line(body_first_stmt))
+                indent = self._get_indent_at_line(self.analyzer._get_line(body_first_stmt))
+            else:
+                # empty body? just before 'end'
+                insert_pos = self._get_line_start(self.analyzer._get_end_line(loop_node))
+                indent = self._get_indent_at_line(self.analyzer._get_line(loop_node)) + self._detect_indent_unit()
+
+            if insert_pos is not None:
+                self.edits.append(SourceEdit(
+                    start_char=insert_pos,
+                    end_char=insert_pos,
+                    replacement=f'{indent}local {v_var} = {table_name}[{k_var}]\n',
+                    priority=5
+                ))
+
+    def _edit_redundant_return_bool(self, finding: Finding):
+        """Convert if cond then return true else return false end to return cond."""
+        node = finding.details.get('node')
+        cond_str = finding.details.get('cond_str', '')
+        if not node or not cond_str:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Use !! idiom to guarantee boolean result if original wasn't
+        # but if it's a comparison, it's already boolean
+        if any(op in cond_str for op in ('==', '~=', '>', '<', '>=', '<=', ' and ', ' or ', 'not ')):
+            replacement = f'return {cond_str}'
+        else:
+            replacement = f'return not not ({cond_str})'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_string_format_to_concat(self, finding: Finding):
+        """Convert string.format("%s", a) to a."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement', '')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_constant_folding(self, finding: Finding):
+        """Replace arithmetic operation with pre-calculated result."""
+        node = finding.details.get('node')
+        result = finding.details.get('result')
+        if not node or result is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=str(result)
+        ))
+
+    def _edit_expo_to_mult(self, finding: Finding):
+        """Replace x^n with x*x*..."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_string_sub_to_byte_simple(self, finding: Finding):
+        """Convert string.sub(s, i, i) to string.char(string.byte(s, i))."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str')
+        i_str = finding.details.get('i_str')
+        if not node or not s_str or i_str is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # We need it to be string again to match original behavior
+        # string.sub returns string, string.byte returns number
+        if i_str == "1":
+            replacement = f'string.char(string.byte({s_str}))'
+        else:
+            replacement = f'string.char(string.byte({s_str}, {i_str}))'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_math_abs_positive(self, finding: Finding):
+        """Remove redundant math.abs() call."""
+        node = finding.details.get('node')
+        arg_str = finding.details.get('arg_str', '')
+        if not node or not arg_str:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=arg_str
+        ))
+
     def _edit_table_insert(self, finding: Finding):
-        """Convert table.insert(t, v) to t[#t+1] = v."""
+        """Convert table.insert(t, v) or table.insert(t, #t+1, v) to t[#t+1] = v."""
         node = finding.details.get('node')
         if not node:
             return
@@ -183,8 +854,13 @@ class ASTTransformer:
             return
 
         # extract value from source
-        call_text = self.source[start:end]
-        value = self._extract_table_insert_value(call_text, table_name)
+        if finding.pattern_name == 'table_insert_append':
+            call_text = self.source[start:end]
+            value = self._extract_table_insert_value(call_text, table_name)
+        else:
+            # table_insert_append_len
+            value = finding.details.get('value', '')
+
         if not value:
             return
 
@@ -196,104 +872,66 @@ class ASTTransformer:
             replacement=replacement,
         ))
 
-    def _extract_table_insert_value(self, call_text: str, table_name: str) -> Optional[str]:
-        """Extract the value argument from table.insert(t, v) call text.
-        
-        Handles:
-        - Regular strings: "..." and '...'
-        - Long strings: [[...]] and [=[...]=] (with any number of =)
-        - Nested parentheses, braces, and brackets
-        """
-        # find opening paren
-        paren_start = call_text.find('(')
-        if paren_start == -1:
-            return None
-
-        # find comma after table name
-        comma_pos = call_text.find(',', paren_start)
-        if comma_pos == -1:
-            return None
-
-        value_start = comma_pos + 1
-
-        # find matching closing paren with proper tracking
+    def _find_matching_paren(self, text: str, start_pos: int) -> int:
+        """Find the index of the matching closing parenthesis in Lua code."""
         depth = 1
-        brace_depth = 0
         in_string = False
         string_char = None
         in_long_string = False
-        long_string_level = 0  # number of = signs in long string delimiter
-        i = paren_start + 1
+        long_string_level = 0
+        i = start_pos + 1
 
-        while i < len(call_text) and depth > 0:
-            c = call_text[i]
-
+        while i < len(text) and depth > 0:
+            c = text[i]
             if in_long_string:
-                # Look for closing long string delimiter: ]=*]
                 if c == ']':
-                    # Check if this is the closing delimiter
-                    # Need to match the same number of = signs
-                    if i + 1 + long_string_level < len(call_text):
-                        expected_close = ']' + '=' * long_string_level + ']'
-                        if call_text[i:i + len(expected_close)] == expected_close:
-                            in_long_string = False
-                            i += len(expected_close)
-                            continue
+                    expected_close = ']' + '=' * long_string_level + ']'
+                    if text[i:i + len(expected_close)] == expected_close:
+                        in_long_string = False
+                        i += len(expected_close)
+                        continue
                 i += 1
                 continue
-            
             if in_string:
-                # Check for escaped quote or end of string
                 if c == string_char:
-                    # Check if escaped (count preceding backslashes)
                     num_backslashes = 0
                     j = i - 1
-                    while j >= 0 and call_text[j] == '\\':
+                    while j >= 0 and text[j] == '\\':
                         num_backslashes += 1
                         j -= 1
-                    # If even number of backslashes, quote is not escaped
                     if num_backslashes % 2 == 0:
                         in_string = False
                 i += 1
                 continue
-
-            # Not in any string - check what we have
             if c in ('"', "'"):
                 in_string = True
                 string_char = c
             elif c == '[':
-                # Check for long string start: [=*[
-                # Count = signs
                 eq_count = 0
                 j = i + 1
-                while j < len(call_text) and call_text[j] == '=':
+                while j < len(text) and text[j] == '=':
                     eq_count += 1
                     j += 1
-                # Check if followed by [
-                if j < len(call_text) and call_text[j] == '[':
-                    # This is a long string
+                if j < len(text) and text[j] == '[':
                     in_long_string = True
                     long_string_level = eq_count
-                    i = j + 1  # skip past the opening [[
+                    i = j + 1
                     continue
-                # Otherwise it's a regular bracket (for indexing)
-                # Don't track bracket depth - it's handled by context
-            elif c == '(':
-                depth += 1
-            elif c == ')':
-                depth -= 1
-            elif c == '{':
-                brace_depth += 1
-            elif c == '}':
-                brace_depth -= 1
-
+            elif c == '(': depth += 1
+            elif c == ')': depth -= 1
             i += 1
+        return i if depth == 0 else -1
 
-        if depth != 0:
-            return None
-
-        value = call_text[value_start:i - 1].strip()
-        return value
+    def _extract_table_insert_value(self, call_text: str, table_name: str) -> Optional[str]:
+        """Extract the value argument from table.insert(t, v) call text."""
+        paren_start = call_text.find('(')
+        if paren_start == -1: return None
+        comma_pos = call_text.find(',', paren_start)
+        if comma_pos == -1: return None
+        value_start = comma_pos + 1
+        match_end = self._find_matching_paren(call_text, paren_start)
+        if match_end == -1: return None
+        return call_text[value_start:match_end - 1].strip()
 
     def _edit_table_getn(self, finding: Finding):
         """Convert table.getn(t) to #t."""
@@ -335,6 +973,30 @@ class ASTTransformer:
             replacement=f'#{str_name}',
         ))
 
+    def _edit_string_find_plain(self, finding: Finding):
+        """Convert string.find(s, p) to string.find(s, p, 1, true)."""
+        node = finding.details.get('node')
+        if not node:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        call_text = self.source[start:end]
+        match_end = self._find_matching_paren(call_text, call_text.find('('))
+        if match_end == -1:
+            return
+
+        # replace the closing paren with ", 1, true)"
+        replacement = call_text[:match_end - 1] + ", 1, true)"
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+        ))
+
     def _edit_math_pow(self, finding: Finding):
         """Convert math.pow(x, n) to x^n or x*x*..."""
         node = finding.details.get('node')
@@ -353,7 +1015,7 @@ class ASTTransformer:
             return
 
         if pow_type == 'sqrt':
-            replacement = f'{base}^0.5'
+            replacement = f'math.sqrt({base})'
         elif pow_type == 'power' and isinstance(exp, int):
             replacement = '*'.join([base] * exp)
         else:
