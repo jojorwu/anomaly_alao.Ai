@@ -6,7 +6,7 @@ from ast_analyzer import ASTAnalyzer
 from ast_transformer import ASTTransformer
 from whole_program_analyzer import WholeProgramAnalyzer
 from discovery import discover_mods, get_mod_info
-from utils import node_to_string, set_parents
+from utils import node_to_string
 import luaparser.astnodes as ln
 
 class TestOptimizer(unittest.TestCase):

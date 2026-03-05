@@ -19,7 +19,7 @@ from luaparser.astnodes import (
     Index, Name, String,
     Return, Break,
 )
-from utils import node_to_string, iter_children, set_parents
+from utils import node_to_string, iter_children
 
 
 @dataclass
@@ -116,6 +116,9 @@ EXPORT_PATTERNS = {
 class WholeProgramAnalyzer:
     """Performs whole-program analysis across multiple script files."""
     
+    def _get_parent(self, node: Node, file_path: Path) -> Optional[Node]:
+        """Get parent node from the parent map for the given file."""
+        return self._parent_maps.get(file_path, {}).get(id(node))
 
     def get_findings(self) -> List[Tuple[Path, Finding]]:
         """Identify unused global symbols and return them as Findings."""
@@ -150,6 +153,7 @@ class WholeProgramAnalyzer:
         self.files_analyzed: Set[Path] = set()
         self.parse_errors: List[Tuple[Path, str]] = []
         self._ast_cache: Dict[Path, Tuple[Optional[Chunk], str]] = {}  # path -> (tree, source)
+        self._parent_maps: Dict[Path, Dict[int, Node]] = {}
     
     def analyze_directory(self, directory: Path, recursive: bool = True) -> CrossFileAnalysis:
         """Analyze all .script files in a directory."""
@@ -164,12 +168,13 @@ class WholeProgramAnalyzer:
     def _analyze_files_impl(self, files: List[Path]) -> CrossFileAnalysis:
         """Internal implementation that parses once and runs both passes."""
         # parse all files once and cache
+        from utils import get_parent_map
         for script_path in files:
             self._ensure_parsed(script_path)
             # set parents for robust logic analysis
             cached = self._ast_cache.get(script_path)
             if cached and cached[0]:
-                set_parents(cached[0])
+                self._parent_maps[script_path] = get_parent_map(cached[0])
         
         # pass 1: collect all definitions
         for script_path in files:
@@ -415,7 +420,7 @@ class WholeProgramAnalyzer:
         # Only count as usage if it's not the name in a function/method definition
         # or assignment target, which are already handled by _define_*.
         # Also skip if it's the function being called (handled by _usage_call)
-        parent = getattr(node, 'parent', None)
+        parent = self._get_parent(node, file_path)
         if isinstance(parent, (Function, LocalFunction, Method)):
             if node is getattr(parent, 'name', None):
                 return

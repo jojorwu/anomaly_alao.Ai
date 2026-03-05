@@ -58,6 +58,7 @@ class ASTAnalyzer:
     def reset(self):
         """Reset analyzer state for reuse."""
         self.findings: List[Finding] = []
+        self.parent_map: Dict[int, Node] = {}
         self.comparisons: List[Tuple[Node, int]] = []
         self.exposures: List[Tuple[Node, int]] = []
         self.index_accesses: List[Tuple[Node, int, Scope, bool]] = []
@@ -122,6 +123,8 @@ class ASTAnalyzer:
 
         # store AST tree for dead code analysis
         self._ast_tree = tree
+        from utils import get_parent_map
+        self.parent_map = get_parent_map(tree)
 
         # create global scope
         self.global_scope = Scope(
@@ -270,11 +273,6 @@ class ASTAnalyzer:
         """Visit a node and dispatch to specific handler."""
         if node is None:
             return
-
-        # track parent node for logic analysis
-        for child in iter_children(node):
-            if isinstance(child, Node):
-                child.parent = node
 
         handler = getattr(self, f'_visit_{type(node).__name__}', None)
         if handler:
@@ -1057,7 +1055,7 @@ class ASTAnalyzer:
         line = self._get_line(node)
         is_write = False
         # check if this is a write
-        parent = getattr(node, 'parent', None)
+        parent = self.parent_map.get(id(node))
         if isinstance(parent, (Assign, LocalAssign)):
             if node in parent.targets:
                 is_write = True
@@ -1239,6 +1237,139 @@ class ASTAnalyzer:
         self._analyze_expo_to_mult()
         self._analyze_table_new_in_loop()
         self._analyze_repeated_member_access_in_loop()
+        self._analyze_string_match_existence()
+        self._analyze_unpack_to_indexing()
+        self._analyze_divide_by_constant()
+        self._analyze_if_nil_assign()
+
+    def _analyze_string_match_existence(self):
+        """Find string.match() used in boolean context with plain patterns."""
+        lua_regex_chars = set('^$()%.[]*+-?')
+        for call in self.calls:
+            if call.full_name == 'string.match' and len(call.args) == 2:
+                # check if it's in a boolean context
+                is_bool_context = False
+                parent = self.parent_map.get(id(call.node))
+                if isinstance(parent, (If, While, Repeat)) and getattr(parent, 'test', None) == call.node:
+                    is_bool_context = True
+                elif isinstance(parent, (AndLoOp, OrLoOp, ULNotOp)):
+                    is_bool_context = True
+
+                if is_bool_context:
+                    pattern_node = call.args[1]
+                    if isinstance(pattern_node, String):
+                        pattern_text = pattern_node.s
+                        if isinstance(pattern_text, bytes):
+                            pattern_text = pattern_text.decode('utf-8', errors='replace')
+
+                        if not any(c in lua_regex_chars for c in pattern_text):
+                            self.findings.append(Finding(
+                                pattern_name='string_match_existence',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'string.match(s, "{pattern_text}") in boolean context -> use string.find(s, "{pattern_text}", 1, true)',
+                                details={
+                                    'pattern': pattern_text,
+                                    's_str': node_to_string(call.args[0]),
+                                    'node': call.node,
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+
+    def _analyze_unpack_to_indexing(self):
+        """Find local a, b = unpack(t) and suggest direct indexing."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, LocalAssign) and len(node.targets) >= 2 and len(node.values) == 1:
+                val = node.values[0]
+                if isinstance(val, Call):
+                    _, _, full_name = self._get_call_name(val)
+                    if full_name == 'unpack' and len(val.args) == 1:
+                        if len(node.targets) <= 4:
+                            table_name = node_to_string(val.args[0])
+                            self.findings.append(Finding(
+                                pattern_name='unpack_to_indexing',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'unpack({table_name}) to multiple locals -> use direct indexing',
+                                details={
+                                    'table': table_name,
+                                    'targets': [node_to_string(t) for t in node.targets],
+                                    'node': node,
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
+    def _analyze_divide_by_constant(self):
+        """Find division by constant and suggest multiplication."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, FloatDivOp):
+                if isinstance(node.right, Number) and node.right.n != 0:
+                    divisor = node.right.n
+                    # suggest for common ones
+                    if divisor in (2, 4, 5, 8, 10, 16, 20, 25, 32, 40, 50, 64, 100, 128, 256, 512, 1024):
+                        reciprocal = 1.0 / divisor
+                        # format nicely
+                        if reciprocal == int(reciprocal):
+                            rec_str = str(int(reciprocal))
+                        else:
+                            rec_str = f"{reciprocal:.6g}"
+
+                        self.findings.append(Finding(
+                            pattern_name='divide_by_constant',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Division by {divisor} -> multiply by {rec_str}',
+                            details={
+                                'divisor': divisor,
+                                'reciprocal': rec_str,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_if_nil_assign(self):
+        """Find if x == nil then x = val end patterns."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, If) and not node.orelse:
+                # check condition: x == nil or not x
+                is_nil_check = False
+                var_name = None
+
+                test = node.test
+                if isinstance(test, EqToOp):
+                    if isinstance(test.left, Name) and isinstance(test.right, Nil):
+                        var_name = test.left.id
+                        is_nil_check = True
+                    elif isinstance(test.right, Name) and isinstance(test.left, Nil):
+                        var_name = test.right.id
+                        is_nil_check = True
+                elif isinstance(test, ULNotOp) and isinstance(test.operand, Name):
+                    var_name = test.operand.id
+                    is_nil_check = True
+
+                if is_nil_check and var_name:
+                    # check body: x = val
+                    if isinstance(node.body, Block) and len(node.body.body) == 1:
+                        stmt = node.body.body[0]
+                        if isinstance(stmt, Assign) and len(stmt.targets) == 1 and len(stmt.values) == 1:
+                            target = stmt.targets[0]
+                            if isinstance(target, Name) and target.id == var_name:
+                                val_str = node_to_string(stmt.values[0])
+                                self.findings.append(Finding(
+                                    pattern_name='if_nil_assign',
+                                    severity='YELLOW',
+                                    line_num=self._get_line(node),
+                                    message=f'if {var_name} == nil then {var_name} = {val_str} end -> {var_name} = {var_name} or {val_str}',
+                                    details={
+                                        'var': var_name,
+                                        'val': val_str,
+                                        'node': node,
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
 
     def _analyze_plain_string_find(self):
         """Find string.find() with plain strings that can use plain=true flag."""
@@ -1291,8 +1422,9 @@ class ASTAnalyzer:
                 # check if it's used in a Forin loop
                 parent_loop = None
                 curr = call.node
-                while hasattr(curr, 'parent'):
-                    curr = curr.parent
+                while True:
+                    curr = self.parent_map.get(id(curr))
+                    if not curr: break
                     if isinstance(curr, Forin):
                         parent_loop = curr
                         break
@@ -1381,30 +1513,44 @@ class ASTAnalyzer:
                     ))
 
     def _analyze_string_sub_to_byte_simple(self):
-        """Find string.sub(s, 1, 1) calls that can be optimized."""
+        """Find string.sub(s, i, i) calls that can be optimized to string.char(string.byte(s, i))."""
         for call in self.calls:
             if call.full_name == 'string.sub' and len(call.args) >= 2:
+                arg1 = call.args[0]
                 arg2 = call.args[1]
                 arg3 = call.args[2] if len(call.args) > 2 else None
 
-                # string.sub(s, 1, 1)
-                if isinstance(arg2, Number) and arg2.n == 1:
-                    if arg3 is None or (isinstance(arg3, Number) and arg3.n == 1):
-                        s_str = node_to_string(call.args[0])
+                # string.sub(s, i, i)
+                is_single_char = False
+                if arg3 is not None:
+                    if node_to_string(arg2) == node_to_string(arg3):
+                        is_single_char = True
+                elif isinstance(arg2, Number) and arg2.n == 1:
+                    # string.sub(s, 1)
+                    is_single_char = True
 
-                        # safety check: check context (if used in comparison, handled by string_sub_to_byte)
-                        # here we just suggest general optimization to string.byte
-                        self.findings.append(Finding(
-                            pattern_name='string_sub_to_byte_simple',
-                            severity='GREEN',
-                            line_num=call.line,
-                            message=f'string.sub({s_str}, 1, 1) -> string.byte({s_str}) is faster',
-                            details={
-                                's_str': s_str,
-                                'node': call.node,
-                            },
-                            source_line=self._get_source_line(call.line),
-                        ))
+                if is_single_char:
+                    s_str = node_to_string(arg1)
+                    i_str = node_to_string(arg2)
+
+                    # if i is 1, we can just use string.byte(s)
+                    if i_str == "1":
+                        msg = f'string.sub({s_str}, 1, 1) -> string.char(string.byte({s_str}))'
+                    else:
+                        msg = f'string.sub({s_str}, {i_str}, {i_str}) -> string.char(string.byte({s_str}, {i_str}))'
+
+                    self.findings.append(Finding(
+                        pattern_name='string_sub_to_byte_simple',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=msg,
+                        details={
+                            's_str': s_str,
+                            'i_str': i_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
 
     def _analyze_string_sub_to_byte(self):
         """Find string.sub(s, n, n) == "c" that can be string.byte(s, n) == code."""
@@ -1873,7 +2019,7 @@ class ASTAnalyzer:
                 # a standalone statement in a block.
 
                 is_standalone = False
-                parent = getattr(call.node, 'parent', None)
+                parent = self.parent_map.get(id(call.node))
                 if isinstance(parent, Block):
                     is_standalone = True
 

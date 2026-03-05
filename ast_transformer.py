@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Set
 import shutil
 
-from luaparser.astnodes import Name, Index, Call, Invoke
+from luaparser.astnodes import Name, Index, Call, Invoke, Number
 from ast_analyzer import analyze_file, ASTAnalyzer, Scope
 from models import Finding
 
@@ -201,9 +201,115 @@ class ASTTransformer:
             self._edit_math_min_max_inline(finding)
         elif pattern == 'string_sub_to_byte':
             self._edit_string_sub_to_byte(finding)
+        elif pattern == 'string_match_existence':
+            self._edit_string_match_existence(finding)
+        elif pattern == 'unpack_to_indexing':
+            self._edit_unpack_to_indexing(finding)
+        elif pattern == 'divide_by_constant':
+            self._edit_divide_by_constant(finding)
+        elif pattern == 'if_nil_assign':
+            self._edit_if_nil_assign(finding)
 
 
     # Edit methods using AST positions
+
+    def _edit_string_match_existence(self, finding: Finding):
+        """Convert string.match(s, "p") to string.find(s, "p", 1, true)."""
+        node = finding.details.get('node')
+        s_str = finding.details.get('s_str')
+        pattern = finding.details.get('pattern')
+
+        if not node or not s_str or pattern is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'string.find({s_str}, "{pattern}", 1, true)'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_unpack_to_indexing(self, finding: Finding):
+        """Convert local a, b = unpack(t) to local a, b = t[1], t[2]."""
+        node = finding.details.get('node')
+        table_name = finding.details.get('table')
+        targets = finding.details.get('targets')
+
+        if not node or not table_name or not targets:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # targets is a list of strings
+        target_str = ', '.join(targets)
+        indexing_str = ', '.join([f'{table_name}[{i+1}]' for i in range(len(targets))])
+
+        replacement = f'local {target_str} = {indexing_str}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_divide_by_constant(self, finding: Finding):
+        """Convert x / 2 to x * 0.5."""
+        node = finding.details.get('node')
+        reciprocal = finding.details.get('reciprocal')
+
+        if not node or reciprocal is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # get the left side
+        left_start, left_end = self._get_node_span(node.left)
+        if left_start is None:
+            return
+
+        left_str = self.source[left_start:left_end]
+
+        # wrap in parens if complex
+        if not isinstance(node.left, (Name, Number, Call, Invoke, Index)):
+            left_str = f'({left_str})'
+
+        replacement = f'{left_str} * {reciprocal}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
+    def _edit_if_nil_assign(self, finding: Finding):
+        """Convert if x == nil then x = val end to x = x or val."""
+        node = finding.details.get('node')
+        var = finding.details.get('var')
+        val = finding.details.get('val')
+
+        if not node or not var or not val:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        replacement = f'{var} = {var} or {val}'
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
 
     def _edit_redundant_boolean_comp(self, finding: Finding):
         """Convert x == true to x, x == false to not x, etc."""
@@ -502,10 +608,11 @@ class ASTTransformer:
         ))
 
     def _edit_string_sub_to_byte_simple(self, finding: Finding):
-        """Convert string.sub(s, 1, 1) to string.char(string.byte(s))."""
+        """Convert string.sub(s, i, i) to string.char(string.byte(s, i))."""
         node = finding.details.get('node')
         s_str = finding.details.get('s_str')
-        if not node or not s_str:
+        i_str = finding.details.get('i_str')
+        if not node or not s_str or i_str is None:
             return
 
         start, end = self._get_node_span(node)
@@ -514,10 +621,15 @@ class ASTTransformer:
 
         # We need it to be string again to match original behavior
         # string.sub returns string, string.byte returns number
+        if i_str == "1":
+            replacement = f'string.char(string.byte({s_str}))'
+        else:
+            replacement = f'string.char(string.byte({s_str}, {i_str}))'
+
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=f'string.char(string.byte({s_str}))'
+            replacement=replacement
         ))
 
     def _edit_math_abs_positive(self, finding: Finding):

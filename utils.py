@@ -1,4 +1,4 @@
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Tuple, Any, Dict
 from luaparser.astnodes import (
     Node, Name, Number, String, TrueExpr, FalseExpr, Nil, Index,
     Call, Invoke, ULengthOP, UMinusOp, ULNotOp, UBNotOp,
@@ -120,9 +120,10 @@ def iter_children(node: Node):
             elif isinstance(child, Node):
                 yield child
 
-def set_parents(root_node: Node):
-    """Iteratively set parent attribute for all nodes in the tree."""
-    if root_node is None: return
+def get_parent_map(root_node: Node) -> Dict[int, Node]:
+    """Iteratively build a map of node id -> parent node."""
+    parent_map = {}
+    if root_node is None: return parent_map
     stack = [root_node]
     visited = set()
     while stack:
@@ -132,5 +133,6 @@ def set_parents(root_node: Node):
         visited.add(id(node))
         for child in iter_children(node):
             if isinstance(child, Node):
-                child.parent = node
+                parent_map[id(child)] = node
                 stack.append(child)
+    return parent_map
