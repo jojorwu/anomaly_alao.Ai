@@ -194,7 +194,7 @@ class ASTTransformer:
             self._edit_redundant_return_bool(finding)
         elif pattern == 'table_concat_literal':
             self._edit_table_concat_literal(finding)
-        elif pattern == 'ipairs_hot_loop':
+        elif pattern in ('ipairs_hot_loop', 'unused_ipairs_value'):
             if finding.severity == 'GREEN':
                 self._edit_ipairs_hot_loop(finding)
         elif pattern == 'math_min_max_inline':
@@ -231,6 +231,12 @@ class ASTTransformer:
             self._edit_algebraic_simplification(finding)
         elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
             self._edit_string_starts_with(finding)
+        elif pattern == 'logical_identity':
+            self._edit_logical_identity(finding)
+        elif pattern == 'nested_redundant_call':
+            self._edit_nested_redundant_call(finding)
+        elif pattern == 'table_literal_indices':
+            self._edit_table_literal_indices(finding)
 
 
     # Edit methods using AST positions
@@ -545,6 +551,60 @@ class ASTTransformer:
             replacement=replacement
         ))
 
+    def _edit_table_literal_indices(self, finding: Finding):
+        """Replace table literal with simplified version."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
+    def _edit_nested_redundant_call(self, finding: Finding):
+        """Replace nested redundant call with simplified version."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
+    def _edit_logical_identity(self, finding: Finding):
+        """Replace redundant logical operation with simplified version."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
     def _edit_string_starts_with(self, finding: Finding):
         """Replace string.find(s, p) == 1 with string.sub(s, 1, #p) == p."""
         node = finding.details.get('node')
@@ -743,6 +803,10 @@ class ASTTransformer:
         ))
 
         # 2. Insert "local v = table[k]" at the beginning of the body
+        # UNLESS the finding is unused_ipairs_value, then we don't need the local
+        if finding.pattern_name == 'unused_ipairs_value':
+            return
+
         if hasattr(loop_node, 'body') and hasattr(loop_node.body, 'body'):
             body_first_stmt = loop_node.body.body[0] if loop_node.body.body else None
             if body_first_stmt:
