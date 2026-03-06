@@ -212,6 +212,19 @@ class ASTAnalyzer:
                 if full_name == 'math.ceil': return py_math.ceil(args[0])
                 if full_name == 'math.sqrt' and args[0] >= 0: return py_math.sqrt(args[0])
                 if full_name == 'math.exp': return py_math.exp(args[0])
+                if full_name == 'math.sin': return py_math.sin(args[0])
+                if full_name == 'math.cos': return py_math.cos(args[0])
+                if full_name == 'math.tan' and len(args) >= 1: return py_math.tan(args[0])
+                if full_name == 'math.asin' and len(args) >= 1 and -1 <= args[0] <= 1: return py_math.asin(args[0])
+                if full_name == 'math.acos' and len(args) >= 1 and -1 <= args[0] <= 1: return py_math.acos(args[0])
+                if full_name == 'math.atan' and len(args) >= 1: return py_math.atan(args[0])
+                if full_name == 'math.atan2' and len(args) >= 2: return py_math.atan2(args[0], args[1])
+                if full_name == 'math.log' and len(args) >= 1:
+                    if len(args) == 1:
+                        return py_math.log(args[0]) if args[0] > 0 else None
+                    else:
+                        return py_math.log(args[0], args[1]) if args[0] > 0 and args[1] > 0 and args[1] != 1 else None
+                if full_name == 'math.log10': return py_math.log10(args[0]) if args[0] > 0 else None
                 if full_name == 'math.deg': return py_math.degrees(args[0])
                 if full_name == 'math.rad': return py_math.radians(args[0])
                 if full_name == 'math.fmod': return py_math.fmod(args[0], args[1])
@@ -261,6 +274,13 @@ class ASTAnalyzer:
                     if isinstance(s, bytes): return len(s)
                 if full_name == 'string.upper': return args[0].upper() if isinstance(args[0], (str, bytes)) else None
                 if full_name == 'string.lower': return args[0].lower() if isinstance(args[0], (str, bytes)) else None
+                if full_name == 'string.rep' and len(args) >= 2:
+                    s = args[0]
+                    n = int(args[1])
+                    if isinstance(s, (str, bytes)) and 0 <= n <= 1024:
+                        res = s * n
+                        if len(res) <= 1024: return res
+                    return None
                 if full_name == 'string.char':
                     # Lua string.char returns bytes
                     try:
@@ -1644,8 +1664,14 @@ class ASTAnalyzer:
                         replacement = None
                         if op == GreaterOrEqThanOp: replacement = "true"
                         elif op == LessThanOp: replacement = "false"
-                        # math.abs(x) > 0 is x ~= 0
-                        # math.abs(x) <= 0 is x == 0
+                        elif op == GreaterThanOp or op == NotEqToOp:
+                            # math.abs(x) > 0  or  math.abs(x) ~= 0  ->  x ~= 0
+                            arg_str = node_to_string(call.args[0]) if call.args else "x"
+                            replacement = f"{arg_str} ~= 0"
+                        elif op == LessOrEqThanOp or op == EqToOp:
+                            # math.abs(x) <= 0  or  math.abs(x) == 0  ->  x == 0
+                            arg_str = node_to_string(call.args[0]) if call.args else "x"
+                            replacement = f"{arg_str} == 0"
 
                         if replacement:
                             self.findings.append(Finding(
@@ -2113,6 +2139,23 @@ class ASTAnalyzer:
                     elif left_val == 0: target = node.right; reason = "0 + x"
                 elif isinstance(node, SubOp):
                     if right_val == 0: target = node.left; reason = "x - 0"
+                    elif left_val == 0:
+                        target_str = node_to_string(node.right)
+                        # Add a space after the minus to avoid forming a comment if target_str starts with '-'
+                        replacement = f"- {target_str}"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: 0 - {target_str} -> - {target_str}',
+                            details={
+                                'target_node': None,
+                                'node': node,
+                                'replacement': replacement
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
                     else:
                         s1 = node_to_string(node.left)
                         s2 = node_to_string(node.right)
@@ -2846,12 +2889,60 @@ class ASTAnalyzer:
         """Find x^2, x^3 etc. that can be simplified to multiplication."""
         for node in ast.walk(self._ast_tree):
             if isinstance(node, ExpoOp):
-                if isinstance(node.right, Number) and node.right.n in (2, 3):
+                if isinstance(node.right, Number):
                     base_str = node_to_string(node.left)
-                    exponent = int(node.right.n)
+                    exponent = node.right.n
 
-                    if self._is_simple_expr(node.left):
-                        replacement = '*'.join([base_str] * exponent)
+                    if exponent == 0.5:
+                        replacement = f"math.sqrt({base_str})"
+                        self.findings.append(Finding(
+                            pattern_name='expo_to_mult',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Exponent to sqrt: {base_str}^0.5 -> {replacement}',
+                            details={
+                                'replacement': replacement,
+                                'node': node,
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
+
+                    if exponent == 2 and isinstance(node.left, Call):
+                        _, _, fn = self._get_call_name(node.left)
+                        if fn == 'math.sqrt' and len(node.left.args) == 1:
+                            x_str = node_to_string(node.left.args[0])
+                            self.findings.append(Finding(
+                                pattern_name='math_identity',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'(math.sqrt({x_str}))^2 -> {x_str}',
+                                details={
+                                    'node': node,
+                                    'replacement': x_str
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
+                        elif fn == 'math.abs' and len(node.left.args) == 1:
+                            x_str = node_to_string(node.left.args[0])
+                            if self._is_simple_expr(node.left.args[0]):
+                                replacement = f"{x_str}*{x_str}"
+                                self.findings.append(Finding(
+                                    pattern_name='math_identity',
+                                    severity='GREEN',
+                                    line_num=self._get_line(node),
+                                    message=f'(math.abs({x_str}))^2 -> {x_str}*{x_str}',
+                                    details={
+                                        'node': node,
+                                        'replacement': replacement
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+                                continue
+
+                    if exponent in (2, 3) and self._is_simple_expr(node.left):
+                        replacement = '*'.join([base_str] * int(exponent))
                         self.findings.append(Finding(
                             pattern_name='expo_to_mult',
                             severity='GREEN',
@@ -3600,6 +3691,10 @@ class ASTAnalyzer:
         """Find string.rep(s, 2) and suggest s .. s."""
         for call in self.calls:
             if call.full_name == 'string.rep' and len(call.args) == 2:
+                # check if it can be constant folded
+                if self._get_const_val(call.node) is not None:
+                    continue
+
                 count_node = call.args[1]
                 if isinstance(count_node, Number) and count_node.n == 2:
                     s_str = node_to_string(call.args[0])
@@ -3622,12 +3717,28 @@ class ASTAnalyzer:
         # Also handle math.log(x) / math.log(10)
         for node in ast.walk(self._ast_tree):
             if isinstance(node, FloatDivOp):
-                if isinstance(node.left, Call) and isinstance(node.right, Call):
+                # skip if already constant folded
+                if self._get_const_val(node) is not None:
+                    continue
+
+                if isinstance(node.left, Call):
                     _, _, f1 = self._get_call_name(node.left)
-                    _, _, f2 = self._get_call_name(node.right)
-                    if f1 == 'math.log' and f2 == 'math.log' and len(node.left.args) == 1 and len(node.right.args) == 1:
-                        base_val = self._get_const_val(node.right.args[0])
-                        if base_val == 10:
+                    if f1 == 'math.log' and len(node.left.args) == 1:
+                        is_log10 = False
+                        if isinstance(node.right, Call):
+                            _, _, f2 = self._get_call_name(node.right)
+                            if f2 == 'math.log' and len(node.right.args) == 1:
+                                val = self._get_const_val(node.right.args[0])
+                                if val == 10 or node_to_string(node.right.args[0]) == "10":
+                                    is_log10 = True
+
+                        if not is_log10:
+                            val = self._get_const_val(node.right)
+                            # log(10) is approx 2.302585092994046
+                            if val is not None and isinstance(val, (int, float)) and abs(val - 2.302585092994046) < 1e-6:
+                                is_log10 = True
+
+                        if is_log10:
                             x_str = node_to_string(node.left.args[0])
                             replacement = f"math.log10({x_str})"
                             self.findings.append(Finding(
@@ -3749,6 +3860,39 @@ class ASTAnalyzer:
                 if exp is not None:
                     full_match = f'math.pow({base}, {exp})'
 
+                    if exp == 2 and isinstance(base_node, Call):
+                        _, _, fn = self._get_call_name(base_node)
+                        if fn == 'math.sqrt' and len(base_node.args) == 1:
+                            x_str = node_to_string(base_node.args[0])
+                            self.findings.append(Finding(
+                                pattern_name='math_identity',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'math.pow(math.sqrt({x_str}), 2) -> {x_str}',
+                                details={
+                                    'node': call.node,
+                                    'replacement': x_str
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
+                        elif fn == 'math.abs' and len(base_node.args) == 1:
+                            x_str = node_to_string(base_node.args[0])
+                            if self._is_simple_expr(base_node.args[0]):
+                                replacement = f"{x_str}*{x_str}"
+                                self.findings.append(Finding(
+                                    pattern_name='math_identity',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'math.pow(math.abs({x_str}), 2) -> {x_str}*{x_str}',
+                                    details={
+                                        'node': call.node,
+                                        'replacement': replacement
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
+                                continue
+
                     if exp == 1:
                         self.findings.append(Finding(
                             pattern_name='math_pow_simple',
@@ -3845,7 +3989,11 @@ class ASTAnalyzer:
 
     def _is_simple_expr(self, node: Node) -> bool:
         """Check if node is a simple expression (safe to repeat)."""
-        return isinstance(node, (Name, Number, String, TrueExpr, FalseExpr))
+        if isinstance(node, (Name, Number, String, TrueExpr, FalseExpr)):
+            return True
+        if isinstance(node, Index):
+            return self._is_simple_expr(node.value) and self._is_simple_expr(node.idx)
+        return False
 
     def _is_guaranteed_truthy(self, node: Node) -> bool:
         """Check if node is guaranteed to be truthy in Lua."""
