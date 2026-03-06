@@ -46,13 +46,14 @@ class TestV5Optimizations(unittest.TestCase):
         self.assertIn("local r = 3.141592654", new_content)
 
     def test_string_rep_2(self):
+        # Now constant folded to "abcabc"
         script = 'local s = string.rep("abc", 2)'
         path = self.test_dir / "rep2.lua"
         path.write_text(script)
 
         modified, new_content, _ = self.transformer.transform_file(path, backup=False)
         self.assertTrue(modified)
-        self.assertIn('"abc" .. "abc"', new_content)
+        self.assertIn('"abcabc"', new_content)
 
 if __name__ == "__main__":
     unittest.main()
