@@ -231,7 +231,7 @@ class ASTTransformer:
             self._edit_algebraic_simplification(finding)
         elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
             self._edit_string_starts_with(finding)
-        elif pattern == 'logical_identity':
+        elif pattern in ('logical_identity', 'comparison_inversion'):
             self._edit_logical_identity(finding)
         elif pattern == 'nested_redundant_call':
             self._edit_nested_redundant_call(finding)
@@ -259,7 +259,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10 # Higher priority than simple constant folding
         ))
 
     def _edit_unpack_to_indexing(self, finding: Finding):
