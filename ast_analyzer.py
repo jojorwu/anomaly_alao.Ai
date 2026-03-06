@@ -1439,18 +1439,25 @@ class ASTAnalyzer:
                 replacement = None
                 reason = None
 
+                s1 = node_to_string(arg1)
+                s2 = node_to_string(arg2)
+                is_same = (s1 == s2) and self._is_simple_expr(arg1)
+
                 if call.full_name == 'bit.band':
-                    if val2 == 0: replacement = "0"; reason = "bit.band(x, 0)"
+                    if is_same: target = arg1; reason = "bit.band(x, x)"
+                    elif val2 == 0: replacement = "0"; reason = "bit.band(x, 0)"
                     elif val1 == 0: replacement = "0"; reason = "bit.band(0, x)"
                     elif val2 == 0xFFFFFFFF: target = arg1; reason = "bit.band(x, -1)"
                     elif val1 == 0xFFFFFFFF: target = arg2; reason = "bit.band(-1, x)"
                 elif call.full_name == 'bit.bor':
-                    if val2 == 0: target = arg1; reason = "bit.bor(x, 0)"
+                    if is_same: target = arg1; reason = "bit.bor(x, x)"
+                    elif val2 == 0: target = arg1; reason = "bit.bor(x, 0)"
                     elif val1 == 0: target = arg2; reason = "bit.bor(0, x)"
                     elif val2 == 0xFFFFFFFF: replacement = "-1"; reason = "bit.bor(x, -1)"
                     elif val1 == 0xFFFFFFFF: replacement = "-1"; reason = "bit.bor(-1, x)"
                 elif call.full_name == 'bit.bxor':
-                    if val2 == 0: target = arg1; reason = "bit.bxor(x, 0)"
+                    if is_same: replacement = "0"; reason = "bit.bxor(x, x)"
+                    elif val2 == 0: target = arg1; reason = "bit.bxor(x, 0)"
                     elif val1 == 0: target = arg2; reason = "bit.bxor(0, x)"
                 elif call.full_name in ('bit.lshift', 'bit.rshift', 'bit.arshift'):
                     if val2 == 0: target = arg1; reason = f"{call.full_name}(x, 0)"
@@ -1460,7 +1467,7 @@ class ASTAnalyzer:
                         replacement = node_to_string(target)
 
                     self.findings.append(Finding(
-                        pattern_name='algebraic_simplification',
+                        pattern_name='bitwise_identity',
                         severity='GREEN',
                         line_num=call.line,
                         message=f'Bitwise identity simplification: {reason} -> {replacement}',
@@ -1521,8 +1528,11 @@ class ASTAnalyzer:
             ('math.ceil', 'math.ceil'): 'redundant',
             ('tostring', 'tostring'): 'redundant',
             ('tonumber', 'tonumber'): 'redundant',
+            ('string.lower', 'string.lower'): 'redundant',
+            ('string.upper', 'string.upper'): 'redundant',
             ('math.deg', 'math.rad'): 'inverse',
             ('math.rad', 'math.deg'): 'inverse',
+            ('math.log', 'math.exp'): 'inverse',
         }
 
         for call in self.calls:
@@ -1793,6 +1803,42 @@ class ASTAnalyzer:
                                 'replacement': target_str
                             },
                             source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+        # Check for table.concat(t, "") -> table.concat(t)
+        for call in self.calls:
+            if call.full_name == 'table.concat' and len(call.args) == 2:
+                sep = self._get_const_val(call.args[1])
+                if sep == "":
+                    self.findings.append(Finding(
+                        pattern_name='table_concat_default_sep',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message='table.concat(t, "") -> table.concat(t)',
+                        details={
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+            # string.sub(s, 1, -1) -> s
+            elif call.full_name == 'string.sub' and len(call.args) == 3:
+                s_node = call.args[0]
+                arg1 = self._get_const_val(call.args[1])
+                arg2 = self._get_const_val(call.args[2])
+                if arg1 == 1 and arg2 == -1:
+                    if self._infer_type(s_node) == 'string':
+                        s_str = node_to_string(s_node)
+                        self.findings.append(Finding(
+                            pattern_name='string_sub_identity',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.sub({s_str}, 1, -1) -> {s_str}',
+                            details={
+                                'node': call.node,
+                                'replacement': s_str
+                            },
+                            source_line=self._get_source_line(call.line),
                         ))
 
     def _analyze_redundant_tonumber_tostring(self):
@@ -2123,7 +2169,7 @@ class ASTAnalyzer:
                 # Identity: math.min(x, x) -> x
                 if s1 == s2:
                     self.findings.append(Finding(
-                        pattern_name='algebraic_simplification',
+                        pattern_name='math_identity',
                         severity='GREEN',
                         line_num=call.line,
                         message=f'Math identity: {call.full_name}({s1}, {s1}) -> {s1}',
@@ -2150,7 +2196,7 @@ class ASTAnalyzer:
                 if target:
                     res_str = node_to_string(target)
                     self.findings.append(Finding(
-                        pattern_name='algebraic_simplification',
+                        pattern_name='math_identity',
                         severity='GREEN',
                         line_num=call.line,
                         message=f'Math identity with infinity: {call.full_name}(...) -> {res_str}',
@@ -2216,7 +2262,7 @@ class ASTAnalyzer:
                     if self._infer_type(arg1) == 'string':
                         s_str = node_to_string(arg1)
                         self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
+                            pattern_name='string_identity',
                             severity='GREEN',
                             line_num=call.line,
                             message=f'String identity: string.sub({s_str}, 1) -> {s_str}',
@@ -2564,15 +2610,19 @@ class ASTAnalyzer:
                             val1 = stmt1.values[0]
                             val2 = stmt2.values[0]
 
-                            if isinstance(val1, TrueExpr) and isinstance(val2, FalseExpr):
+                            if (isinstance(val1, TrueExpr) and isinstance(val2, FalseExpr)) or \
+                               (isinstance(val1, FalseExpr) and isinstance(val2, TrueExpr)):
                                 cond_str = node_to_string(node.test)
+                                inverted = isinstance(val1, FalseExpr)
+                                msg = f'if {cond_str} then return {"false" if inverted else "true"} else return {"true" if inverted else "false"} end -> return {"not " if inverted else ""}{cond_str}'
                                 self.findings.append(Finding(
                                     pattern_name='redundant_return_bool',
                                     severity='YELLOW',
                                     line_num=self._get_line(node),
-                                    message=f'if {cond_str} then return true else return false end -> return {cond_str}',
+                                    message=msg,
                                     details={
                                         'cond_str': cond_str,
+                                        'inverted': inverted,
                                         'node': node,
                                     },
                                     source_line=self._get_source_line(self._get_line(node)),
@@ -2991,6 +3041,7 @@ class ASTAnalyzer:
             if call.full_name == 'math.log' and len(call.args) == 2:
                 base_node = call.args[1]
                 is_e = False
+                is_10 = False
 
                 # check for math.exp(1)
                 if isinstance(base_node, Call):
@@ -3004,6 +3055,8 @@ class ASTAnalyzer:
                 elif isinstance(base_node, Number):
                     if 2.71828 <= base_node.n <= 2.71829:
                         is_e = True
+                    elif base_node.n == 10:
+                        is_10 = True
 
                 if is_e:
                     x_str = node_to_string(call.args[0])
@@ -3012,6 +3065,19 @@ class ASTAnalyzer:
                         severity='GREEN',
                         line_num=call.line,
                         message=f'math.log({x_str}, e) -> math.log({x_str})',
+                        details={
+                            'x_str': x_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                elif is_10:
+                    x_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='math_log_base_10',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.log({x_str}, 10) -> math.log10({x_str})',
                         details={
                             'x_str': x_str,
                             'node': call.node,
@@ -3068,7 +3134,8 @@ class ASTAnalyzer:
         """Find math.pow that can be simplified."""
         for call in self.calls:
             if call.full_name == 'math.pow' and len(call.args) == 2:
-                base = node_to_string(call.args[0])
+                base_node = call.args[0]
+                base = node_to_string(base_node)
                 exp_node = call.args[1]
                 exp = self._get_const_val(exp_node)
 
@@ -3090,6 +3157,7 @@ class ASTAnalyzer:
                             },
                             source_line=self._get_source_line(call.line),
                         ))
+                        continue
                     elif exp == 0:
                         self.findings.append(Finding(
                             pattern_name='math_pow_simple',
@@ -3104,6 +3172,7 @@ class ASTAnalyzer:
                             },
                             source_line=self._get_source_line(call.line),
                         ))
+                        continue
                     elif exp == 0.5:
                         self.findings.append(Finding(
                             pattern_name='math_pow_simple',
@@ -3120,26 +3189,9 @@ class ASTAnalyzer:
                             },
                             source_line=self._get_source_line(call.line),
                         ))
-                    elif exp < 0:
-                        if exp == -1: type_val = 'power_neg'
-                        elif exp == -2: type_val = 'power_neg'
-                        elif exp == -0.5: type_val = 'power_neg'
-                        else: continue
-
-                        self.findings.append(Finding(
-                            pattern_name='math_pow_simple',
-                            severity='GREEN',
-                            line_num=call.line,
-                            message=f'{full_match} -> negative power simplification',
-                            details={
-                                'base': base,
-                                'exponent': exp,
-                                'type': type_val,
-                                'node': call.node,
-                            },
-                            source_line=self._get_source_line(call.line),
-                        ))
-                    elif exp in (2, 3, 4) and self._is_simple_expr(call.args[0]):
+                        continue
+                    elif exp in (2, 3) and self._is_simple_expr(base_node):
+                        # Suggest multiplication
                         replacement = '*'.join([base] * int(exp))
                         self.findings.append(Finding(
                             pattern_name='math_pow_simple',
@@ -3148,14 +3200,42 @@ class ASTAnalyzer:
                             message=f'{full_match} -> {replacement}',
                             details={
                                 'base': base,
-                                'exponent': int(exp),
+                                'exponent': exp,
                                 'type': 'power',
-                                'is_simple': True,
-                                'full_match': full_match,
                                 'node': call.node,
                             },
                             source_line=self._get_source_line(call.line),
                         ))
+                        continue
+                    elif exp in (-1, -2, -0.5):
+                        self.findings.append(Finding(
+                            pattern_name='math_pow_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'{full_match} -> negative power simplification',
+                            details={
+                                'base': base,
+                                'exponent': exp,
+                                'type': 'power_neg',
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
+
+                # Fallback to base ^ exp for general cases
+                self.findings.append(Finding(
+                    pattern_name='math_pow_to_expo',
+                    severity='GREEN',
+                    line_num=call.line,
+                    message=f'math.pow({base}, ...) -> {base} ^ ...',
+                    details={
+                        'base': base,
+                        'exp_str': node_to_string(exp_node),
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
 
     def _is_simple_expr(self, node: Node) -> bool:
         """Check if node is a simple expression (safe to repeat)."""
