@@ -152,7 +152,7 @@ class ASTTransformer:
             self._edit_table_getn(finding)
         elif pattern == 'string_len':
             self._edit_string_len(finding)
-        elif pattern == 'math_pow_simple':
+        elif pattern in ('math_pow_simple', 'math_pow_to_expo'):
             self._edit_math_pow(finding)
         elif pattern == 'debug_statement':
             self._edit_debug_statement(finding)
@@ -219,7 +219,7 @@ class ASTTransformer:
             self._edit_math_atan2(finding)
         elif pattern in ('math_mod_to_percent', 'math_fmod_to_percent'):
             self._edit_math_mod(finding)
-        elif pattern == 'math_log_base_e':
+        elif pattern in ('math_log_base_e', 'math_log_base_10'):
             self._edit_math_log(finding)
         elif pattern in ('math_deg_to_mult', 'math_rad_to_mult'):
             self._edit_math_deg_rad(finding)
@@ -227,14 +227,16 @@ class ASTTransformer:
             self._edit_math_random_0_1(finding)
         elif pattern == 'string_rep_simple':
             self._edit_string_rep_simple(finding)
-        elif pattern == 'algebraic_simplification':
+        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index', 'string_empty_check'):
             self._edit_algebraic_simplification(finding)
         elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
             self._edit_string_starts_with(finding)
         elif pattern in ('logical_identity', 'comparison_inversion'):
             self._edit_logical_identity(finding)
-        elif pattern == 'nested_redundant_call':
+        elif pattern in ('nested_redundant_call', 'redundant_call_args'):
             self._edit_nested_redundant_call(finding)
+        elif pattern == 'table_concat_default_sep':
+            self._edit_table_concat_default_sep(finding)
         elif pattern == 'table_literal_indices':
             self._edit_table_literal_indices(finding)
 
@@ -285,7 +287,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=20
         ))
 
     def _edit_divide_by_constant(self, finding: Finding):
@@ -316,7 +319,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=20
         ))
 
     def _edit_redundant_type_conversion(self, finding: Finding):
@@ -364,10 +368,18 @@ class ASTTransformer:
         if start is None:
             return
 
+        # Compound identities (like math.sqrt(x*x)) should have higher priority than
+        # simple ones (like math.pow(x, 2)) to avoid partial transformations blocking
+        # the better ones.
+        priority = 10
+        if finding.pattern_name in ('math_identity', 'string_sub_negative_index'):
+            priority = 20
+
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=priority
         ))
 
     def _edit_math_random_0_1(self, finding: Finding):
@@ -409,7 +421,7 @@ class ASTTransformer:
         ))
 
     def _edit_math_log(self, finding: Finding):
-        """Convert math.log(x, base) to math.log(x)."""
+        """Convert math.log(x, base) to math.log(x) or math.log10(x)."""
         node = finding.details.get('node')
         x_str = finding.details.get('x_str')
         if not node or x_str is None:
@@ -419,10 +431,16 @@ class ASTTransformer:
         if start is None:
             return
 
+        if finding.pattern_name == 'math_log_base_10':
+            replacement = f'math.log10({x_str})'
+        else:
+            replacement = f'math.log({x_str})'
+
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=f'math.log({x_str})'
+            replacement=replacement,
+            priority=20
         ))
 
     def _edit_math_mod(self, finding: Finding):
@@ -487,7 +505,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_if_nil_assign(self, finding: Finding):
@@ -508,7 +527,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_redundant_boolean_comp(self, finding: Finding):
@@ -549,7 +569,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_table_literal_indices(self, finding: Finding):
@@ -563,11 +584,12 @@ class ASTTransformer:
         if start is None:
             return
 
+        # High priority for algebraic/identity simplifications to avoid partial folding
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_nested_redundant_call(self, finding: Finding):
@@ -638,7 +660,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_table_remove_last(self, finding: Finding):
@@ -830,6 +853,7 @@ class ASTTransformer:
         """Convert if cond then return true else return false end to return cond."""
         node = finding.details.get('node')
         cond_str = finding.details.get('cond_str', '')
+        inverted = finding.details.get('inverted', False)
         if not node or not cond_str:
             return
 
@@ -839,10 +863,18 @@ class ASTTransformer:
 
         # Use !! idiom to guarantee boolean result if original wasn't
         # but if it's a comparison, it's already boolean
-        if any(op in cond_str for op in ('==', '~=', '>', '<', '>=', '<=', ' and ', ' or ', 'not ')):
-            replacement = f'return {cond_str}'
+        has_bool_op = any(op in cond_str for op in ('==', '~=', '>', '<', '>=', '<=', ' and ', ' or ', 'not '))
+
+        if inverted:
+            # Always wrap the condition in parentheses when using 'not' to ensure correct precedence.
+            # In Lua, 'not' has higher precedence than arithmetic, comparison, and concatenation operators.
+            replacement = f'return not ({cond_str})'
         else:
-            replacement = f'return not not ({cond_str})'
+            if has_bool_op:
+                replacement = f'return {cond_str}'
+            else:
+                # Use 'not not' to force a boolean result if it wasn't already boolean.
+                replacement = f'return not not ({cond_str})'
 
         self.edits.append(SourceEdit(
             start_char=start,
@@ -1142,6 +1174,14 @@ class ASTTransformer:
             replacement = base
         elif pow_type == 'power_0':
             replacement = '1'
+        elif finding.pattern_name == 'math_pow_to_expo':
+            exp_str = finding.details.get('exp_str', '')
+            # handle precedence
+            if not isinstance(node.args[0], (Name, Number, Call, Invoke, Index)):
+                base = f'({base})'
+            if not isinstance(node.args[1], (Name, Number, Call, Invoke, Index)):
+                exp_str = f'({exp_str})'
+            replacement = f'{base} ^ {exp_str}'
         else:
             return
 
@@ -1149,7 +1189,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10,
+            priority=10 if finding.pattern_name == 'math_pow_to_expo' else 5,
         ))
 
     def _edit_distance_to_comparison(self, finding: Finding):
@@ -1901,12 +1941,7 @@ class ASTTransformer:
                     continue
 
                 # for calls like pairs(), ipairs() - replace the function name part
-                if '.' not in name:
-                    # bare global - find and replace just the name
-                    start, end = self._get_call_func_span(node, name)
-                else:
-                    # module.func - replace the whole func reference
-                    start, end = self._get_call_func_span(node, name)
+                start, end = self._get_call_func_span(node, name)
 
                 if start is None:
                     continue
@@ -1916,6 +1951,30 @@ class ASTTransformer:
                     end_char=end,
                     replacement=new_name,
                 ))
+
+    def _edit_table_concat_default_sep(self, finding: Finding):
+        """Convert table.concat(t, "") to table.concat(t)."""
+        node = finding.details.get('node')
+        if not node or not node.args:
+            return
+
+        start, end = self._get_node_span(node)
+        arg_start, arg_end = self._get_node_span(node.args[0])
+
+        if start is None or arg_start is None:
+            return
+
+        # Use the source text between call start and first arg start as header (e.g. "table.concat(")
+        header = self.source[start:arg_start]
+        arg_expr = self.source[arg_start:arg_end]
+
+        replacement = f"{header}{arg_expr})"
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+        ))
 
     def _edit_repeated_calls(self, finding: Finding):
         """Add caching for repeated expensive calls."""

@@ -211,6 +211,7 @@ class ASTAnalyzer:
                 if full_name == 'math.floor': return py_math.floor(args[0])
                 if full_name == 'math.ceil': return py_math.ceil(args[0])
                 if full_name == 'math.sqrt' and args[0] >= 0: return py_math.sqrt(args[0])
+                if full_name == 'math.exp': return py_math.exp(args[0])
                 if full_name == 'math.deg': return py_math.degrees(args[0])
                 if full_name == 'math.rad': return py_math.radians(args[0])
                 if full_name == 'math.fmod': return py_math.fmod(args[0], args[1])
@@ -262,7 +263,10 @@ class ASTAnalyzer:
                 if full_name == 'string.lower': return args[0].lower() if isinstance(args[0], (str, bytes)) else None
                 if full_name == 'string.char':
                     # Lua string.char returns bytes
-                    return bytes([int(a) for a in args]).decode('latin-1')
+                    try:
+                        return bytes([int(a) & 0xFF for a in args]).decode('latin-1')
+                    except (ValueError, OverflowError):
+                        return None
                 if full_name == 'string.byte':
                     s = args[0]
                     idx = int(args[1]) if len(args) > 1 else 1
@@ -1377,9 +1381,11 @@ class ASTAnalyzer:
         self._analyze_math_atan2()
         self._analyze_math_mod()
         self._analyze_math_log()
+        self._analyze_math_sqrt_identity()
         self._analyze_math_deg_rad()
         self._analyze_math_random_0_1()
         self._analyze_string_rep()
+        self._analyze_string_empty()
         self._analyze_uncached_globals()
         self._analyze_repeated_calls_in_scope()
         self._analyze_string_concat_in_loop()
@@ -1420,11 +1426,129 @@ class ASTAnalyzer:
         self._analyze_pairs_to_next()
         self._analyze_return_ternary()
         self._analyze_algebraic_simplification()
+        self._analyze_string_sub_negative_indices()
         self._analyze_string_starts_with()
         self._analyze_logical_identity()
+        self._analyze_logical_redundancy()
         self._analyze_nested_redundant_calls()
         self._analyze_table_literal_indices()
         self._analyze_bit_identity()
+        self._analyze_string_find_args()
+        self._analyze_math_sqrt_pow()
+        self._analyze_table_concat_single()
+
+    def _analyze_math_sqrt_pow(self):
+        """Find math.sqrt(x*x) or math.sqrt(x^2) and suggest math.abs(x)."""
+        for call in self.calls:
+            if call.full_name == 'math.sqrt' and len(call.args) == 1:
+                arg = call.args[0]
+                inner_val = None
+
+                # check x*x
+                if isinstance(arg, MultOp):
+                    s1 = node_to_string(arg.left)
+                    s2 = node_to_string(arg.right)
+                    if s1 == s2 and self._is_simple_expr(arg.left):
+                        inner_val = s1
+                # check x^2
+                elif isinstance(arg, ExpoOp):
+                    if isinstance(arg.right, Number) and arg.right.n == 2:
+                        inner_val = node_to_string(arg.left)
+                # check math.pow(x, 2)
+                elif isinstance(arg, Call):
+                    _, _, fn = self._get_call_name(arg)
+                    if fn == 'math.pow' and len(arg.args) == 2:
+                        if isinstance(arg.args[1], Number) and arg.args[1].n == 2:
+                            inner_val = node_to_string(arg.args[0])
+
+                if inner_val:
+                    replacement = f"math.abs({inner_val})"
+                    self.findings.append(Finding(
+                        pattern_name='math_identity',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.sqrt({inner_val}^2) -> math.abs({inner_val})',
+                        details={
+                            'node': call.node,
+                            'replacement': replacement
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                    continue
+
+    def _analyze_table_concat_single(self):
+        """Find table.concat(t, sep, i, i) and suggest tostring(t[i])."""
+        for call in self.calls:
+            # table.concat({a}) -> tostring(a)
+            if call.full_name == 'table.concat' and len(call.args) == 1:
+                arg = call.args[0]
+                if isinstance(arg, Table) and len(arg.fields) == 1:
+                    field = arg.fields[0]
+                    if not field.key:
+                        val_str = node_to_string(field.value)
+                        replacement = f"tostring({val_str})"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'table.concat({{{val_str}}}) -> tostring({val_str})',
+                            details={
+                                'node': call.node,
+                                'replacement': replacement
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
+
+            if call.full_name == 'table.concat' and len(call.args) >= 3:
+                i_node = call.args[2]
+                j_node = call.args[3] if len(call.args) >= 4 else None
+
+                is_same = False
+                if j_node:
+                    is_same = (node_to_string(i_node) == node_to_string(j_node))
+
+                if is_same:
+                    t_str = node_to_string(call.args[0])
+                    i_str = node_to_string(i_node)
+                    replacement = f"tostring({t_str}[{i_str}])"
+                    self.findings.append(Finding(
+                        pattern_name='algebraic_simplification',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'table.concat({t_str}, sep, {i_str}, {i_str}) -> tostring({t_str}[{i_str}])',
+                        details={
+                            'node': call.node,
+                            'replacement': replacement
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_string_find_args(self):
+        """Find redundant arguments in string.find(s, p, 1, false)."""
+        for call in self.calls:
+            if call.full_name == 'string.find' and len(call.args) >= 3:
+                s_str = node_to_string(call.args[0])
+                p_str = node_to_string(call.args[1])
+
+                start_pos = self._get_const_val(call.args[2])
+                plain = self._get_const_val(call.args[3]) if len(call.args) >= 4 else None
+
+                if start_pos == 1:
+                    if plain is False or plain is None:
+                        # string.find(s, p, 1) or string.find(s, p, 1, false) -> string.find(s, p)
+                        replacement = f"string.find({s_str}, {p_str})"
+                        self.findings.append(Finding(
+                            pattern_name='redundant_call_args',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f"Redundant arguments in string.find: {node_to_string(call.node)} -> {replacement}",
+                            details={
+                                'node': call.node,
+                                'replacement': replacement
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
 
     def _analyze_bit_identity(self):
         """Find redundant bitwise operations like bit.band(x, 0)."""
@@ -1439,19 +1563,42 @@ class ASTAnalyzer:
                 replacement = None
                 reason = None
 
+                s1 = node_to_string(arg1)
+                s2 = node_to_string(arg2)
+                is_same = (s1 == s2) and self._is_simple_expr(arg1)
+
+                is_ones1 = val1 in (-1, 0xFFFFFFFF, 4294967295)
+                is_ones2 = val2 in (-1, 0xFFFFFFFF, 4294967295)
+
+                # Check if one is bnot of another
+                def is_bnot_of(n1, n2):
+                    if isinstance(n1, Call):
+                        _, _, fn = self._get_call_name(n1)
+                        if fn == 'bit.bnot' and len(n1.args) == 1:
+                            return node_to_string(n1.args[0]) == node_to_string(n2)
+                    return False
+
+                is_complement = (is_bnot_of(arg1, arg2) or is_bnot_of(arg2, arg1))
+
                 if call.full_name == 'bit.band':
-                    if val2 == 0: replacement = "0"; reason = "bit.band(x, 0)"
-                    elif val1 == 0: replacement = "0"; reason = "bit.band(0, x)"
-                    elif val2 == 0xFFFFFFFF: target = arg1; reason = "bit.band(x, -1)"
-                    elif val1 == 0xFFFFFFFF: target = arg2; reason = "bit.band(-1, x)"
+                    if is_same: target = arg1; reason = "bit.band(x, x)"
+                    elif val2 == 0 or val1 == 0: replacement = "0"; reason = "bit.band(x, 0)"
+                    elif is_ones2: target = arg1; reason = "bit.band(x, -1)"
+                    elif is_ones1: target = arg2; reason = "bit.band(-1, x)"
+                    elif is_complement: replacement = "0"; reason = "bit.band(x, bit.bnot(x))"
                 elif call.full_name == 'bit.bor':
-                    if val2 == 0: target = arg1; reason = "bit.bor(x, 0)"
+                    if is_same: target = arg1; reason = "bit.bor(x, x)"
+                    elif val2 == 0: target = arg1; reason = "bit.bor(x, 0)"
                     elif val1 == 0: target = arg2; reason = "bit.bor(0, x)"
-                    elif val2 == 0xFFFFFFFF: replacement = "-1"; reason = "bit.bor(x, -1)"
-                    elif val1 == 0xFFFFFFFF: replacement = "-1"; reason = "bit.bor(-1, x)"
+                    elif is_ones2 or is_ones1: replacement = "-1"; reason = "bit.bor(x, -1)"
+                    elif is_complement: replacement = "-1"; reason = "bit.bor(x, bit.bnot(x))"
                 elif call.full_name == 'bit.bxor':
-                    if val2 == 0: target = arg1; reason = "bit.bxor(x, 0)"
+                    if is_same: replacement = "0"; reason = "bit.bxor(x, x)"
+                    elif val2 == 0: target = arg1; reason = "bit.bxor(x, 0)"
                     elif val1 == 0: target = arg2; reason = "bit.bxor(0, x)"
+                    elif is_ones2: replacement = f"bit.bnot({s1})"; reason = "bit.bxor(x, -1)"
+                    elif is_ones1: replacement = f"bit.bnot({s2})"; reason = "bit.bxor(-1, x)"
+                    elif is_complement: replacement = "-1"; reason = "bit.bxor(x, bit.bnot(x))"
                 elif call.full_name in ('bit.lshift', 'bit.rshift', 'bit.arshift'):
                     if val2 == 0: target = arg1; reason = f"{call.full_name}(x, 0)"
 
@@ -1460,7 +1607,7 @@ class ASTAnalyzer:
                         replacement = node_to_string(target)
 
                     self.findings.append(Finding(
-                        pattern_name='algebraic_simplification',
+                        pattern_name='bitwise_identity',
                         severity='GREEN',
                         line_num=call.line,
                         message=f'Bitwise identity simplification: {reason} -> {replacement}',
@@ -1470,6 +1617,48 @@ class ASTAnalyzer:
                         },
                         source_line=self._get_source_line(call.line),
                     ))
+
+        # Detect math.abs(x) >= 0 and similar
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp, EqToOp, NotEqToOp)):
+                call = None
+                const_val = None
+                op = type(node)
+
+                if isinstance(node.left, Call) and isinstance(node.right, Number):
+                    call = node.left
+                    const_val = node.right.n
+                elif isinstance(node.right, Call) and isinstance(node.left, Number):
+                    call = node.right
+                    const_val = node.left.n
+                    # Swap op for right-side calls
+                    if op == LessThanOp: op = GreaterThanOp
+                    elif op == GreaterThanOp: op = LessThanOp
+                    elif op == LessOrEqThanOp: op = GreaterOrEqThanOp
+                    elif op == GreaterOrEqThanOp: op = LessOrEqThanOp
+
+                if call:
+                    _, _, full_name = self._get_call_name(call)
+                    if full_name == 'math.abs' and const_val == 0:
+                        replacement = None
+                        if op == GreaterOrEqThanOp: replacement = "true"
+                        elif op == LessThanOp: replacement = "false"
+                        # math.abs(x) > 0 is x ~= 0
+                        # math.abs(x) <= 0 is x == 0
+
+                        if replacement:
+                            self.findings.append(Finding(
+                                pattern_name='logical_identity',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
+                                details={
+                                    'node': node,
+                                    'replacement': replacement
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
 
     def _analyze_table_literal_indices(self):
         """Find table literals with explicit numeric indices { [1] = a } -> { a }."""
@@ -1521,11 +1710,46 @@ class ASTAnalyzer:
             ('math.ceil', 'math.ceil'): 'redundant',
             ('tostring', 'tostring'): 'redundant',
             ('tonumber', 'tonumber'): 'redundant',
+            ('string.lower', 'string.lower'): 'redundant',
+            ('string.upper', 'string.upper'): 'redundant',
             ('math.deg', 'math.rad'): 'inverse',
             ('math.rad', 'math.deg'): 'inverse',
+            ('math.log', 'math.exp'): 'inverse',
+            ('math.exp', 'math.log'): 'inverse',
+            ('bit.bnot', 'bit.bnot'): 'inverse',
+            ('string.byte', 'string.char'): 'inverse',
         }
 
         for call in self.calls:
+            # Flatten nested math.max, math.min, and bitwise operations
+            if call.full_name in ('math.max', 'math.min', 'bit.band', 'bit.bor', 'bit.bxor') and len(call.args) >= 1:
+                new_args = []
+                changed = False
+                for arg in call.args:
+                    if isinstance(arg, Call):
+                        _, _, inner_name = self._get_call_name(arg)
+                        if inner_name == call.full_name:
+                            new_args.extend(arg.args)
+                            changed = True
+                            continue
+                    new_args.append(arg)
+
+                if changed:
+                    args_str = ", ".join(node_to_string(a) for a in new_args)
+                    replacement = f"{call.full_name}({args_str})"
+                    self.findings.append(Finding(
+                        pattern_name='nested_redundant_call',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'Flattened nested {call.full_name} call',
+                        details={
+                            'node': call.node,
+                            'replacement': replacement
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                    continue
+
             if len(call.args) != 1:
                 continue
 
@@ -1561,6 +1785,75 @@ class ASTAnalyzer:
                     },
                     source_line=self._get_source_line(call.line),
                 ))
+
+    def _analyze_logical_redundancy(self):
+        """Find redundant logical checks like x == nil or not x."""
+        if not self._ast_tree: return
+
+        for node in ast.walk(self._ast_tree):
+            # x == nil or not x -> not x
+            if isinstance(node, OrLoOp):
+                left = node.left
+                right = node.right
+
+                var_name = None
+                # x == nil
+                if isinstance(left, EqToOp):
+                    if isinstance(left.left, Name) and isinstance(left.right, Nil):
+                        var_name = left.left.id
+                    elif isinstance(left.right, Name) and isinstance(left.left, Nil):
+                        var_name = left.right.id
+
+                # not x
+                if var_name and isinstance(right, ULNotOp) and isinstance(right.operand, Name) and right.operand.id == var_name:
+                    self.findings.append(Finding(
+                        pattern_name='logical_identity',
+                        severity='GREEN',
+                        line_num=self._get_line(node),
+                        message=f'Redundant check: {var_name} == nil or not {var_name} -> not {var_name}',
+                        details={
+                            'node': node,
+                            'replacement': f'not {var_name}'
+                        },
+                        source_line=self._get_source_line(self._get_line(node)),
+                    ))
+                    continue
+
+            # x ~= nil and x -> x (in boolean context)
+            if isinstance(node, AndLoOp):
+                left = node.left
+                right = node.right
+
+                var_name = None
+                # x ~= nil
+                if isinstance(left, NotEqToOp):
+                    if isinstance(left.left, Name) and isinstance(left.right, Nil):
+                        var_name = left.left.id
+                    elif isinstance(left.right, Name) and isinstance(left.left, Nil):
+                        var_name = left.right.id
+
+                # and x
+                if var_name and isinstance(right, Name) and right.id == var_name:
+                    # check if it's in a boolean context
+                    is_bool_context = False
+                    parent = self.parent_map.get(id(node))
+                    if isinstance(parent, (If, While, Repeat)) and getattr(parent, 'test', None) == node:
+                        is_bool_context = True
+                    elif isinstance(parent, (AndLoOp, OrLoOp, ULNotOp)):
+                        is_bool_context = True
+
+                    if is_bool_context:
+                        self.findings.append(Finding(
+                            pattern_name='logical_identity',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Redundant check: {var_name} ~= nil and {var_name} -> {var_name}',
+                            details={
+                                'node': node,
+                                'replacement': var_name
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
 
     def _analyze_logical_identity(self):
         """Find redundant logical operations like x and true, x or false."""
@@ -1673,6 +1966,82 @@ class ASTAnalyzer:
                         source_line=self._get_source_line(self._get_line(node)),
                     ))
 
+    def _analyze_string_sub_negative_indices(self):
+        """Find string.sub(s, #s - n) and suggest string.sub(s, -(n+1))."""
+        for call in self.calls:
+            if call.full_name == 'string.sub' and len(call.args) >= 2:
+                s_node = call.args[0]
+                s_str = node_to_string(s_node)
+
+                # Check arg 2
+                arg2 = call.args[1]
+                if isinstance(arg2, ULengthOP) and node_to_string(arg2.operand) == s_str:
+                    # string.sub(s, #s) -> string.sub(s, -1)
+                    if len(call.args) == 2:
+                        self.findings.append(Finding(
+                            pattern_name='string_sub_negative_index',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.sub({s_str}, #{s_str}) -> string.sub({s_str}, -1)',
+                            details={
+                                'node': call.node,
+                                'replacement': f'string.sub({s_str}, -1)'
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                elif isinstance(arg2, SubOp):
+                    if isinstance(arg2.left, ULengthOP) and node_to_string(arg2.left.operand) == s_str:
+                        n = self._get_const_val(arg2.right)
+                        if isinstance(n, (int, float)):
+                            neg_idx = -int(n + 1)
+                            if len(call.args) == 2:
+                                self.findings.append(Finding(
+                                    pattern_name='string_sub_negative_index',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'string.sub({s_str}, #{s_str} - {int(n)}) -> string.sub({s_str}, {neg_idx})',
+                                    details={
+                                        'node': call.node,
+                                        'replacement': f'string.sub({s_str}, {neg_idx})'
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
+
+                # Check arg 3
+                if len(call.args) == 3:
+                    arg3 = call.args[2]
+                    if isinstance(arg3, ULengthOP) and node_to_string(arg3.operand) == s_str:
+                        # string.sub(s, i, #s) -> string.sub(s, i, -1)
+                        arg2_str = node_to_string(call.args[1])
+                        self.findings.append(Finding(
+                            pattern_name='string_sub_negative_index',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.sub({s_str}, {arg2_str}, #{s_str}) -> string.sub({s_str}, {arg2_str}, -1)',
+                            details={
+                                'node': call.node,
+                                'replacement': f'string.sub({s_str}, {arg2_str}, -1)'
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                    elif isinstance(arg3, SubOp):
+                        if isinstance(arg3.left, ULengthOP) and node_to_string(arg3.left.operand) == s_str:
+                            n = self._get_const_val(arg3.right)
+                            if isinstance(n, (int, float)):
+                                neg_idx = -int(n + 1)
+                                arg2_str = node_to_string(call.args[1])
+                                self.findings.append(Finding(
+                                    pattern_name='string_sub_negative_index',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'string.sub({s_str}, {arg2_str}, #{s_str} - {int(n)}) -> string.sub({s_str}, {arg2_str}, {neg_idx})',
+                                    details={
+                                        'node': call.node,
+                                        'replacement': f'string.sub({s_str}, {arg2_str}, {neg_idx})'
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
+
     def _analyze_string_starts_with(self):
         """Find string.find(s, prefix) == 1 and suggest string.sub(s, 1, #prefix) == prefix."""
         lua_regex_chars = set(b'^$()%.[]*+-?')
@@ -1744,14 +2113,117 @@ class ASTAnalyzer:
                     elif left_val == 0: target = node.right; reason = "0 + x"
                 elif isinstance(node, SubOp):
                     if right_val == 0: target = node.left; reason = "x - 0"
+                    else:
+                        s1 = node_to_string(node.left)
+                        s2 = node_to_string(node.right)
+                        if s1 == s2 and self._is_simple_expr(node.left) and self._infer_type(node.left) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: {s1} - {s1} -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
                 elif isinstance(node, Concat):
                     if right_val == "": target = node.left; reason = 's .. ""'
                     elif left_val == "": target = node.right; reason = '"" .. s'
                 elif isinstance(node, MultOp):
                     if right_val == 1: target = node.left; reason = "x * 1"
                     elif left_val == 1: target = node.right; reason = "1 * x"
+                    elif isinstance(node.left, Call) and isinstance(node.right, Call):
+                        _, _, f1 = self._get_call_name(node.left)
+                        _, _, f2 = self._get_call_name(node.right)
+                        if f1 == 'math.abs' and f2 == 'math.abs' and len(node.left.args) == 1 and len(node.right.args) == 1:
+                            s1 = node_to_string(node.left.args[0])
+                            s2 = node_to_string(node.right.args[0])
+                            if s1 == s2 and self._is_simple_expr(node.left.args[0]):
+                                replacement = f"{s1} * {s1}"
+                                self.findings.append(Finding(
+                                    pattern_name='algebraic_simplification',
+                                    severity='GREEN',
+                                    line_num=self._get_line(node),
+                                    message=f'Algebraic simplification: math.abs({s1}) * math.abs({s1}) -> {replacement}',
+                                    details={
+                                        'target_node': None,
+                                        'node': node,
+                                        'replacement': replacement
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+                                continue
+                    elif right_val == 0:
+                        if self._infer_type(node.left) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: x * 0 -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
+                    elif left_val == 0:
+                        if self._infer_type(node.right) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: 0 * x -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
                 elif isinstance(node, FloatDivOp):
                     if right_val == 1: target = node.left; reason = "x / 1"
+                    else:
+                        s1 = node_to_string(node.left)
+                        s2 = node_to_string(node.right)
+                        if s1 == s2 and self._is_simple_expr(node.left) and self._infer_type(node.left) == 'number':
+                            # Check if value is not zero to avoid 0/0
+                            val = self._get_const_val(node.left)
+                            if val != 0:
+                                self.findings.append(Finding(
+                                    pattern_name='algebraic_simplification',
+                                    severity='GREEN',
+                                    line_num=self._get_line(node),
+                                    message=f'Algebraic simplification: {s1} / {s1} -> 1',
+                                    details={
+                                        'target_node': None,
+                                        'node': node,
+                                        'replacement': '1'
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+                                continue
+                    if left_val == 0:
+                        if self._infer_type(node.right) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: 0 / x -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
                 elif isinstance(node, ExpoOp):
                     if right_val == 1: target = node.left; reason = "x ^ 1"
                     elif right_val == 0:
@@ -1793,6 +2265,57 @@ class ASTAnalyzer:
                                 'replacement': target_str
                             },
                             source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+        # Check for table.concat(t, "") -> table.concat(t)
+        for call in self.calls:
+            if call.full_name == 'table.concat' and len(call.args) == 2:
+                sep = self._get_const_val(call.args[1])
+                if sep == "":
+                    self.findings.append(Finding(
+                        pattern_name='table_concat_default_sep',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message='table.concat(t, "") -> table.concat(t)',
+                        details={
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+            # string.sub(s, 1, -1) -> s
+            elif call.full_name == 'string.sub' and len(call.args) == 3:
+                s_node = call.args[0]
+                arg1 = self._get_const_val(call.args[1])
+                arg2_val = self._get_const_val(call.args[2])
+                arg2_node = call.args[2]
+
+                is_identity = False
+                if arg1 == 1:
+                    if arg2_val == -1:
+                        is_identity = True
+                    else:
+                        s_str = node_to_string(s_node)
+                        if isinstance(arg2_node, ULengthOP) and node_to_string(arg2_node.operand) == s_str:
+                            is_identity = True
+                        elif isinstance(arg2_node, Call):
+                            _, _, l_name = self._get_call_name(arg2_node)
+                            if l_name == 'string.len' and len(arg2_node.args) == 1 and node_to_string(arg2_node.args[0]) == s_str:
+                                is_identity = True
+
+                if is_identity:
+                    if self._infer_type(s_node) == 'string':
+                        s_str = node_to_string(s_node)
+                        self.findings.append(Finding(
+                            pattern_name='string_sub_identity',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'String identity: {node_to_string(call.node)} -> {s_str}',
+                            details={
+                                'node': call.node,
+                                'replacement': s_str
+                            },
+                            source_line=self._get_source_line(call.line),
                         ))
 
     def _analyze_redundant_tonumber_tostring(self):
@@ -2123,7 +2646,7 @@ class ASTAnalyzer:
                 # Identity: math.min(x, x) -> x
                 if s1 == s2:
                     self.findings.append(Finding(
-                        pattern_name='algebraic_simplification',
+                        pattern_name='math_identity',
                         severity='GREEN',
                         line_num=call.line,
                         message=f'Math identity: {call.full_name}({s1}, {s1}) -> {s1}',
@@ -2150,7 +2673,7 @@ class ASTAnalyzer:
                 if target:
                     res_str = node_to_string(target)
                     self.findings.append(Finding(
-                        pattern_name='algebraic_simplification',
+                        pattern_name='math_identity',
                         severity='GREEN',
                         line_num=call.line,
                         message=f'Math identity with infinity: {call.full_name}(...) -> {res_str}',
@@ -2216,7 +2739,7 @@ class ASTAnalyzer:
                     if self._infer_type(arg1) == 'string':
                         s_str = node_to_string(arg1)
                         self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
+                            pattern_name='string_identity',
                             severity='GREEN',
                             line_num=call.line,
                             message=f'String identity: string.sub({s_str}, 1) -> {s_str}',
@@ -2358,6 +2881,28 @@ class ASTAnalyzer:
     def _analyze_constant_folding(self):
         """Find arithmetic and string operations on constant values that can be folded."""
         if not self._ast_tree: return
+
+        # bit.bnot identities
+        for call in self.calls:
+            if call.full_name == 'bit.bnot' and len(call.args) == 1:
+                val = self._get_const_val(call.args[0])
+                if val is not None:
+                    try:
+                        res = self._get_const_val(call.node)
+                        if res is not None:
+                            self.findings.append(Finding(
+                                pattern_name='bitwise_identity',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Bitwise constant folding: bit.bnot({val}) -> {res}',
+                                details={
+                                    'node': call.node,
+                                    'replacement': str(res)
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
+                    except: pass
 
         for node in ast.walk(self._ast_tree):
             # Skip terminal nodes
@@ -2564,15 +3109,19 @@ class ASTAnalyzer:
                             val1 = stmt1.values[0]
                             val2 = stmt2.values[0]
 
-                            if isinstance(val1, TrueExpr) and isinstance(val2, FalseExpr):
+                            if (isinstance(val1, TrueExpr) and isinstance(val2, FalseExpr)) or \
+                               (isinstance(val1, FalseExpr) and isinstance(val2, TrueExpr)):
                                 cond_str = node_to_string(node.test)
+                                inverted = isinstance(val1, FalseExpr)
+                                msg = f'if {cond_str} then return {"false" if inverted else "true"} else return {"true" if inverted else "false"} end -> return {"not " if inverted else ""}{cond_str}'
                                 self.findings.append(Finding(
                                     pattern_name='redundant_return_bool',
                                     severity='YELLOW',
                                     line_num=self._get_line(node),
-                                    message=f'if {cond_str} then return true else return false end -> return {cond_str}',
+                                    message=msg,
                                     details={
                                         'cond_str': cond_str,
+                                        'inverted': inverted,
                                         'node': node,
                                     },
                                     source_line=self._get_source_line(self._get_line(node)),
@@ -2810,6 +3359,26 @@ class ASTAnalyzer:
         for call in self.calls:
             if call.full_name == 'math.random' and len(call.args) == 2:
                 arg1 = call.args[0]
+                arg2 = call.args[1]
+
+                s1 = node_to_string(arg1)
+                s2 = node_to_string(arg2)
+
+                if s1 == s2 and self._is_simple_expr(arg1):
+                    # math.random(n, n) -> n
+                    self.findings.append(Finding(
+                        pattern_name='math_identity',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.random({s1}, {s1}) -> {s1}',
+                        details={
+                            'node': call.node,
+                            'replacement': s1
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                    continue
+
                 if isinstance(arg1, Number) and arg1.n == 1:
                     n_str = node_to_string(call.args[1])
                     self.findings.append(Finding(
@@ -2929,6 +3498,69 @@ class ASTAnalyzer:
                         source_line=self._get_source_line(call.line),
                     ))
 
+    def _analyze_string_empty(self):
+        """Find #s == 0 or string.len(s) == 0 and suggest s == ''."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                call = None
+                val = None
+
+                if isinstance(node.left, (ULengthOP, Call)) and isinstance(node.right, Number):
+                    call = node.left
+                    val = node.right.n
+                elif isinstance(node.right, (ULengthOP, Call)) and isinstance(node.left, Number):
+                    call = node.right
+                    val = node.left.n
+
+                if val == 0:
+                    s_str = None
+                    if isinstance(call, ULengthOP):
+                        s_str = node_to_string(call.operand)
+                    elif isinstance(call, Call):
+                        _, _, fn = self._get_call_name(call)
+                        if fn == 'string.len' and len(call.args) == 1:
+                            s_str = node_to_string(call.args[0])
+
+                    if s_str:
+                        op = '==' if isinstance(node, EqToOp) else '~='
+                        replacement = f"{s_str} {op} ''"
+                        self.findings.append(Finding(
+                            pattern_name='string_empty_check',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f"Check for empty string: {node_to_string(node)} -> {replacement}",
+                            details={
+                                'node': node,
+                                'replacement': replacement
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_math_sqrt_identity(self):
+        """Find math.sqrt(x) * math.sqrt(x) and suggest x."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, MultOp):
+                if isinstance(node.left, Call) and isinstance(node.right, Call):
+                    _, _, f1 = self._get_call_name(node.left)
+                    _, _, f2 = self._get_call_name(node.right)
+                    if f1 == 'math.sqrt' and f2 == 'math.sqrt' and len(node.left.args) == 1 and len(node.right.args) == 1:
+                        s1 = node_to_string(node.left.args[0])
+                        s2 = node_to_string(node.right.args[0])
+                        if s1 == s2 and self._is_simple_expr(node.left.args[0]):
+                            # math.sqrt(x) * math.sqrt(x) -> x
+                            # Note: only safe if x >= 0, but if x < 0 it was NaN anyway.
+                            self.findings.append(Finding(
+                                pattern_name='math_identity',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'math.sqrt({s1}) * math.sqrt({s1}) -> {s1}',
+                                details={
+                                    'node': node,
+                                    'replacement': s1
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
     def _analyze_math_deg_rad(self):
         """Find math.deg(x) or math.rad(x) and suggest multiplication by constant."""
         import math as py_math
@@ -2987,10 +3619,35 @@ class ASTAnalyzer:
 
     def _analyze_math_log(self):
         """Find math.log(x, base) and suggest math.log(x) if base is e."""
+        # Also handle math.log(x) / math.log(10)
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, FloatDivOp):
+                if isinstance(node.left, Call) and isinstance(node.right, Call):
+                    _, _, f1 = self._get_call_name(node.left)
+                    _, _, f2 = self._get_call_name(node.right)
+                    if f1 == 'math.log' and f2 == 'math.log' and len(node.left.args) == 1 and len(node.right.args) == 1:
+                        base_val = self._get_const_val(node.right.args[0])
+                        if base_val == 10:
+                            x_str = node_to_string(node.left.args[0])
+                            replacement = f"math.log10({x_str})"
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'math.log(x) / math.log(10) -> math.log10(x)',
+                                details={
+                                    'node': node,
+                                    'replacement': replacement
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
+
         for call in self.calls:
             if call.full_name == 'math.log' and len(call.args) == 2:
                 base_node = call.args[1]
                 is_e = False
+                is_10 = False
 
                 # check for math.exp(1)
                 if isinstance(base_node, Call):
@@ -3002,8 +3659,10 @@ class ASTAnalyzer:
 
                 # check for numeric value of e (approx)
                 elif isinstance(base_node, Number):
-                    if 2.71828 <= base_node.n <= 2.71829:
+                    if 2.71828 <= base_node.n <= 2.718282:
                         is_e = True
+                    elif base_node.n == 10:
+                        is_10 = True
 
                 if is_e:
                     x_str = node_to_string(call.args[0])
@@ -3012,6 +3671,19 @@ class ASTAnalyzer:
                         severity='GREEN',
                         line_num=call.line,
                         message=f'math.log({x_str}, e) -> math.log({x_str})',
+                        details={
+                            'x_str': x_str,
+                            'node': call.node,
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                elif is_10:
+                    x_str = node_to_string(call.args[0])
+                    self.findings.append(Finding(
+                        pattern_name='math_log_base_10',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'math.log({x_str}, 10) -> math.log10({x_str})',
                         details={
                             'x_str': x_str,
                             'node': call.node,
@@ -3068,7 +3740,8 @@ class ASTAnalyzer:
         """Find math.pow that can be simplified."""
         for call in self.calls:
             if call.full_name == 'math.pow' and len(call.args) == 2:
-                base = node_to_string(call.args[0])
+                base_node = call.args[0]
+                base = node_to_string(base_node)
                 exp_node = call.args[1]
                 exp = self._get_const_val(exp_node)
 
@@ -3090,6 +3763,7 @@ class ASTAnalyzer:
                             },
                             source_line=self._get_source_line(call.line),
                         ))
+                        continue
                     elif exp == 0:
                         self.findings.append(Finding(
                             pattern_name='math_pow_simple',
@@ -3104,6 +3778,7 @@ class ASTAnalyzer:
                             },
                             source_line=self._get_source_line(call.line),
                         ))
+                        continue
                     elif exp == 0.5:
                         self.findings.append(Finding(
                             pattern_name='math_pow_simple',
@@ -3120,26 +3795,9 @@ class ASTAnalyzer:
                             },
                             source_line=self._get_source_line(call.line),
                         ))
-                    elif exp < 0:
-                        if exp == -1: type_val = 'power_neg'
-                        elif exp == -2: type_val = 'power_neg'
-                        elif exp == -0.5: type_val = 'power_neg'
-                        else: continue
-
-                        self.findings.append(Finding(
-                            pattern_name='math_pow_simple',
-                            severity='GREEN',
-                            line_num=call.line,
-                            message=f'{full_match} -> negative power simplification',
-                            details={
-                                'base': base,
-                                'exponent': exp,
-                                'type': type_val,
-                                'node': call.node,
-                            },
-                            source_line=self._get_source_line(call.line),
-                        ))
-                    elif exp in (2, 3, 4) and self._is_simple_expr(call.args[0]):
+                        continue
+                    elif exp in (2, 3) and self._is_simple_expr(base_node):
+                        # Suggest multiplication
                         replacement = '*'.join([base] * int(exp))
                         self.findings.append(Finding(
                             pattern_name='math_pow_simple',
@@ -3148,14 +3806,42 @@ class ASTAnalyzer:
                             message=f'{full_match} -> {replacement}',
                             details={
                                 'base': base,
-                                'exponent': int(exp),
+                                'exponent': exp,
                                 'type': 'power',
-                                'is_simple': True,
-                                'full_match': full_match,
                                 'node': call.node,
                             },
                             source_line=self._get_source_line(call.line),
                         ))
+                        continue
+                    elif exp in (-1, -2, -0.5):
+                        self.findings.append(Finding(
+                            pattern_name='math_pow_simple',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'{full_match} -> negative power simplification',
+                            details={
+                                'base': base,
+                                'exponent': exp,
+                                'type': 'power_neg',
+                                'node': call.node,
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
+
+                # Fallback to base ^ exp for general cases
+                self.findings.append(Finding(
+                    pattern_name='math_pow_to_expo',
+                    severity='GREEN',
+                    line_num=call.line,
+                    message=f'math.pow({base}, ...) -> {base} ^ ...',
+                    details={
+                        'base': base,
+                        'exp_str': node_to_string(exp_node),
+                        'node': call.node,
+                    },
+                    source_line=self._get_source_line(call.line),
+                ))
 
     def _is_simple_expr(self, node: Node) -> bool:
         """Check if node is a simple expression (safe to repeat)."""
