@@ -227,7 +227,7 @@ class ASTTransformer:
             self._edit_math_random_0_1(finding)
         elif pattern == 'string_rep_simple':
             self._edit_string_rep_simple(finding)
-        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity'):
+        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index'):
             self._edit_algebraic_simplification(finding)
         elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
             self._edit_string_starts_with(finding)
@@ -368,11 +368,18 @@ class ASTTransformer:
         if start is None:
             return
 
+        # Compound identities (like math.sqrt(x*x)) should have higher priority than
+        # simple ones (like math.pow(x, 2)) to avoid partial transformations blocking
+        # the better ones.
+        priority = 10
+        if finding.pattern_name in ('math_identity', 'string_sub_negative_index'):
+            priority = 20
+
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=priority
         ))
 
     def _edit_math_random_0_1(self, finding: Finding):
@@ -1181,7 +1188,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10,
+            priority=10 if finding.pattern_name == 'math_pow_to_expo' else 5,
         ))
 
     def _edit_distance_to_comparison(self, finding: Finding):

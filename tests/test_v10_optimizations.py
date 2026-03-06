@@ -204,5 +204,82 @@ local c = bit.bxor(z, bit.bnot(z))
         self.assertIn("local b = -1", new_content)
         self.assertIn("local c = -1", new_content)
 
+    def test_bit_bnot_folding(self):
+        script = """
+local a = bit.bnot(-1)
+local b = bit.bnot(0)
+"""
+        new_content = self.transform(script)
+        self.assertIn("local a = 0", new_content)
+        self.assertIn("local b = -1", new_content)
+
+    def test_string_sub_negative_indices(self):
+        script = """
+local a = string.sub(s, #s)
+local b = string.sub(s, #s - 1)
+local c = string.sub(s, #s - 5)
+"""
+        new_content = self.transform(script)
+        self.assertIn("local a = string.sub(s, -1)", new_content)
+        self.assertIn("local b = string.sub(s, -2)", new_content)
+        self.assertIn("local c = string.sub(s, -6)", new_content)
+
+    def test_math_sqrt_pow(self):
+        script = """
+local a = math.sqrt(x * x)
+local b = math.sqrt(y ^ 2)
+local c = math.sqrt(math.pow(z, 2))
+"""
+        new_content = self.transform(script)
+        self.assertIn("local a = math.abs(x)", new_content)
+        self.assertIn("local b = math.abs(y)", new_content)
+        self.assertIn("local c = math.abs(z)", new_content)
+
+    def test_table_concat_single(self):
+        script = 'local a = table.concat(t, ",", i, i)'
+        new_content = self.transform(script)
+        self.assertIn("local a = tostring(t[i])", new_content)
+
+    def test_algebraic_more_identities(self):
+        script = """
+local x = 10
+local s = "hi"
+local a = x + 0
+local b = 0 + x
+local c = x * 1
+local d = 1 * x
+local e = x ^ 1
+local f = s .. ""
+local g = "" .. s
+"""
+        new_content = self.transform(script)
+        self.assertIn("local a = x", new_content)
+        self.assertIn("local b = x", new_content)
+        self.assertIn("local c = x", new_content)
+        self.assertIn("local d = x", new_content)
+        self.assertIn("local e = x", new_content)
+        self.assertIn("local f = s", new_content)
+        self.assertIn("local g = s", new_content)
+
+    def test_x_div_x(self):
+        script = "local x = 5; local a = x / x"
+        new_content = self.transform(script)
+        self.assertIn("local a = 1", new_content)
+
+    def test_x_pow_zero(self):
+        script = "local x = 5; local a = x ^ 0"
+        new_content = self.transform(script)
+        self.assertIn("local a = 1", new_content)
+
+    def test_table_concat_single_literal(self):
+        script = "local a = table.concat({x})"
+        new_content = self.transform(script)
+        self.assertIn("local a = tostring(x)", new_content)
+
+    def test_math_random_same(self):
+        script = "local a = math.random(x, x)"
+        new_content = self.transform(script)
+        self.assertIn("local a = x", new_content)
+
 if __name__ == "__main__":
     unittest.main()
