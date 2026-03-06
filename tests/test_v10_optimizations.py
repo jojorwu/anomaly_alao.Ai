@@ -95,5 +95,114 @@ local b = string.upper(string.upper(s))
         expected = "local a = math.log10(x)"
         self.assertEqual(self.transform(script), expected)
 
+    def test_bit_bnot_bnot(self):
+        script = "local a = bit.bnot(bit.bnot(x))"
+        new_content = self.transform(script)
+        self.assertIn("local a = x", new_content)
+
+    def test_math_exp_log(self):
+        script = "local a = math.exp(math.log(x))"
+        new_content = self.transform(script)
+        self.assertIn("local a = x", new_content)
+
+    def test_nested_math_flatten(self):
+        script = "local a = math.max(math.max(x, y), z)"
+        new_content = self.transform(script)
+        self.assertIn("local a = math.max(x, y, z)", new_content)
+
+    def test_redundant_string_find_args(self):
+        script = "local a = string.find(s, p, 1)"
+        new_content = self.transform(script)
+        self.assertIn("local a = string.find(s, p)", new_content)
+
+        script = "local a = string.find(s, p, 1, false)"
+        new_content = self.transform(script)
+        self.assertIn("local a = string.find(s, p)", new_content)
+
+    def test_sub_self(self):
+        script = "local x = 10; local a = x - x"
+        new_content = self.transform(script)
+        self.assertIn("local a = 0", new_content)
+
+    def test_string_sub_len(self):
+        script = 'local s = "hello"; local a = string.sub(s, 1, #s)'
+        new_content = self.transform(script)
+        self.assertIn("local a = s", new_content)
+
+    def test_string_byte_char(self):
+        script = "local a = string.byte(string.char(x))"
+        new_content = self.transform(script)
+        self.assertIn("local a = x", new_content)
+
+    def test_bit_bxor_neg1(self):
+        script = "local a = bit.bxor(x, -1)"
+        new_content = self.transform(script)
+        self.assertIn("local a = bit.bnot(x)", new_content)
+
+    def test_mult_zero(self):
+        script = "local a = x * 0"
+        # We need type inference for x to be number, which is hard in small scripts
+        # Let's use a script that provides type hints
+        script = "local x = 5; local a = x * 0"
+        new_content = self.transform(script)
+        self.assertIn("local a = 0", new_content)
+
+    def test_div_zero_numerator(self):
+        script = "local x = 5; local a = 0 / x"
+        new_content = self.transform(script)
+        self.assertIn("local a = 0", new_content)
+
+    def test_mult_zero_unsafe(self):
+        # table * 0 should NOT be optimized
+        script = "local x = {}; local a = x * 0"
+        new_content = self.transform(script)
+        self.assertIn("local a = x * 0", new_content)
+
+    def test_math_pow_square(self):
+        script = "local x = 5; local a = math.pow(x, 2)"
+        new_content = self.transform(script)
+        self.assertIn("local a = x*x", new_content)
+
+    def test_math_pow_cube(self):
+        script = "local x = 5; local a = math.pow(x, 3)"
+        new_content = self.transform(script)
+        self.assertIn("local a = x*x*x", new_content)
+
+    def test_math_pow_sqrt(self):
+        script = "local a = math.pow(x, 0.5)"
+        new_content = self.transform(script)
+        self.assertIn("local a = math.sqrt(x)", new_content)
+
+    def test_math_pow_neg1(self):
+        script = "local a = math.pow(x, -1)"
+        new_content = self.transform(script)
+        self.assertIn("local a = 1/x", new_content)
+
+    def test_string_sub_len_call(self):
+        script = 'local s = "hello"; local a = string.sub(s, 1, string.len(s))'
+        new_content = self.transform(script)
+        self.assertIn("local a = s", new_content)
+
+    def test_abs_mult_self(self):
+        script = "local x = 5; local a = math.abs(x) * math.abs(x)"
+        new_content = self.transform(script)
+        self.assertIn("local a = x * x", new_content)
+
+    def test_nested_flatten_bitwise(self):
+        script = "local a = bit.band(bit.band(x, y), z)"
+        new_content = self.transform(script)
+        self.assertIn("local a = bit.band(x, y, z)", new_content)
+
+    def test_bit_complements(self):
+        script = """
+local a = bit.band(x, bit.bnot(x))
+local b = bit.bor(y, bit.bnot(y))
+local c = bit.bxor(z, bit.bnot(z))
+"""
+        new_content = self.transform(script)
+        self.assertIn("local a = 0", new_content)
+        self.assertIn("local b = -1", new_content)
+        self.assertIn("local c = -1", new_content)
+
 if __name__ == "__main__":
     unittest.main()

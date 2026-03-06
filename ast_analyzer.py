@@ -1425,6 +1425,33 @@ class ASTAnalyzer:
         self._analyze_nested_redundant_calls()
         self._analyze_table_literal_indices()
         self._analyze_bit_identity()
+        self._analyze_string_find_args()
+
+    def _analyze_string_find_args(self):
+        """Find redundant arguments in string.find(s, p, 1, false)."""
+        for call in self.calls:
+            if call.full_name == 'string.find' and len(call.args) >= 3:
+                s_str = node_to_string(call.args[0])
+                p_str = node_to_string(call.args[1])
+
+                start_pos = self._get_const_val(call.args[2])
+                plain = self._get_const_val(call.args[3]) if len(call.args) >= 4 else None
+
+                if start_pos == 1:
+                    if plain is False or plain is None:
+                        # string.find(s, p, 1) or string.find(s, p, 1, false) -> string.find(s, p)
+                        replacement = f"string.find({s_str}, {p_str})"
+                        self.findings.append(Finding(
+                            pattern_name='redundant_call_args',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f"Redundant arguments in string.find: {node_to_string(call.node)} -> {replacement}",
+                            details={
+                                'node': call.node,
+                                'replacement': replacement
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
 
     def _analyze_bit_identity(self):
         """Find redundant bitwise operations like bit.band(x, 0)."""
@@ -1443,22 +1470,38 @@ class ASTAnalyzer:
                 s2 = node_to_string(arg2)
                 is_same = (s1 == s2) and self._is_simple_expr(arg1)
 
+                is_ones1 = val1 in (-1, 0xFFFFFFFF, 4294967295)
+                is_ones2 = val2 in (-1, 0xFFFFFFFF, 4294967295)
+
+                # Check if one is bnot of another
+                def is_bnot_of(n1, n2):
+                    if isinstance(n1, Call):
+                        _, _, fn = self._get_call_name(n1)
+                        if fn == 'bit.bnot' and len(n1.args) == 1:
+                            return node_to_string(n1.args[0]) == node_to_string(n2)
+                    return False
+
+                is_complement = (is_bnot_of(arg1, arg2) or is_bnot_of(arg2, arg1))
+
                 if call.full_name == 'bit.band':
                     if is_same: target = arg1; reason = "bit.band(x, x)"
-                    elif val2 == 0: replacement = "0"; reason = "bit.band(x, 0)"
-                    elif val1 == 0: replacement = "0"; reason = "bit.band(0, x)"
-                    elif val2 == 0xFFFFFFFF: target = arg1; reason = "bit.band(x, -1)"
-                    elif val1 == 0xFFFFFFFF: target = arg2; reason = "bit.band(-1, x)"
+                    elif val2 == 0 or val1 == 0: replacement = "0"; reason = "bit.band(x, 0)"
+                    elif is_ones2: target = arg1; reason = "bit.band(x, -1)"
+                    elif is_ones1: target = arg2; reason = "bit.band(-1, x)"
+                    elif is_complement: replacement = "0"; reason = "bit.band(x, bit.bnot(x))"
                 elif call.full_name == 'bit.bor':
                     if is_same: target = arg1; reason = "bit.bor(x, x)"
                     elif val2 == 0: target = arg1; reason = "bit.bor(x, 0)"
                     elif val1 == 0: target = arg2; reason = "bit.bor(0, x)"
-                    elif val2 == 0xFFFFFFFF: replacement = "-1"; reason = "bit.bor(x, -1)"
-                    elif val1 == 0xFFFFFFFF: replacement = "-1"; reason = "bit.bor(-1, x)"
+                    elif is_ones2 or is_ones1: replacement = "-1"; reason = "bit.bor(x, -1)"
+                    elif is_complement: replacement = "-1"; reason = "bit.bor(x, bit.bnot(x))"
                 elif call.full_name == 'bit.bxor':
                     if is_same: replacement = "0"; reason = "bit.bxor(x, x)"
                     elif val2 == 0: target = arg1; reason = "bit.bxor(x, 0)"
                     elif val1 == 0: target = arg2; reason = "bit.bxor(0, x)"
+                    elif is_ones2: replacement = f"bit.bnot({s1})"; reason = "bit.bxor(x, -1)"
+                    elif is_ones1: replacement = f"bit.bnot({s2})"; reason = "bit.bxor(-1, x)"
+                    elif is_complement: replacement = "-1"; reason = "bit.bxor(x, bit.bnot(x))"
                 elif call.full_name in ('bit.lshift', 'bit.rshift', 'bit.arshift'):
                     if val2 == 0: target = arg1; reason = f"{call.full_name}(x, 0)"
 
@@ -1533,9 +1576,41 @@ class ASTAnalyzer:
             ('math.deg', 'math.rad'): 'inverse',
             ('math.rad', 'math.deg'): 'inverse',
             ('math.log', 'math.exp'): 'inverse',
+            ('math.exp', 'math.log'): 'inverse',
+            ('bit.bnot', 'bit.bnot'): 'inverse',
+            ('string.byte', 'string.char'): 'inverse',
         }
 
         for call in self.calls:
+            # Flatten nested math.max, math.min, and bitwise operations
+            if call.full_name in ('math.max', 'math.min', 'bit.band', 'bit.bor', 'bit.bxor') and len(call.args) >= 1:
+                new_args = []
+                changed = False
+                for arg in call.args:
+                    if isinstance(arg, Call):
+                        _, _, inner_name = self._get_call_name(arg)
+                        if inner_name == call.full_name:
+                            new_args.extend(arg.args)
+                            changed = True
+                            continue
+                    new_args.append(arg)
+
+                if changed:
+                    args_str = ", ".join(node_to_string(a) for a in new_args)
+                    replacement = f"{call.full_name}({args_str})"
+                    self.findings.append(Finding(
+                        pattern_name='nested_redundant_call',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'Flattened nested {call.full_name} call',
+                        details={
+                            'node': call.node,
+                            'replacement': replacement
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+                    continue
+
             if len(call.args) != 1:
                 continue
 
@@ -1754,14 +1829,97 @@ class ASTAnalyzer:
                     elif left_val == 0: target = node.right; reason = "0 + x"
                 elif isinstance(node, SubOp):
                     if right_val == 0: target = node.left; reason = "x - 0"
+                    else:
+                        s1 = node_to_string(node.left)
+                        s2 = node_to_string(node.right)
+                        if s1 == s2 and self._is_simple_expr(node.left) and self._infer_type(node.left) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: {s1} - {s1} -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
                 elif isinstance(node, Concat):
                     if right_val == "": target = node.left; reason = 's .. ""'
                     elif left_val == "": target = node.right; reason = '"" .. s'
                 elif isinstance(node, MultOp):
                     if right_val == 1: target = node.left; reason = "x * 1"
                     elif left_val == 1: target = node.right; reason = "1 * x"
+                    elif isinstance(node.left, Call) and isinstance(node.right, Call):
+                        _, _, f1 = self._get_call_name(node.left)
+                        _, _, f2 = self._get_call_name(node.right)
+                        if f1 == 'math.abs' and f2 == 'math.abs' and len(node.left.args) == 1 and len(node.right.args) == 1:
+                            s1 = node_to_string(node.left.args[0])
+                            s2 = node_to_string(node.right.args[0])
+                            if s1 == s2 and self._is_simple_expr(node.left.args[0]):
+                                replacement = f"{s1} * {s1}"
+                                self.findings.append(Finding(
+                                    pattern_name='algebraic_simplification',
+                                    severity='GREEN',
+                                    line_num=self._get_line(node),
+                                    message=f'Algebraic simplification: math.abs({s1}) * math.abs({s1}) -> {replacement}',
+                                    details={
+                                        'target_node': None,
+                                        'node': node,
+                                        'replacement': replacement
+                                    },
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+                                continue
+                    elif right_val == 0:
+                        if self._infer_type(node.left) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: x * 0 -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
+                    elif left_val == 0:
+                        if self._infer_type(node.right) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: 0 * x -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
                 elif isinstance(node, FloatDivOp):
                     if right_val == 1: target = node.left; reason = "x / 1"
+                    elif left_val == 0:
+                        if self._infer_type(node.right) == 'number':
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Algebraic simplification: 0 / x -> 0',
+                                details={
+                                    'target_node': None,
+                                    'node': node,
+                                    'replacement': '0'
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
                 elif isinstance(node, ExpoOp):
                     if right_val == 1: target = node.left; reason = "x ^ 1"
                     elif right_val == 0:
@@ -1825,15 +1983,30 @@ class ASTAnalyzer:
             elif call.full_name == 'string.sub' and len(call.args) == 3:
                 s_node = call.args[0]
                 arg1 = self._get_const_val(call.args[1])
-                arg2 = self._get_const_val(call.args[2])
-                if arg1 == 1 and arg2 == -1:
+                arg2_val = self._get_const_val(call.args[2])
+                arg2_node = call.args[2]
+
+                is_identity = False
+                if arg1 == 1:
+                    if arg2_val == -1:
+                        is_identity = True
+                    else:
+                        s_str = node_to_string(s_node)
+                        if isinstance(arg2_node, ULengthOP) and node_to_string(arg2_node.operand) == s_str:
+                            is_identity = True
+                        elif isinstance(arg2_node, Call):
+                            _, _, l_name = self._get_call_name(arg2_node)
+                            if l_name == 'string.len' and len(arg2_node.args) == 1 and node_to_string(arg2_node.args[0]) == s_str:
+                                is_identity = True
+
+                if is_identity:
                     if self._infer_type(s_node) == 'string':
                         s_str = node_to_string(s_node)
                         self.findings.append(Finding(
                             pattern_name='string_sub_identity',
                             severity='GREEN',
                             line_num=call.line,
-                            message=f'string.sub({s_str}, 1, -1) -> {s_str}',
+                            message=f'String identity: {node_to_string(call.node)} -> {s_str}',
                             details={
                                 'node': call.node,
                                 'replacement': s_str

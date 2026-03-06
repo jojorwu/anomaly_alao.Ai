@@ -233,7 +233,7 @@ class ASTTransformer:
             self._edit_string_starts_with(finding)
         elif pattern in ('logical_identity', 'comparison_inversion'):
             self._edit_logical_identity(finding)
-        elif pattern == 'nested_redundant_call':
+        elif pattern in ('nested_redundant_call', 'redundant_call_args'):
             self._edit_nested_redundant_call(finding)
         elif pattern == 'table_concat_default_sep':
             self._edit_table_concat_default_sep(finding)
@@ -287,7 +287,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_divide_by_constant(self, finding: Finding):
@@ -318,7 +319,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_redundant_type_conversion(self, finding: Finding):
@@ -369,7 +371,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_math_random_0_1(self, finding: Finding):
@@ -429,7 +432,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_math_mod(self, finding: Finding):
@@ -494,7 +498,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_if_nil_assign(self, finding: Finding):
@@ -515,7 +520,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_redundant_boolean_comp(self, finding: Finding):
@@ -556,7 +562,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_table_literal_indices(self, finding: Finding):
@@ -645,7 +652,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10
         ))
 
     def _edit_table_remove_last(self, finding: Finding):
@@ -1925,12 +1933,7 @@ class ASTTransformer:
                     continue
 
                 # for calls like pairs(), ipairs() - replace the function name part
-                if '.' not in name:
-                    # bare global - find and replace just the name
-                    start, end = self._get_call_func_span(node, name)
-                else:
-                    # module.func - replace the whole func reference
-                    start, end = self._get_call_func_span(node, name)
+                start, end = self._get_call_func_span(node, name)
 
                 if start is None:
                     continue
