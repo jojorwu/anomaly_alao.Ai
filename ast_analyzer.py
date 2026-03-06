@@ -1496,6 +1496,46 @@ class ASTAnalyzer:
                     ))
                     continue
 
+        # Detect math.sqrt(x) == 0 -> x == 0 and math.sqrt(x) > 0 -> x > 0
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp, GreaterThanOp, GreaterOrEqThanOp, LessThanOp, LessOrEqThanOp)):
+                call = None
+                const_val = None
+                op = type(node)
+
+                if isinstance(node.left, Call) and isinstance(node.right, Number):
+                    call = node.left
+                    const_val = node.right.n
+                elif isinstance(node.right, Call) and isinstance(node.left, Number):
+                    call = node.right
+                    const_val = node.left.n
+                    # Swap op for right-side calls
+                    if op == GreaterThanOp: op = LessThanOp
+                    elif op == LessThanOp: op = GreaterThanOp
+                    elif op == GreaterOrEqThanOp: op = LessOrEqThanOp
+                    elif op == LessOrEqThanOp: op = GreaterOrEqThanOp
+
+                if call and const_val == 0:
+                    _, _, fn = self._get_call_name(call)
+                    if fn == 'math.sqrt' and len(call.args) == 1:
+                        x_str = node_to_string(call.args[0])
+                        replacement = None
+                        if op in (EqToOp, LessOrEqThanOp): replacement = f"{x_str} == 0"
+                        elif op in (NotEqToOp, GreaterThanOp): replacement = f"{x_str} > 0"
+                        elif op == GreaterOrEqThanOp: replacement = "true" # sqrt is always >= 0
+                        elif op == LessThanOp: replacement = "false" # sqrt is never < 0
+
+                        if replacement:
+                            self.findings.append(Finding(
+                                pattern_name='math_identity',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
+                                details={'node': node, 'replacement': replacement},
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
     def _analyze_table_concat_single(self):
         """Find table.concat(t, sep, i, i) and suggest tostring(t[i])."""
         for call in self.calls:
@@ -1845,6 +1885,31 @@ class ASTAnalyzer:
                     ))
                     continue
 
+                # x == nil or x == false -> not x
+                if var_name and isinstance(right, EqToOp):
+                    r_var = None
+                    r_false = False
+                    if isinstance(right.left, Name) and isinstance(right.right, FalseExpr):
+                        r_var = right.left.id
+                        r_false = True
+                    elif isinstance(right.right, Name) and isinstance(right.left, FalseExpr):
+                        r_var = right.right.id
+                        r_false = True
+
+                    if r_var == var_name and r_false:
+                        self.findings.append(Finding(
+                            pattern_name='logical_identity',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Redundant check: {var_name} == nil or {var_name} == false -> not {var_name}',
+                            details={
+                                'node': node,
+                                'replacement': f'not {var_name}'
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
+
             # x ~= nil and x -> x (in boolean context)
             if isinstance(node, AndLoOp):
                 left = node.left
@@ -2128,6 +2193,10 @@ class ASTAnalyzer:
 
         for node in ast.walk(self._ast_tree):
             if isinstance(node, ops):
+                # If the whole node can be constant folded, skip algebraic simplification
+                if self._get_const_val(node) is not None:
+                    continue
+
                 left_val = self._get_const_val(node.left)
                 right_val = self._get_const_val(node.right)
 
@@ -2137,8 +2206,50 @@ class ASTAnalyzer:
                 if isinstance(node, AddOp):
                     if right_val == 0: target = node.left; reason = "x + 0"
                     elif left_val == 0: target = node.right; reason = "0 + x"
+                    # x + -y -> x - y
+                    elif isinstance(node.right, UMinusOp):
+                        x_str = node_to_string(node.left)
+                        y_str = node_to_string(node.right.operand)
+                        replacement = f"{x_str} - {y_str}"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: {x_str} + -{y_str} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
+                    # -y + x -> x - y
+                    elif isinstance(node.left, UMinusOp):
+                        x_str = node_to_string(node.right)
+                        y_str = node_to_string(node.left.operand)
+                        replacement = f"{x_str} - {y_str}"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: -{y_str} + {x_str} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
                 elif isinstance(node, SubOp):
                     if right_val == 0: target = node.left; reason = "x - 0"
+                    # x - -y -> x + y
+                    elif isinstance(node.right, UMinusOp):
+                        x_str = node_to_string(node.left)
+                        y_str = node_to_string(node.right.operand)
+                        replacement = f"{x_str} + {y_str}"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: {x_str} - -{y_str} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
                     elif left_val == 0:
                         target_str = node_to_string(node.right)
                         # Add a space after the minus to avoid forming a comment if target_str starts with '-'
@@ -2179,6 +2290,30 @@ class ASTAnalyzer:
                 elif isinstance(node, MultOp):
                     if right_val == 1: target = node.left; reason = "x * 1"
                     elif left_val == 1: target = node.right; reason = "1 * x"
+                    elif right_val == -1:
+                        target_str = node_to_string(node.left)
+                        replacement = f"- {target_str}"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: {target_str} * -1 -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
+                    elif left_val == -1:
+                        target_str = node_to_string(node.right)
+                        replacement = f"- {target_str}"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: -1 * {target_str} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
                     elif isinstance(node.left, Call) and isinstance(node.right, Call):
                         _, _, f1 = self._get_call_name(node.left)
                         _, _, f2 = self._get_call_name(node.right)
@@ -2232,6 +2367,18 @@ class ASTAnalyzer:
                             continue
                 elif isinstance(node, FloatDivOp):
                     if right_val == 1: target = node.left; reason = "x / 1"
+                    elif right_val == -1:
+                        target_str = node_to_string(node.left)
+                        replacement = f"- {target_str}"
+                        self.findings.append(Finding(
+                            pattern_name='algebraic_simplification',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Algebraic simplification: {target_str} / -1 -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
                     else:
                         s1 = node_to_string(node.left)
                         s2 = node_to_string(node.right)
@@ -4120,7 +4267,9 @@ class ASTAnalyzer:
         # NOTE: level.object_by_id() is NOT auto-fixed because different IDs give
         # different objects, and even same IDs can change if object is destroyed
         expensive_calls = {'db.actor', 'alife', 'system_ini', 'game_ini', 'getFS',
-                           'device', 'get_console', 'get_hud', 'level.name'}
+                           'device', 'get_console', 'get_hud', 'level.name',
+                           'level.get_target_obj', 'level.object_by_id', 'alife_object',
+                           'get_story_object', 'get_object_by_name'}
 
         # method calls that are safe to cache (immutable object properties)
         # based on X-Ray engine source analysis:

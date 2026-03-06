@@ -27,6 +27,7 @@ PER_FRAME_CALLBACKS: Set[str] = frozenset({
 CACHEABLE_BARE_GLOBALS: Set[str] = frozenset({
     'pairs', 'ipairs', 'next', 'type', 'tostring', 'tonumber',
     'unpack', 'select', 'rawget', 'rawset',
+    'clamp', 'vector', 'v2d', 'color', 'is_empty',
 })
 
 # these are less beneficial to cache (error handling, output)
