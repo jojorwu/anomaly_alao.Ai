@@ -194,7 +194,7 @@ class ASTTransformer:
             self._edit_redundant_return_bool(finding)
         elif pattern == 'table_concat_literal':
             self._edit_table_concat_literal(finding)
-        elif pattern == 'ipairs_hot_loop':
+        elif pattern in ('ipairs_hot_loop', 'unused_ipairs_value'):
             if finding.severity == 'GREEN':
                 self._edit_ipairs_hot_loop(finding)
         elif pattern == 'math_min_max_inline':
@@ -217,7 +217,7 @@ class ASTTransformer:
             self._edit_return_ternary_simplification(finding)
         elif pattern == 'math_atan2_to_atan':
             self._edit_math_atan2(finding)
-        elif pattern == 'math_mod_to_percent':
+        elif pattern in ('math_mod_to_percent', 'math_fmod_to_percent'):
             self._edit_math_mod(finding)
         elif pattern == 'math_log_base_e':
             self._edit_math_log(finding)
@@ -227,6 +227,16 @@ class ASTTransformer:
             self._edit_math_random_0_1(finding)
         elif pattern == 'string_rep_simple':
             self._edit_string_rep_simple(finding)
+        elif pattern == 'algebraic_simplification':
+            self._edit_algebraic_simplification(finding)
+        elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
+            self._edit_string_starts_with(finding)
+        elif pattern in ('logical_identity', 'comparison_inversion'):
+            self._edit_logical_identity(finding)
+        elif pattern == 'nested_redundant_call':
+            self._edit_nested_redundant_call(finding)
+        elif pattern == 'table_literal_indices':
+            self._edit_table_literal_indices(finding)
 
 
     # Edit methods using AST positions
@@ -249,7 +259,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=replacement
+            replacement=replacement,
+            priority=10 # Higher priority than simple constant folding
         ))
 
     def _edit_unpack_to_indexing(self, finding: Finding):
@@ -541,6 +552,95 @@ class ASTTransformer:
             replacement=replacement
         ))
 
+    def _edit_table_literal_indices(self, finding: Finding):
+        """Replace table literal with simplified version."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
+    def _edit_nested_redundant_call(self, finding: Finding):
+        """Replace nested redundant call with simplified version."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
+    def _edit_logical_identity(self, finding: Finding):
+        """Replace redundant logical operation with simplified version."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
+    def _edit_string_starts_with(self, finding: Finding):
+        """Replace string.find(s, p) == 1 with string.sub(s, 1, #p) == p."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=10
+        ))
+
+    def _edit_algebraic_simplification(self, finding: Finding):
+        """Replace redundant algebraic operation with the target expression."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement
+        ))
+
     def _edit_table_remove_last(self, finding: Finding):
         """Convert table.remove(t) to t[#t] = nil."""
         node = finding.details.get('node')
@@ -561,6 +661,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
+            priority=100  # High priority to override constant folding of arguments
         ))
 
     def _edit_math_random_1(self, finding: Finding):
@@ -703,6 +804,10 @@ class ASTTransformer:
         ))
 
         # 2. Insert "local v = table[k]" at the beginning of the body
+        # UNLESS the finding is unused_ipairs_value, then we don't need the local
+        if finding.pattern_name == 'unused_ipairs_value':
+            return
+
         if hasattr(loop_node, 'body') and hasattr(loop_node.body, 'body'):
             body_first_stmt = loop_node.body.body[0] if loop_node.body.body else None
             if body_first_stmt:
@@ -773,10 +878,15 @@ class ASTTransformer:
         if start is None:
             return
 
+        # Give Call folding higher priority than nested expression folding
+        from luaparser.astnodes import Call
+        priority = 10 if isinstance(node, Call) else 0
+
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=str(result)
+            replacement=str(result),
+            priority=priority
         ))
 
     def _edit_expo_to_mult(self, finding: Finding):
@@ -870,6 +980,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
+            priority=100 # High priority to override table.getn(t) -> #t folding
         ))
 
     def _find_matching_paren(self, text: str, start_pos: int) -> int:
@@ -1018,6 +1129,19 @@ class ASTTransformer:
             replacement = f'math.sqrt({base})'
         elif pow_type == 'power' and isinstance(exp, int):
             replacement = '*'.join([base] * exp)
+        elif pow_type == 'power_neg':
+            if exp == -1:
+                replacement = f'1/{base}'
+            elif exp == -2:
+                replacement = f'1/({base}*{base})'
+            elif exp == -0.5:
+                replacement = f'1/math.sqrt({base})'
+            else:
+                return
+        elif pow_type == 'power_1':
+            replacement = base
+        elif pow_type == 'power_0':
+            replacement = '1'
         else:
             return
 
@@ -1025,6 +1149,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
+            priority=10,
         ))
 
     def _edit_distance_to_comparison(self, finding: Finding):
