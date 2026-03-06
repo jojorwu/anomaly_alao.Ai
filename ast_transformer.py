@@ -227,7 +227,7 @@ class ASTTransformer:
             self._edit_math_random_0_1(finding)
         elif pattern == 'string_rep_simple':
             self._edit_string_rep_simple(finding)
-        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index'):
+        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index', 'string_empty_check'):
             self._edit_algebraic_simplification(finding)
         elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
             self._edit_string_starts_with(finding)
@@ -288,7 +288,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_divide_by_constant(self, finding: Finding):
@@ -320,7 +320,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_redundant_type_conversion(self, finding: Finding):
@@ -440,7 +440,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_math_mod(self, finding: Finding):
@@ -584,11 +584,12 @@ class ASTTransformer:
         if start is None:
             return
 
+        # High priority for algebraic/identity simplifications to avoid partial folding
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_nested_redundant_call(self, finding: Finding):

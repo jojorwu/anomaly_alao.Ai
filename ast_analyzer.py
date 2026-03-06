@@ -211,6 +211,7 @@ class ASTAnalyzer:
                 if full_name == 'math.floor': return py_math.floor(args[0])
                 if full_name == 'math.ceil': return py_math.ceil(args[0])
                 if full_name == 'math.sqrt' and args[0] >= 0: return py_math.sqrt(args[0])
+                if full_name == 'math.exp': return py_math.exp(args[0])
                 if full_name == 'math.deg': return py_math.degrees(args[0])
                 if full_name == 'math.rad': return py_math.radians(args[0])
                 if full_name == 'math.fmod': return py_math.fmod(args[0], args[1])
@@ -262,7 +263,10 @@ class ASTAnalyzer:
                 if full_name == 'string.lower': return args[0].lower() if isinstance(args[0], (str, bytes)) else None
                 if full_name == 'string.char':
                     # Lua string.char returns bytes
-                    return bytes([int(a) for a in args]).decode('latin-1')
+                    try:
+                        return bytes([int(a) & 0xFF for a in args]).decode('latin-1')
+                    except (ValueError, OverflowError):
+                        return None
                 if full_name == 'string.byte':
                     s = args[0]
                     idx = int(args[1]) if len(args) > 1 else 1
@@ -1377,9 +1381,11 @@ class ASTAnalyzer:
         self._analyze_math_atan2()
         self._analyze_math_mod()
         self._analyze_math_log()
+        self._analyze_math_sqrt_identity()
         self._analyze_math_deg_rad()
         self._analyze_math_random_0_1()
         self._analyze_string_rep()
+        self._analyze_string_empty()
         self._analyze_uncached_globals()
         self._analyze_repeated_calls_in_scope()
         self._analyze_string_concat_in_loop()
@@ -1423,6 +1429,7 @@ class ASTAnalyzer:
         self._analyze_string_sub_negative_indices()
         self._analyze_string_starts_with()
         self._analyze_logical_identity()
+        self._analyze_logical_redundancy()
         self._analyze_nested_redundant_calls()
         self._analyze_table_literal_indices()
         self._analyze_bit_identity()
@@ -1779,6 +1786,75 @@ class ASTAnalyzer:
                     source_line=self._get_source_line(call.line),
                 ))
 
+    def _analyze_logical_redundancy(self):
+        """Find redundant logical checks like x == nil or not x."""
+        if not self._ast_tree: return
+
+        for node in ast.walk(self._ast_tree):
+            # x == nil or not x -> not x
+            if isinstance(node, OrLoOp):
+                left = node.left
+                right = node.right
+
+                var_name = None
+                # x == nil
+                if isinstance(left, EqToOp):
+                    if isinstance(left.left, Name) and isinstance(left.right, Nil):
+                        var_name = left.left.id
+                    elif isinstance(left.right, Name) and isinstance(left.left, Nil):
+                        var_name = left.right.id
+
+                # not x
+                if var_name and isinstance(right, ULNotOp) and isinstance(right.operand, Name) and right.operand.id == var_name:
+                    self.findings.append(Finding(
+                        pattern_name='logical_identity',
+                        severity='GREEN',
+                        line_num=self._get_line(node),
+                        message=f'Redundant check: {var_name} == nil or not {var_name} -> not {var_name}',
+                        details={
+                            'node': node,
+                            'replacement': f'not {var_name}'
+                        },
+                        source_line=self._get_source_line(self._get_line(node)),
+                    ))
+                    continue
+
+            # x ~= nil and x -> x (in boolean context)
+            if isinstance(node, AndLoOp):
+                left = node.left
+                right = node.right
+
+                var_name = None
+                # x ~= nil
+                if isinstance(left, NotEqToOp):
+                    if isinstance(left.left, Name) and isinstance(left.right, Nil):
+                        var_name = left.left.id
+                    elif isinstance(left.right, Name) and isinstance(left.left, Nil):
+                        var_name = left.right.id
+
+                # and x
+                if var_name and isinstance(right, Name) and right.id == var_name:
+                    # check if it's in a boolean context
+                    is_bool_context = False
+                    parent = self.parent_map.get(id(node))
+                    if isinstance(parent, (If, While, Repeat)) and getattr(parent, 'test', None) == node:
+                        is_bool_context = True
+                    elif isinstance(parent, (AndLoOp, OrLoOp, ULNotOp)):
+                        is_bool_context = True
+
+                    if is_bool_context:
+                        self.findings.append(Finding(
+                            pattern_name='logical_identity',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Redundant check: {var_name} ~= nil and {var_name} -> {var_name}',
+                            details={
+                                'node': node,
+                                'replacement': var_name
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
     def _analyze_logical_identity(self):
         """Find redundant logical operations like x and true, x or false."""
         if not self._ast_tree: return
@@ -1896,39 +1972,75 @@ class ASTAnalyzer:
             if call.full_name == 'string.sub' and len(call.args) >= 2:
                 s_node = call.args[0]
                 s_str = node_to_string(s_node)
-                arg2 = call.args[1]
 
-                # Check for #s
+                # Check arg 2
+                arg2 = call.args[1]
                 if isinstance(arg2, ULengthOP) and node_to_string(arg2.operand) == s_str:
                     # string.sub(s, #s) -> string.sub(s, -1)
-                    self.findings.append(Finding(
-                        pattern_name='string_sub_negative_index',
-                        severity='GREEN',
-                        line_num=call.line,
-                        message=f'string.sub({s_str}, #{s_str}) -> string.sub({s_str}, -1)',
-                        details={
-                            'node': call.node,
-                            'replacement': f'string.sub({s_str}, -1)'
-                        },
-                        source_line=self._get_source_line(call.line),
-                    ))
-                # Check for #s - n
+                    if len(call.args) == 2:
+                        self.findings.append(Finding(
+                            pattern_name='string_sub_negative_index',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.sub({s_str}, #{s_str}) -> string.sub({s_str}, -1)',
+                            details={
+                                'node': call.node,
+                                'replacement': f'string.sub({s_str}, -1)'
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
                 elif isinstance(arg2, SubOp):
                     if isinstance(arg2.left, ULengthOP) and node_to_string(arg2.left.operand) == s_str:
                         n = self._get_const_val(arg2.right)
                         if isinstance(n, (int, float)):
                             neg_idx = -int(n + 1)
-                            self.findings.append(Finding(
-                                pattern_name='string_sub_negative_index',
-                                severity='GREEN',
-                                line_num=call.line,
-                                message=f'string.sub({s_str}, #{s_str} - {int(n)}) -> string.sub({s_str}, {neg_idx})',
-                                details={
-                                    'node': call.node,
-                                    'replacement': f'string.sub({s_str}, {neg_idx})'
-                                },
-                                source_line=self._get_source_line(call.line),
-                            ))
+                            if len(call.args) == 2:
+                                self.findings.append(Finding(
+                                    pattern_name='string_sub_negative_index',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'string.sub({s_str}, #{s_str} - {int(n)}) -> string.sub({s_str}, {neg_idx})',
+                                    details={
+                                        'node': call.node,
+                                        'replacement': f'string.sub({s_str}, {neg_idx})'
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
+
+                # Check arg 3
+                if len(call.args) == 3:
+                    arg3 = call.args[2]
+                    if isinstance(arg3, ULengthOP) and node_to_string(arg3.operand) == s_str:
+                        # string.sub(s, i, #s) -> string.sub(s, i, -1)
+                        arg2_str = node_to_string(call.args[1])
+                        self.findings.append(Finding(
+                            pattern_name='string_sub_negative_index',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'string.sub({s_str}, {arg2_str}, #{s_str}) -> string.sub({s_str}, {arg2_str}, -1)',
+                            details={
+                                'node': call.node,
+                                'replacement': f'string.sub({s_str}, {arg2_str}, -1)'
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+                    elif isinstance(arg3, SubOp):
+                        if isinstance(arg3.left, ULengthOP) and node_to_string(arg3.left.operand) == s_str:
+                            n = self._get_const_val(arg3.right)
+                            if isinstance(n, (int, float)):
+                                neg_idx = -int(n + 1)
+                                arg2_str = node_to_string(call.args[1])
+                                self.findings.append(Finding(
+                                    pattern_name='string_sub_negative_index',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'string.sub({s_str}, {arg2_str}, #{s_str} - {int(n)}) -> string.sub({s_str}, {arg2_str}, {neg_idx})',
+                                    details={
+                                        'node': call.node,
+                                        'replacement': f'string.sub({s_str}, {arg2_str}, {neg_idx})'
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
 
     def _analyze_string_starts_with(self):
         """Find string.find(s, prefix) == 1 and suggest string.sub(s, 1, #prefix) == prefix."""
@@ -3386,6 +3498,69 @@ class ASTAnalyzer:
                         source_line=self._get_source_line(call.line),
                     ))
 
+    def _analyze_string_empty(self):
+        """Find #s == 0 or string.len(s) == 0 and suggest s == ''."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                call = None
+                val = None
+
+                if isinstance(node.left, (ULengthOP, Call)) and isinstance(node.right, Number):
+                    call = node.left
+                    val = node.right.n
+                elif isinstance(node.right, (ULengthOP, Call)) and isinstance(node.left, Number):
+                    call = node.right
+                    val = node.left.n
+
+                if val == 0:
+                    s_str = None
+                    if isinstance(call, ULengthOP):
+                        s_str = node_to_string(call.operand)
+                    elif isinstance(call, Call):
+                        _, _, fn = self._get_call_name(call)
+                        if fn == 'string.len' and len(call.args) == 1:
+                            s_str = node_to_string(call.args[0])
+
+                    if s_str:
+                        op = '==' if isinstance(node, EqToOp) else '~='
+                        replacement = f"{s_str} {op} ''"
+                        self.findings.append(Finding(
+                            pattern_name='string_empty_check',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f"Check for empty string: {node_to_string(node)} -> {replacement}",
+                            details={
+                                'node': node,
+                                'replacement': replacement
+                            },
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_math_sqrt_identity(self):
+        """Find math.sqrt(x) * math.sqrt(x) and suggest x."""
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, MultOp):
+                if isinstance(node.left, Call) and isinstance(node.right, Call):
+                    _, _, f1 = self._get_call_name(node.left)
+                    _, _, f2 = self._get_call_name(node.right)
+                    if f1 == 'math.sqrt' and f2 == 'math.sqrt' and len(node.left.args) == 1 and len(node.right.args) == 1:
+                        s1 = node_to_string(node.left.args[0])
+                        s2 = node_to_string(node.right.args[0])
+                        if s1 == s2 and self._is_simple_expr(node.left.args[0]):
+                            # math.sqrt(x) * math.sqrt(x) -> x
+                            # Note: only safe if x >= 0, but if x < 0 it was NaN anyway.
+                            self.findings.append(Finding(
+                                pattern_name='math_identity',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'math.sqrt({s1}) * math.sqrt({s1}) -> {s1}',
+                                details={
+                                    'node': node,
+                                    'replacement': s1
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
     def _analyze_math_deg_rad(self):
         """Find math.deg(x) or math.rad(x) and suggest multiplication by constant."""
         import math as py_math
@@ -3444,6 +3619,30 @@ class ASTAnalyzer:
 
     def _analyze_math_log(self):
         """Find math.log(x, base) and suggest math.log(x) if base is e."""
+        # Also handle math.log(x) / math.log(10)
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, FloatDivOp):
+                if isinstance(node.left, Call) and isinstance(node.right, Call):
+                    _, _, f1 = self._get_call_name(node.left)
+                    _, _, f2 = self._get_call_name(node.right)
+                    if f1 == 'math.log' and f2 == 'math.log' and len(node.left.args) == 1 and len(node.right.args) == 1:
+                        base_val = self._get_const_val(node.right.args[0])
+                        if base_val == 10:
+                            x_str = node_to_string(node.left.args[0])
+                            replacement = f"math.log10({x_str})"
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'math.log(x) / math.log(10) -> math.log10(x)',
+                                details={
+                                    'node': node,
+                                    'replacement': replacement
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
+
         for call in self.calls:
             if call.full_name == 'math.log' and len(call.args) == 2:
                 base_node = call.args[1]
@@ -3460,7 +3659,7 @@ class ASTAnalyzer:
 
                 # check for numeric value of e (approx)
                 elif isinstance(base_node, Number):
-                    if 2.71828 <= base_node.n <= 2.71829:
+                    if 2.71828 <= base_node.n <= 2.718282:
                         is_e = True
                     elif base_node.n == 10:
                         is_10 = True
