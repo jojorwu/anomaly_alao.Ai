@@ -247,3 +247,42 @@ class TestNewOptimizations(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_math_clamp_extended(self):
+        # min(max(x, 0), 1) -> clamp(x, 0, 1)
+        script = "local res = math.min(math.max(x, 0), 1)"
+        path = self.test_dir / "clamp_ext.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("clamp(x, 0, 1)", new_content)
+
+        # min(1, max(0, x)) -> clamp(x, 0, 1)
+        script = "local res = math.min(1, math.max(0, x))"
+        path = self.test_dir / "clamp_ext2.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("clamp(x, 0, 1)", new_content)
+
+    def test_vector_arithmetic_in_loop_extended(self):
+        script = "for i=1, 10 do local v = vector():set(1,0,0) + vector():set(0,1,0) end"
+        path = self.test_dir / "vector_loop_ext.lua"
+        path.write_text(script)
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'vector_arithmetic_in_loop' for f in findings))
+
+    def test_cacheable_methods_extended_ext(self):
+        script = "function test(obj) obj:position() obj:position() obj:position() obj:position() end"
+        path = self.test_dir / "cache_methods_ext.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("local obj_pos = obj:position()", new_content)
+
+    def test_repeated_member_access_in_loop_extended_ext(self):
+        script = "for i=1, 10 do print(obj.member) print(obj.member) print(obj.member) end"
+        path = self.test_dir / "member_loop_ext.lua"
+        path.write_text(script)
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'repeated_member_access_in_loop' for f in findings))
