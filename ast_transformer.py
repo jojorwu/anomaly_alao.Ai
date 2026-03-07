@@ -239,6 +239,12 @@ class ASTTransformer:
             self._edit_table_concat_default_sep(finding)
         elif pattern == 'table_literal_indices':
             self._edit_table_literal_indices(finding)
+        elif pattern == 'inplace_vector_op':
+            self._edit_inplace_vector_op(finding)
+        elif pattern == 'table_emptiness_check':
+            self._edit_table_emptiness_check(finding)
+        elif pattern == 'loop_invariant_global':
+            self._edit_loop_invariant_global(finding)
 
 
     # Edit methods using AST positions
@@ -571,6 +577,87 @@ class ASTTransformer:
             end_char=end,
             replacement=replacement,
             priority=10
+        ))
+
+    def _edit_loop_invariant_global(self, finding: Finding):
+        """Hoist loop-invariant global access outside of the loop."""
+        loop_node = finding.details.get('loop_node')
+        name = finding.details.get('name')
+        usage_nodes = finding.details.get('nodes', [])
+        is_call = finding.details.get('is_call', False)
+        local_name = finding.details.get('local_name')
+
+        if not loop_node or not name or not usage_nodes or not local_name:
+            return
+
+        # 2. Insert local declaration before the loop
+        loop_start = self._get_line_start(self.analyzer._get_line(loop_node))
+        if loop_start is None:
+            return
+
+        indent = self._get_indent_at_line(self.analyzer._get_line(loop_node))
+
+        rhs = name
+        if is_call:
+            rhs = f'{name}()'
+
+        # Check if already cached in parent scope (simplified check)
+        # We don't want to shadow if the parent already has this local
+        declaration = f'local {local_name} = {rhs}\n{indent}'
+
+        self.edits.append(SourceEdit(
+            start_char=loop_start,
+            end_char=loop_start,
+            replacement=declaration,
+            priority=100
+        ))
+
+        # 3. Replace all usages inside the loop
+        for node in usage_nodes:
+            start, end = self._get_node_span(node)
+            if start is not None:
+                self.edits.append(SourceEdit(
+                    start_char=start,
+                    end_char=end,
+                    replacement=local_name,
+                    priority=50
+                ))
+
+    def _edit_table_emptiness_check(self, finding: Finding):
+        """Replace #t == 0 with next(t) == nil."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Lower priority so string_empty_check (priority 10) takes precedence if ambiguous
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=5
+        ))
+
+    def _edit_inplace_vector_op(self, finding: Finding):
+        """Replace v = v + d with v:add(d)."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=20
         ))
 
     def _edit_table_literal_indices(self, finding: Finding):

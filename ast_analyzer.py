@@ -801,7 +801,24 @@ class ASTAnalyzer:
 
     def _infer_type(self, node: Node, scope: Optional[Scope] = None) -> Optional[str]:
         """Infer the Lua type of an expression node."""
-        if isinstance(node, (Number, AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp, UMinusOp)):
+        if isinstance(node, (AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp, UMinusOp)):
+            # Check for vector arithmetic
+            if hasattr(node, 'left') and hasattr(node, 'right'):
+                l_type = self._infer_type(node.left, scope)
+                r_type = self._infer_type(node.right, scope)
+                # Both sides must be vectors OR one is a vector and the other is a number
+                # (Scalar multiplication/division)
+                if l_type == 'vector' or r_type == 'vector':
+                    # If one side is unknown (e.g. parameter), we can't be sure it's vector arithmetic
+                    # unless it's explicitly assigned to a vector type earlier.
+                    if l_type is None or r_type is None:
+                        return None
+                    return 'vector'
+            elif isinstance(node, UMinusOp):
+                if self._infer_type(node.operand, scope) == 'vector':
+                    return 'vector'
+            return 'number'
+        if isinstance(node, Number):
             return 'number'
         if isinstance(node, (String, Concat)):
             return 'string'
@@ -874,7 +891,7 @@ class ASTAnalyzer:
                     # (might be used in next iteration)
                     pass
 
-            new_assign = Assignment(line=line, node=value, inferred_type=self._infer_type(value))
+            new_assign = Assignment(line=line, node=value, inferred_type=self._infer_type(value, self.current_scope))
             self.local_vars[key].assignments.append(new_assign)
             self.active_assignments[key] = new_assign
 
@@ -1480,6 +1497,181 @@ class ASTAnalyzer:
         self._analyze_table_concat_single()
         self._analyze_math_clamp()
         self._analyze_vector_arithmetic_in_loop()
+        self._analyze_table_emptiness()
+        self._analyze_inplace_vector_ops()
+        self._analyze_loop_invariant_globals()
+
+    def _analyze_table_emptiness(self):
+        """Find #t == 0 and suggest next(t) == nil for general tables."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                left = node.left
+                right = node.right
+
+                table_node = None
+                if isinstance(left, ULengthOP) and isinstance(right, Number) and right.n == 0:
+                    table_node = left.operand
+                elif isinstance(right, ULengthOP) and isinstance(left, Number) and left.n == 0:
+                    table_node = right.operand
+
+                if table_node:
+                    # Only suggest next(t) == nil if we are reasonably sure it's a table.
+                    # Suggesting it for a string would cause a runtime error.
+                    inf = self._infer_type(table_node, self.node_scopes.get(id(table_node)))
+                    if inf is not None and inf != 'table':
+                        continue
+
+                    table_str = node_to_string(table_node)
+                    op = "==" if isinstance(node, EqToOp) else "~="
+                    replacement = f"next({table_str}) {'==' if isinstance(node, EqToOp) else '~='} nil"
+
+                    self.findings.append(Finding(
+                        pattern_name='table_emptiness_check',
+                        severity='YELLOW', # Yellow because #t is faster for arrays
+                        line_num=self._get_line(node),
+                        message=f'General table emptiness check: {node_to_string(node)} -> {replacement}',
+                        details={'node': node, 'replacement': replacement},
+                        source_line=self._get_source_line(self._get_line(node)),
+                    ))
+
+    def _analyze_inplace_vector_ops(self):
+        """Find v = v + d and suggest v:add(d) for vector performance."""
+        for assign in self.assigns:
+            if assign.value_type == 'other' and isinstance(assign.node, (AddOp, SubOp, MultOp)):
+                target = assign.target
+                op_node = assign.node
+
+                left_str = node_to_string(op_node.left)
+                if left_str == target and self._infer_type(op_node.left, assign.scope) == 'vector':
+                    method = None
+                    if isinstance(op_node, AddOp): method = "add"
+                    elif isinstance(op_node, SubOp): method = "sub"
+                    elif isinstance(op_node, MultOp): method = "mul"
+
+                    if method:
+                        arg_str = node_to_string(op_node.right)
+                        replacement = f"{target}:{method}({arg_str})"
+
+                        # We need the full assignment node for replacement
+                        full_assign_node = self.parent_map.get(id(op_node))
+                        if full_assign_node and isinstance(full_assign_node, (Assign, LocalAssign)):
+                            # MARK AS YELLOW: in-place modification changes reference semantics!
+                            # Original: v = v + d (creates new vector, original v unchanged)
+                            # Replacement: v:add(d) (modifies v in-place, affecting all references to it)
+                            self.findings.append(Finding(
+                                pattern_name='inplace_vector_op',
+                                severity='YELLOW',
+                                line_num=assign.line,
+                                message=f'In-place vector operation: {target} = {target} {node_to_string(op_node).split()[1]} {arg_str} -> {replacement} (Note: modifies vector in-place)',
+                                details={'node': full_assign_node, 'replacement': replacement},
+                                source_line=self._get_source_line(assign.line),
+                            ))
+
+    def _analyze_loop_invariant_globals(self):
+        """Identify globals accessed in loops that could be hoisted."""
+        # We target specific high-impact globals that are often used in loops
+        # without being localized.
+        target_globals = {'db.actor', 'device', 'game_ini', 'system_ini', 'bit'}
+        target_calls = {'alife', 'time_global', 'level.name', 'level.get_target_obj'}
+
+        # Track loop-local usages
+        loop_usages = defaultdict(lambda: defaultdict(list))
+
+        # Global Name and Index reads (like db.actor)
+        if self._ast_tree:
+            for node in ast.walk(self._ast_tree):
+                node_name = None
+                if isinstance(node, Name) and node.id in target_globals:
+                    node_name = node.id
+                elif isinstance(node, Index):
+                    s = node_to_string(node)
+                    if s in target_globals:
+                        node_name = s
+
+                if node_name:
+                    # check if inside loop
+                    curr = node
+                    loop_node = None
+                    while curr:
+                        curr = self.parent_map.get(id(curr))
+                        if isinstance(curr, (While, Repeat, Fornum, Forin)):
+                            loop_node = curr
+                            break
+
+                    if loop_node:
+                        # only if not in locals
+                        if not self._is_in_locals(node_name.split('.')[0]):
+                             loop_usages[id(loop_node)][node_name].append(node)
+
+        # Calls
+        for call in self.calls:
+            if call.in_loop and (call.full_name in target_calls or call.full_name in target_globals):
+                # find innermost loop
+                curr = call.node
+                loop_node = None
+                while curr:
+                    curr = self.parent_map.get(id(curr))
+                    if isinstance(curr, (While, Repeat, Fornum, Forin)):
+                        loop_node = curr
+                        break
+                if loop_node:
+                    loop_usages[id(loop_node)][call.full_name].append(call.node)
+
+        # For hoisting, we need the loop node itself.
+        # We need to map loop_id back to loop_node.
+        loop_id_to_node = {}
+        if self._ast_tree:
+            for node in ast.walk(self._ast_tree):
+                if isinstance(node, (While, Repeat, Fornum, Forin)):
+                    loop_id_to_node[id(node)] = node
+
+        for loop_id, usages in loop_usages.items():
+            loop_node = loop_id_to_node.get(loop_id)
+            if not loop_node: continue
+
+            # Get the scope for the loop node
+            loop_scope = self.node_scopes.get(id(loop_node))
+
+            for name, nodes in usages.items():
+                first_node = nodes[0]
+                line = self._get_line(first_node)
+
+                # Check if it's a call or a simple global
+                is_call = any(isinstance(n, Call) for n in nodes)
+
+                # Safety check: avoid name collisions with existing locals in the parent scope
+                if '.' in name:
+                    local_name = name.split('.')[-1]
+                else:
+                    local_name = f'g_{name}'
+
+                if name == 'alife': local_name = 'sim'
+                elif name == 'time_global': local_name = 'tg'
+                elif name == 'device': local_name = 'dev'
+                elif name == 'db.actor': local_name = 'actor'
+
+                is_safe = True
+                if loop_scope:
+                    # check for existing locals in this or parent scopes
+                    if self._find_local_key(local_name, loop_scope):
+                        is_safe = False
+
+                if is_safe:
+                    self.findings.append(Finding(
+                        pattern_name='loop_invariant_global',
+                        severity='YELLOW',
+                        line_num=line,
+                        message=f'Global {name} accessed in loop - hoist to local variable outside loop for performance',
+                        details={
+                            'name': name,
+                            'nodes': nodes,
+                            'loop_node': loop_node,
+                            'is_call': is_call,
+                            'local_name': local_name
+                        },
+                        source_line=self._get_source_line(line),
+                    ))
 
     def _analyze_math_sqrt_pow(self):
         """Find math.sqrt(x*x) or math.sqrt(x^2) and suggest math.abs(x)."""
@@ -3887,6 +4079,9 @@ class ASTAnalyzer:
         """Find #s == 0 or string.len(s) == 0 and suggest s == ''."""
         for node in ast.walk(self._ast_tree):
             if isinstance(node, (EqToOp, NotEqToOp)):
+                # If already constant folded, skip
+                if self._get_const_val(node) is not None:
+                    continue
                 call = None
                 val = None
 
@@ -3907,6 +4102,13 @@ class ASTAnalyzer:
                             s_str = node_to_string(call.args[0])
 
                     if s_str:
+                        # For strings, we can be more lenient because s == "" is safe even for tables
+                        # (it just returns false), whereas next(s) crashes for strings.
+                        # So we trigger string_empty_check unless we know it's NOT a string.
+                        inf = self._infer_type(call.operand if isinstance(call, ULengthOP) else call.args[0], self.node_scopes.get(id(node)))
+                        if inf is not None and inf != 'string':
+                            continue
+
                         op = '==' if isinstance(node, EqToOp) else '~='
                         replacement = f"{s_str} {op} ''"
                         self.findings.append(Finding(
@@ -4367,7 +4569,13 @@ class ASTAnalyzer:
 
                 # threshold: configurable (default 4), hot callbacks use threshold-1
                 # with --experimental, use branch-aware counting
-                threshold = self.cache_threshold - 1 if func_scope.is_hot_callback else self.cache_threshold
+                # usage in loops is weighted more heavily
+                is_in_loop = any(c.in_loop for c in calls)
+                if is_in_loop:
+                    threshold = 2  # Caching is always good if used in a loop
+                else:
+                    threshold = self.cache_threshold - 1 if func_scope.is_hot_callback else self.cache_threshold
+
                 call_count = self._count_calls_branch_aware(calls)
                 if call_count >= threshold:
                     globals_to_cache[name] = calls
