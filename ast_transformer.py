@@ -227,7 +227,7 @@ class ASTTransformer:
             self._edit_math_random_0_1(finding)
         elif pattern == 'string_rep_simple':
             self._edit_string_rep_simple(finding)
-        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index', 'string_empty_check'):
+        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index', 'string_empty_check', 'math_clamp_suggestion'):
             self._edit_algebraic_simplification(finding)
         elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
             self._edit_string_starts_with(finding)
@@ -2039,13 +2039,14 @@ class ASTTransformer:
             new_name = 'level_name'
             call_pattern = 'level.name()'
             call_pattern_re = re.compile(r'\blevel\.name\s*\(')
-        elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
+        elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()') or \
+             pattern.endswith('_position()') or pattern.endswith('_direction()') or pattern.endswith('_level_vertex_id()') or pattern.endswith('_game_vertex_id()'):
             # dynamic method caching: repeated_obj_section(), repeated_item_id(), etc
             # extract object name and method from pattern: repeated_obj_section() -> obj, section
             # pattern format: repeated_{objname}_{method}()
             # NOTE: story_id must be checked before id since _id() is suffix of _story_id()
             # NOTE: Use non-greedy (.+?) to avoid capturing part of method name
-            match = re.match(r'repeated_(.+?)_(story_id|section|clsid|id)\(\)$', pattern)
+            match = re.match(r'repeated_(.+?)_(story_id|section|clsid|id|position|direction|level_vertex_id|game_vertex_id)\(\)$', pattern)
             if not match:
                 return
             sanitized_obj_name = match.group(1)
@@ -2077,6 +2078,14 @@ class ASTTransformer:
                 new_name = f'{sanitized_obj_name}_cls'
             elif method_name == 'story_id':
                 new_name = f'{sanitized_obj_name}_sid'
+            elif method_name == 'position':
+                new_name = f'{sanitized_obj_name}_pos'
+            elif method_name == 'direction':
+                new_name = f'{sanitized_obj_name}_dir'
+            elif method_name == 'level_vertex_id':
+                new_name = f'{sanitized_obj_name}_lvid'
+            elif method_name == 'game_vertex_id':
+                new_name = f'{sanitized_obj_name}_gvid'
             else:
                 new_name = f'{sanitized_obj_name}_{method_name}'
             

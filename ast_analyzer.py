@@ -824,6 +824,14 @@ class ASTAnalyzer:
                 return 'number'
             if full_name in ('tostring', 'string.format', 'string.sub', 'string.gsub', 'string.lower', 'string.upper', 'string.char'):
                 return 'string'
+            if full_name in ('vector', 'v2d', 'color'):
+                return 'vector'
+        if isinstance(node, Invoke):
+            method_name = node.func.id if isinstance(node.func, Name) else ""
+            if method_name in ('position', 'direction', 'up', 'right', 'forward', 'set', 'add', 'sub', 'mul', 'div', 'normalize'):
+                return 'vector'
+            if self._infer_type(node.source) == 'vector' and method_name in ('set', 'add', 'sub', 'mul', 'div', 'normalize'):
+                return 'vector'
         if isinstance(node, Name):
             key = self._find_local_key(node.id)
             if key and key in self.active_assignments:
@@ -1456,6 +1464,8 @@ class ASTAnalyzer:
         self._analyze_string_find_args()
         self._analyze_math_sqrt_pow()
         self._analyze_table_concat_single()
+        self._analyze_math_clamp()
+        self._analyze_vector_arithmetic_in_loop()
 
     def _analyze_math_sqrt_pow(self):
         """Find math.sqrt(x*x) or math.sqrt(x^2) and suggest math.abs(x)."""
@@ -1523,8 +1533,6 @@ class ASTAnalyzer:
                         replacement = None
                         if op in (EqToOp, LessOrEqThanOp): replacement = f"{x_str} == 0"
                         elif op in (NotEqToOp, GreaterThanOp): replacement = f"{x_str} > 0"
-                        elif op == GreaterOrEqThanOp: replacement = "true" # sqrt is always >= 0
-                        elif op == LessThanOp: replacement = "false" # sqrt is never < 0
 
                         if replacement:
                             self.findings.append(Finding(
@@ -3192,8 +3200,8 @@ class ASTAnalyzer:
 
         for node, line, scope, is_write in self.index_accesses:
             if not is_write:
-                # check if it's a member access like self.xxx
-                if isinstance(node, Index) and isinstance(node.value, Name) and node.value.id == 'self':
+                # check if it's a member access like self.xxx or obj.xxx
+                if isinstance(node, Index):
                     # find enclosing loop
                     curr = scope
                     while curr and curr.scope_type != 'loop':
@@ -3201,7 +3209,9 @@ class ASTAnalyzer:
 
                     if curr:
                         member_name = node_to_string(node)
-                        loop_accesses[id(curr)][member_name].append((node, line))
+                        # only care about simple bases
+                        if isinstance(node.value, (Name, Index)) and self._is_simple_expr(node.value):
+                            loop_accesses[id(curr)][member_name].append((node, line))
 
         for loop_id, members in loop_accesses.items():
             for member, accesses in members.items():
@@ -3219,6 +3229,88 @@ class ASTAnalyzer:
                         },
                         source_line=self._get_source_line(first_line),
                     ))
+
+    def _analyze_math_clamp(self):
+        """Find math.min(math.max(x, min_val), max_val) and suggest clamp(x, min_val, max_val)."""
+        for call in self.calls:
+            if call.full_name == 'math.min' and len(call.args) == 2:
+                arg1 = call.args[0]
+                arg2 = call.args[1]
+
+                # Check for math.min(math.max(x, min), max)
+                inner_call = None
+                max_val = None
+
+                if isinstance(arg1, Call):
+                    _, _, fn = self._get_call_name(arg1)
+                    if fn == 'math.max' and len(arg1.args) == 2:
+                        inner_call = arg1
+                        max_val = node_to_string(arg2)
+
+                if not inner_call and isinstance(arg2, Call):
+                    _, _, fn = self._get_call_name(arg2)
+                    if fn == 'math.max' and len(arg2.args) == 2:
+                        inner_call = arg2
+                        max_val = node_to_string(arg1)
+
+                if inner_call:
+                    a = inner_call.args[0]
+                    b = inner_call.args[1]
+
+                    # Try to identify which one is the value and which is the min_val
+                    # If one is a number, it's likely the min_val
+                    if isinstance(a, Number) and not isinstance(b, Number):
+                        min_val = node_to_string(a)
+                        x = node_to_string(b)
+                    else:
+                        x = node_to_string(a)
+                        min_val = node_to_string(b)
+
+                    replacement = f"clamp({x}, {min_val}, {max_val})"
+                    self.findings.append(Finding(
+                        pattern_name='math_clamp_suggestion',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'Suggest using clamp: math.min(math.max({x}, {min_val}), {max_val}) -> {replacement}',
+                        details={
+                            'node': call.node,
+                            'replacement': replacement
+                        },
+                        source_line=self._get_source_line(call.line),
+                    ))
+
+    def _analyze_vector_arithmetic_in_loop(self):
+        """Warn about vector arithmetic (+, -, *) in loops as they create garbage."""
+        if not self._ast_tree: return
+
+        # We need to use a visitor or walk the AST
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (AddOp, SubOp, MultOp)):
+                # find current depth
+                # Actually we can just check if we are inside any loop
+                # The walk doesn't give us current scope/depth easily
+                # but we can check parent_map to see if any ancestor is a loop
+                curr = node
+                in_loop = False
+                while curr:
+                    curr = self.parent_map.get(id(curr))
+                    if isinstance(curr, (While, Repeat, Fornum, Forin)):
+                        in_loop = True
+                        break
+
+                if in_loop:
+                    l_type = self._infer_type(node.left)
+                    r_type = self._infer_type(node.right)
+
+                    if l_type == 'vector' or r_type == 'vector':
+                        self.findings.append(Finding(
+                            pattern_name='vector_arithmetic_in_loop',
+                            severity='RED',
+                            line_num=self._get_line(node),
+                            message='Vector arithmetic in loop creates garbage - use :add(), :sub(), :mul() or :set() to reuse vectors',
+                            details={'node': node},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
 
     def _analyze_luajit_nyi(self):
         """Find LuaJIT NYI functions in hot callbacks or loops."""
@@ -4277,7 +4369,7 @@ class ASTAnalyzer:
         # - :id() returns stored Props.net_ID member (xr_object.h:98)
         # - :clsid() returns stored m_script_clsid member (GameObject.h:257)
         # - :story_id() returns m_story_id set once from config (xrServer_Objects_ALife.cpp:375)
-        cacheable_methods = {'section', 'id', 'clsid', 'story_id'}
+        cacheable_methods = {'section', 'id', 'clsid', 'story_id', 'position', 'direction', 'level_vertex_id', 'game_vertex_id'}
 
         # group by function scope
         scope_calls: Dict[Scope, Dict[str, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
