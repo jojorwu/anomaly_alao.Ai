@@ -40,17 +40,23 @@ CACHEABLE_MODULE_FUNCS: Dict[str, Set[str]] = {
     'math': frozenset({
         'floor', 'ceil', 'abs', 'min', 'max', 'sqrt', 'sin', 'cos', 'tan',
         'random', 'pow', 'log', 'exp', 'atan2', 'atan', 'asin', 'acos',
-        'deg', 'rad', 'fmod', 'modf', 'huge',
+        'deg', 'rad', 'fmod', 'modf', 'huge', 'log10', 'sinh', 'cosh', 'tanh',
     }),
     'string': frozenset({
         'find', 'sub', 'gsub', 'match', 'gmatch', 'format',
         'lower', 'upper', 'len', 'rep', 'byte', 'char', 'reverse',
     }),
     'table': frozenset({
-        'insert', 'remove', 'concat', 'sort', 'getn', 'unpack',
+        'insert', 'remove', 'concat', 'sort', 'getn', 'unpack', 'clear', 'new',
     }),
     'bit': frozenset({
         'band', 'bor', 'bxor', 'bnot', 'lshift', 'rshift', 'arshift', 'rol', 'ror',
+    }),
+    'db': frozenset({
+        'actor', 'storage',
+    }),
+    'level': frozenset({
+        'name', 'get_target_obj', 'object_by_id', 'id', 'vertex_id',
     }),
 }
 

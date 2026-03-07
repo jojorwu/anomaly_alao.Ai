@@ -245,5 +245,70 @@ class TestNewOptimizations(unittest.TestCase):
         self.assertTrue(modified)
         self.assertIn("string.char(string.byte(s))", new_content)
 
+    def test_inplace_vector_op(self):
+        script = """
+        function test()
+            local v = vector()
+            local d = vector()
+            for i=1, 10 do
+                v = v + d
+            end
+        end
+        """
+        path = self.test_dir / "vadd.lua"
+        path.write_text(script)
+
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("v:add(d)", new_content)
+
+    def test_table_emptiness(self):
+        script = """
+        function test()
+            local t = {}
+            if #t == 0 then
+                return
+            end
+        end
+        """
+        path = self.test_dir / "empty.lua"
+        path.write_text(script)
+
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("next(t) == nil", new_content)
+
+    def test_loop_invariant_global_hoist(self):
+        script = """
+        function test()
+            for i=1, 10 do
+                local a = db.actor:position()
+            end
+        end
+        """
+        path = self.test_dir / "hoist.lua"
+        path.write_text(script)
+
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("local actor = db.actor", new_content)
+        self.assertIn("actor:position()", new_content)
+
+    def test_math_max_comparison(self):
+        script = "if math.max(a, b) == a then end"
+        path = self.test_dir / "maxcomp.lua"
+        path.write_text(script)
+
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'math_identity' and 'a >= b' in f.message for f in findings))
+
+    def test_logical_identity_expansion(self):
+        script = "if x ~= nil and x ~= false then end"
+        path = self.test_dir / "logic.lua"
+        path.write_text(script)
+
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'logical_identity' and f.details.get('replacement') == 'x' for f in findings))
+
 if __name__ == "__main__":
     unittest.main()

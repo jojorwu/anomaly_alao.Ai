@@ -2238,8 +2238,18 @@ class ASTAnalyzer:
                     elif isinstance(left.right, Name) and isinstance(left.left, Nil):
                         var_name = left.right.id
 
-                # and x
-                if var_name and isinstance(right, Name) and right.id == var_name:
+                # and x  OR  and x ~= false
+                target_var = None
+                if var_name:
+                    if isinstance(right, Name) and right.id == var_name:
+                        target_var = var_name
+                    elif isinstance(right, NotEqToOp):
+                        if isinstance(right.left, Name) and isinstance(right.right, FalseExpr) and right.left.id == var_name:
+                            target_var = var_name
+                        elif isinstance(right.right, Name) and isinstance(right.left, FalseExpr) and right.right.id == var_name:
+                            target_var = var_name
+
+                if target_var:
                     # check if it's in a boolean context
                     is_bool_context = False
                     parent = self.parent_map.get(id(node))
@@ -2253,10 +2263,10 @@ class ASTAnalyzer:
                             pattern_name='logical_identity',
                             severity='GREEN',
                             line_num=self._get_line(node),
-                            message=f'Redundant check: {var_name} ~= nil and {var_name} -> {var_name}',
+                            message=f'Redundant check: {node_to_string(node)} -> {target_var}',
                             details={
                                 'node': node,
-                                'replacement': var_name
+                                'replacement': target_var
                             },
                             source_line=self._get_source_line(self._get_line(node)),
                         ))
@@ -3080,6 +3090,46 @@ class ASTAnalyzer:
 
     def _analyze_math_min_max(self):
         """Find math.min(a, b) and math.max(a, b) with simple arguments."""
+        if not self._ast_tree: return
+
+        # Check for math.max(a, b) == a etc
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp)):
+                call = None
+                other = None
+                if isinstance(node.left, Call) and self._is_simple_expr(node.right):
+                    call = node.left
+                    other = node.right
+                elif isinstance(node.right, Call) and self._is_simple_expr(node.left):
+                    call = node.right
+                    other = node.left
+
+                if call and len(call.args) == 2:
+                    _, _, fn = self._get_call_name(call)
+                    if fn in ('math.min', 'math.max'):
+                        a_str = node_to_string(call.args[0])
+                        b_str = node_to_string(call.args[1])
+                        other_str = node_to_string(other)
+
+                        target_var = None
+                        if other_str == a_str: target_var = a_str; other_val = b_str
+                        elif other_str == b_str: target_var = b_str; other_val = a_str
+
+                        if target_var:
+                            op = ">=" if fn == 'math.max' else "<="
+                            if isinstance(node, NotEqToOp):
+                                op = "<" if fn == 'math.max' else ">"
+
+                            replacement = f"{target_var} {op} {other_val}"
+                            self.findings.append(Finding(
+                                pattern_name='math_identity',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
+                                details={'node': node, 'replacement': replacement},
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+
         for call in self.calls:
             if call.full_name in ('math.min', 'math.max') and len(call.args) == 2:
                 arg1 = call.args[0]
@@ -4638,17 +4688,20 @@ class ASTAnalyzer:
         scope_calls: Dict[Scope, Dict[str, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
 
         for call in self.calls:
+            full_call_str = node_to_string(call.node)
+
             if call.full_name in expensive_calls:
+                # For alife(), db.actor etc, they are often used without args or with simple args.
+                # We only cache if the full call expression is identical.
                 func_scope = self._find_function_scope(call.scope)
                 if func_scope:
-                    scope_calls[func_scope][call.full_name].append(call)
+                    scope_calls[func_scope][full_call_str].append(call)
 
             # track cacheable method calls on objects (:section(), :id(), :clsid())
             if call.func in cacheable_methods and ':' in call.full_name:
                 func_scope = self._find_function_scope(call.scope)
                 if func_scope:
-                    key = f"{call.full_name}()"
-                    scope_calls[func_scope][key].append(call)
+                    scope_calls[func_scope][full_call_str].append(call)
 
         for func_scope, calls_by_name in scope_calls.items():
             for name, calls in calls_by_name.items():
