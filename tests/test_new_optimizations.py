@@ -245,9 +245,6 @@ class TestNewOptimizations(unittest.TestCase):
         self.assertTrue(modified)
         self.assertIn("string.char(string.byte(s))", new_content)
 
-if __name__ == "__main__":
-    unittest.main()
-
     def test_math_clamp_extended(self):
         # min(max(x, 0), 1) -> clamp(x, 0, 1)
         script = "local res = math.min(math.max(x, 0), 1)"
@@ -286,3 +283,32 @@ if __name__ == "__main__":
         path.write_text(script)
         findings = self.analyzer.analyze_file(path)
         self.assertTrue(any(f.pattern_name == 'repeated_member_access_in_loop' for f in findings))
+
+    def test_math_sqrt_comparisons(self):
+        # math.sqrt(x) > 0 -> x > 0
+        script = "if math.sqrt(x) > 0 then end"
+        path = self.test_dir / "sqrt_comp.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("if x > 0 then end", new_content)
+
+        # math.sqrt(x) >= 0 -> x >= 0
+        script = "if math.sqrt(x) >= 0 then end"
+        path = self.test_dir / "sqrt_comp2.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("if x >= 0 then end", new_content)
+
+    def test_bitwise_absorption(self):
+        # bit.bor(bit.band(x, y), x) -> x
+        script = "local a = bit.bor(bit.band(x, y), x)"
+        path = self.test_dir / "bit_absorb.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("local a = x", new_content)
+
+if __name__ == "__main__":
+    unittest.main()

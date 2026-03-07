@@ -60,6 +60,7 @@ class ASTAnalyzer:
         """Reset analyzer state for reuse."""
         self.findings: List[Finding] = []
         self.parent_map: Dict[int, Node] = {}
+        self.node_scopes: Dict[int, Scope] = {}
         self.comparisons: List[Tuple[Node, int]] = []
         self.exposures: List[Tuple[Node, int]] = []
         self.index_accesses: List[Tuple[Node, int, Scope, bool]] = []
@@ -390,9 +391,9 @@ class ASTAnalyzer:
             scope = scope.parent
         return None
 
-    def _find_local_key(self, name: str) -> Optional[Tuple[int, str]]:
+    def _find_local_key(self, name: str, start_scope: Optional[Scope] = None) -> Optional[Tuple[int, str]]:
         """Find the key (scope_id, name) for a local variable in scope chain."""
-        scope = self.current_scope
+        scope = start_scope or self.current_scope
         while scope:
             key = (id(scope), name)
             if key in self.local_vars:
@@ -430,6 +431,9 @@ class ASTAnalyzer:
         """Visit a node and dispatch to specific handler."""
         if node is None:
             return
+
+        # Record the scope of this node for later use in pattern analysis
+        self.node_scopes[id(node)] = self.current_scope
 
         handler = getattr(self, f'_visit_{type(node).__name__}', None)
         if handler:
@@ -795,7 +799,7 @@ class ASTAnalyzer:
                 return  # Only remove from innermost scope where it exists
             scope = scope.parent
 
-    def _infer_type(self, node: Node) -> Optional[str]:
+    def _infer_type(self, node: Node, scope: Optional[Scope] = None) -> Optional[str]:
         """Infer the Lua type of an expression node."""
         if isinstance(node, (Number, AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp, UMinusOp)):
             return 'number'
@@ -830,12 +834,22 @@ class ASTAnalyzer:
             method_name = node.func.id if isinstance(node.func, Name) else ""
             if method_name in ('position', 'direction', 'up', 'right', 'forward', 'set', 'add', 'sub', 'mul', 'div', 'normalize'):
                 return 'vector'
-            if self._infer_type(node.source) == 'vector' and method_name in ('set', 'add', 'sub', 'mul', 'div', 'normalize'):
+            if self._infer_type(node.source, scope) == 'vector' and method_name in ('set', 'add', 'sub', 'mul', 'div', 'normalize'):
                 return 'vector'
         if isinstance(node, Name):
-            key = self._find_local_key(node.id)
-            if key and key in self.active_assignments:
-                return self.active_assignments[key].inferred_type
+            node_scope = scope or self.node_scopes.get(id(node)) or self.current_scope
+            key = self._find_local_key(node.id, node_scope)
+            if key and key in self.local_vars:
+                info = self.local_vars[key]
+                # for Name nodes, we want the type of the last assignment BEFORE or ON this node's line
+                line = self._get_line(node)
+                best_type = None
+                for assign in info.assignments:
+                    if assign.line <= line:
+                        best_type = assign.inferred_type
+                    else:
+                        break
+                return best_type
         return None
 
     def _is_in_locals(self, name: str) -> bool:
@@ -1526,18 +1540,40 @@ class ASTAnalyzer:
                     elif op == GreaterOrEqThanOp: op = LessOrEqThanOp
                     elif op == LessOrEqThanOp: op = GreaterOrEqThanOp
 
-                if call and const_val == 0:
+                if call:
                     _, _, fn = self._get_call_name(call)
                     if fn == 'math.sqrt' and len(call.args) == 1:
                         x_str = node_to_string(call.args[0])
                         replacement = None
-                        if op in (EqToOp, LessOrEqThanOp): replacement = f"{x_str} == 0"
-                        elif op in (NotEqToOp, GreaterThanOp): replacement = f"{x_str} > 0"
+                        if const_val == 0:
+                            if op in (EqToOp, LessOrEqThanOp): replacement = f"{x_str} == 0"
+                            elif op in (NotEqToOp, GreaterThanOp): replacement = f"{x_str} > 0"
+                            elif op == GreaterOrEqThanOp: replacement = f"{x_str} >= 0"
+                            elif op == LessThanOp: replacement = "false"
+                        elif const_val > 0:
+                            # math.sqrt(x) op c -> x op c*c
+                            c2 = const_val * const_val
+                            if c2 == int(c2):
+                                c2_str = str(int(c2))
+                            else:
+                                c2_str = f"{c2:.6g}"
+
+                            op_map = {
+                                EqToOp: "==",
+                                NotEqToOp: "~=",
+                                LessThanOp: "<",
+                                LessOrEqThanOp: "<=",
+                                GreaterThanOp: ">",
+                                GreaterOrEqThanOp: ">="
+                            }
+                            replacement = f"{x_str} {op_map[op]} {c2_str}"
 
                         if replacement:
+                            # Use YELLOW severity for non-zero constants as it changes behavior for x < 0 (NaN)
+                            severity = 'GREEN' if const_val == 0 else 'YELLOW'
                             self.findings.append(Finding(
                                 pattern_name='math_identity',
-                                severity='GREEN',
+                                severity=severity,
                                 line_num=self._get_line(node),
                                 message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
                                 details={'node': node, 'replacement': replacement},
@@ -1648,6 +1684,51 @@ class ASTAnalyzer:
 
                 is_complement = (is_bnot_of(arg1, arg2) or is_bnot_of(arg2, arg1))
 
+                # Absorption laws
+                if call.full_name == 'bit.bor':
+                    inner_band = None
+                    other_arg = None
+                    if isinstance(arg1, Call):
+                        _, _, fn = self._get_call_name(arg1)
+                        if fn == 'bit.band':
+                            inner_band = arg1
+                            other_arg = arg2
+                    if not inner_band and isinstance(arg2, Call):
+                        _, _, fn = self._get_call_name(arg2)
+                        if fn == 'bit.band':
+                            inner_band = arg2
+                            other_arg = arg1
+
+                    if inner_band and len(inner_band.args) == 2:
+                        b1 = node_to_string(inner_band.args[0])
+                        b2 = node_to_string(inner_band.args[1])
+                        oa = node_to_string(other_arg)
+                        if (b1 == oa or b2 == oa) and self._is_simple_expr(other_arg):
+                            target = other_arg
+                            reason = "bit.bor(bit.band(x, y), x)"
+
+                elif call.full_name == 'bit.band':
+                    inner_bor = None
+                    other_arg = None
+                    if isinstance(arg1, Call):
+                        _, _, fn = self._get_call_name(arg1)
+                        if fn == 'bit.bor':
+                            inner_bor = arg1
+                            other_arg = arg2
+                    if not inner_bor and isinstance(arg2, Call):
+                        _, _, fn = self._get_call_name(arg2)
+                        if fn == 'bit.bor':
+                            inner_bor = arg2
+                            other_arg = arg1
+
+                    if inner_bor and len(inner_bor.args) == 2:
+                        b1 = node_to_string(inner_bor.args[0])
+                        b2 = node_to_string(inner_bor.args[1])
+                        oa = node_to_string(other_arg)
+                        if (b1 == oa or b2 == oa) and self._is_simple_expr(other_arg):
+                            target = other_arg
+                            reason = "bit.band(bit.bor(x, y), x)"
+
                 if call.full_name == 'bit.band':
                     if is_same: target = arg1; reason = "bit.band(x, x)"
                     elif val2 == 0 or val1 == 0: replacement = "0"; reason = "bit.band(x, 0)"
@@ -1720,6 +1801,40 @@ class ASTAnalyzer:
                             # math.abs(x) <= 0  or  math.abs(x) == 0  ->  x == 0
                             arg_str = node_to_string(call.args[0]) if call.args else "x"
                             replacement = f"{arg_str} == 0"
+
+                        if replacement:
+                            self.findings.append(Finding(
+                                pattern_name='logical_identity',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
+                                details={
+                                    'node': node,
+                                    'replacement': replacement
+                                },
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
+
+                    if full_name == 'math.abs' and const_val > 0:
+                        arg_str = node_to_string(call.args[0]) if call.args else "x"
+                        replacement = None
+                        if op == EqToOp:
+                            replacement = f"({arg_str} == {const_val} or {arg_str} == -{const_val})"
+                        elif op == NotEqToOp:
+                            replacement = f"({arg_str} ~= {const_val} and {arg_str} ~= -{const_val})"
+                        elif op == LessThanOp:
+                            replacement = f"({arg_str} > -{const_val} and {arg_str} < {const_val})"
+                        elif op == LessOrEqThanOp:
+                            replacement = f"({arg_str} >= -{const_val} and {arg_str} <= {const_val})"
+                        elif op == GreaterThanOp:
+                            replacement = f"({arg_str} < -{const_val} or {arg_str} > {const_val})"
+                        elif op == GreaterOrEqThanOp:
+                            replacement = f"({arg_str} <= -{const_val} or {arg_str} >= {const_val})"
+
+                        if replacement and not self._is_simple_expr(call.args[0]):
+                            # Only suggest if it's a simple variable to avoid double evaluation
+                            replacement = None
 
                         if replacement:
                             self.findings.append(Finding(
@@ -2201,127 +2316,67 @@ class ASTAnalyzer:
 
         for node in ast.walk(self._ast_tree):
             if isinstance(node, ops):
-                # If the whole node can be constant folded, skip algebraic simplification
+                # If the entire expression can be folded to a constant, skip algebraic rules
+                # to allow constant folding to handle it more efficiently.
                 if self._get_const_val(node) is not None:
                     continue
 
+                scope = self.node_scopes.get(id(node))
                 left_val = self._get_const_val(node.left)
                 right_val = self._get_const_val(node.right)
 
                 target = None
                 reason = None
+                replacement = None
 
                 if isinstance(node, AddOp):
                     if right_val == 0: target = node.left; reason = "x + 0"
                     elif left_val == 0: target = node.right; reason = "0 + x"
                     # x + -y -> x - y
                     elif isinstance(node.right, UMinusOp):
-                        x_str = node_to_string(node.left)
-                        y_str = node_to_string(node.right.operand)
-                        replacement = f"{x_str} - {y_str}"
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: {x_str} + -{y_str} -> {replacement}',
-                            details={'node': node, 'replacement': replacement},
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
-                        continue
+                        if not (isinstance(node.left, Number) and isinstance(node.right.operand, Number)):
+                            x_str = node_to_string(node.left)
+                            y_str = node_to_string(node.right.operand)
+                            replacement = f"{x_str} - {y_str}"
                     # -y + x -> x - y
                     elif isinstance(node.left, UMinusOp):
-                        x_str = node_to_string(node.right)
-                        y_str = node_to_string(node.left.operand)
-                        replacement = f"{x_str} - {y_str}"
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: -{y_str} + {x_str} -> {replacement}',
-                            details={'node': node, 'replacement': replacement},
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
-                        continue
+                        if not (isinstance(node.right, Number) and isinstance(node.left.operand, Number)):
+                            x_str = node_to_string(node.right)
+                            y_str = node_to_string(node.left.operand)
+                            replacement = f"{x_str} - {y_str}"
                 elif isinstance(node, SubOp):
                     if right_val == 0: target = node.left; reason = "x - 0"
                     # x - -y -> x + y
                     elif isinstance(node.right, UMinusOp):
-                        x_str = node_to_string(node.left)
-                        y_str = node_to_string(node.right.operand)
-                        replacement = f"{x_str} + {y_str}"
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: {x_str} - -{y_str} -> {replacement}',
-                            details={'node': node, 'replacement': replacement},
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
-                        continue
+                        if not (isinstance(node.left, Number) and isinstance(node.right.operand, Number)):
+                            x_str = node_to_string(node.left)
+                            y_str = node_to_string(node.right.operand)
+                            replacement = f"{x_str} + {y_str}"
                     elif left_val == 0:
                         target_str = node_to_string(node.right)
-                        # Add a space after the minus to avoid forming a comment if target_str starts with '-'
                         replacement = f"- {target_str}"
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: 0 - {target_str} -> - {target_str}',
-                            details={
-                                'target_node': None,
-                                'node': node,
-                                'replacement': replacement
-                            },
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
-                        continue
+                        reason = f"0 - {target_str}"
                     else:
                         s1 = node_to_string(node.left)
                         s2 = node_to_string(node.right)
-                        if s1 == s2 and self._is_simple_expr(node.left) and self._infer_type(node.left) == 'number':
-                            self.findings.append(Finding(
-                                pattern_name='algebraic_simplification',
-                                severity='GREEN',
-                                line_num=self._get_line(node),
-                                message=f'Algebraic simplification: {s1} - {s1} -> 0',
-                                details={
-                                    'target_node': None,
-                                    'node': node,
-                                    'replacement': '0'
-                                },
-                                source_line=self._get_source_line(self._get_line(node)),
-                            ))
-                            continue
+                        if s1 == s2 and self._is_simple_expr(node.left) and self._infer_type(node.left, scope) == 'number':
+                            replacement = '0'
+                            reason = f"{s1} - {s1}"
+
                 elif isinstance(node, Concat):
                     if right_val == "": target = node.left; reason = 's .. ""'
                     elif left_val == "": target = node.right; reason = '"" .. s'
                 elif isinstance(node, MultOp):
                     if right_val == 1: target = node.left; reason = "x * 1"
                     elif left_val == 1: target = node.right; reason = "1 * x"
-                    elif right_val == -1:
+                    elif right_val == -1 and not isinstance(node.left, Number):
                         target_str = node_to_string(node.left)
                         replacement = f"- {target_str}"
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: {target_str} * -1 -> {replacement}',
-                            details={'node': node, 'replacement': replacement},
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
-                        continue
-                    elif left_val == -1:
+                        reason = f"{target_str} * -1"
+                    elif left_val == -1 and not isinstance(node.right, Number):
                         target_str = node_to_string(node.right)
                         replacement = f"- {target_str}"
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: -1 * {target_str} -> {replacement}',
-                            details={'node': node, 'replacement': replacement},
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
-                        continue
+                        reason = f"-1 * {target_str}"
                     elif isinstance(node.left, Call) and isinstance(node.right, Call):
                         _, _, f1 = self._get_call_name(node.left)
                         _, _, f2 = self._get_call_name(node.right)
@@ -2330,140 +2385,140 @@ class ASTAnalyzer:
                             s2 = node_to_string(node.right.args[0])
                             if s1 == s2 and self._is_simple_expr(node.left.args[0]):
                                 replacement = f"{s1} * {s1}"
-                                self.findings.append(Finding(
-                                    pattern_name='algebraic_simplification',
-                                    severity='GREEN',
-                                    line_num=self._get_line(node),
-                                    message=f'Algebraic simplification: math.abs({s1}) * math.abs({s1}) -> {replacement}',
-                                    details={
-                                        'target_node': None,
-                                        'node': node,
-                                        'replacement': replacement
-                                    },
-                                    source_line=self._get_source_line(self._get_line(node)),
-                                ))
-                                continue
-                    elif right_val == 0:
-                        if self._infer_type(node.left) == 'number':
-                            self.findings.append(Finding(
-                                pattern_name='algebraic_simplification',
-                                severity='GREEN',
-                                line_num=self._get_line(node),
-                                message=f'Algebraic simplification: x * 0 -> 0',
-                                details={
-                                    'target_node': None,
-                                    'node': node,
-                                    'replacement': '0'
-                                },
-                                source_line=self._get_source_line(self._get_line(node)),
-                            ))
-                            continue
-                    elif left_val == 0:
-                        if self._infer_type(node.right) == 'number':
-                            self.findings.append(Finding(
-                                pattern_name='algebraic_simplification',
-                                severity='GREEN',
-                                line_num=self._get_line(node),
-                                message=f'Algebraic simplification: 0 * x -> 0',
-                                details={
-                                    'target_node': None,
-                                    'node': node,
-                                    'replacement': '0'
-                                },
-                                source_line=self._get_source_line(self._get_line(node)),
-                            ))
-                            continue
+                                reason = f"math.abs({s1}) * math.abs({s1})"
+                    elif right_val == 0 or left_val == 0:
+                        non_const = node.left if right_val == 0 else node.right
+                        if self._infer_type(non_const, scope) == 'number':
+                            replacement = '0'
+                            reason = "x * 0"
+
                 elif isinstance(node, FloatDivOp):
                     if right_val == 1: target = node.left; reason = "x / 1"
-                    elif right_val == -1:
+                    elif right_val == -1 and not isinstance(node.left, Number):
                         target_str = node_to_string(node.left)
                         replacement = f"- {target_str}"
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: {target_str} / -1 -> {replacement}',
-                            details={'node': node, 'replacement': replacement},
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
-                        continue
+                        reason = f"{target_str} / -1"
+                    elif left_val == 0:
+                        if self._infer_type(node.right, scope) == 'number':
+                            replacement = '0'
+                            reason = "0 / x"
                     else:
                         s1 = node_to_string(node.left)
                         s2 = node_to_string(node.right)
-                        if s1 == s2 and self._is_simple_expr(node.left) and self._infer_type(node.left) == 'number':
-                            # Check if value is not zero to avoid 0/0
+                        if s1 == s2 and self._is_simple_expr(node.left) and self._infer_type(node.left, scope) == 'number':
                             val = self._get_const_val(node.left)
                             if val != 0:
-                                self.findings.append(Finding(
-                                    pattern_name='algebraic_simplification',
-                                    severity='GREEN',
-                                    line_num=self._get_line(node),
-                                    message=f'Algebraic simplification: {s1} / {s1} -> 1',
-                                    details={
-                                        'target_node': None,
-                                        'node': node,
-                                        'replacement': '1'
-                                    },
-                                    source_line=self._get_source_line(self._get_line(node)),
-                                ))
-                                continue
-                    if left_val == 0:
-                        if self._infer_type(node.right) == 'number':
-                            self.findings.append(Finding(
-                                pattern_name='algebraic_simplification',
-                                severity='GREEN',
-                                line_num=self._get_line(node),
-                                message=f'Algebraic simplification: 0 / x -> 0',
-                                details={
-                                    'target_node': None,
-                                    'node': node,
-                                    'replacement': '0'
-                                },
-                                source_line=self._get_source_line(self._get_line(node)),
-                            ))
-                            continue
+                                replacement = '1'
+                                reason = f"{s1} / {s1}"
+
                 elif isinstance(node, ExpoOp):
                     if right_val == 1: target = node.left; reason = "x ^ 1"
                     elif right_val == 0:
-                        # x ^ 0 is always 1 in Lua, even for 0 ^ 0
+                        replacement = '1'
+                        reason = "x ^ 0"
+
+                # If we have a target or a replacement string, generate a finding
+                if target or replacement:
+                    if target:
+                        # Type safety check for simple targets (x + 0 -> x)
+                        is_safe = False
+                        if isinstance(node, (AddOp, SubOp, MultOp, FloatDivOp, ExpoOp)):
+                            if self._infer_type(target, scope) == 'number':
+                                is_safe = True
+                        elif isinstance(node, Concat):
+                            if self._infer_type(target, scope) == 'string':
+                                is_safe = True
+
+                        if is_safe:
+                            replacement = node_to_string(target)
+                        else:
+                            replacement = None
+
+                    if replacement:
                         self.findings.append(Finding(
                             pattern_name='algebraic_simplification',
                             severity='GREEN',
                             line_num=self._get_line(node),
-                            message=f'Algebraic simplification: x ^ 0 -> 1',
+                            message=f'Algebraic simplification: {reason} -> {replacement}',
                             details={
-                                'target_node': None,
                                 'node': node,
-                                'replacement': '1'
+                                'replacement': replacement
                             },
                             source_line=self._get_source_line(self._get_line(node)),
                         ))
                         continue
 
-                if target:
-                    # Type safety checks
-                    is_safe = False
-                    if isinstance(node, (AddOp, SubOp, MultOp, FloatDivOp, ExpoOp)):
-                        if self._infer_type(target) == 'number':
-                            is_safe = True
-                    elif isinstance(node, Concat):
-                        if self._infer_type(target) == 'string':
-                            is_safe = True
+                # math.log identities (division)
+                if isinstance(node, FloatDivOp):
+                    if isinstance(node.left, Call):
+                        _, _, f1 = self._get_call_name(node.left)
+                        if f1 == 'math.log' and len(node.left.args) == 1:
+                            is_log2 = False
+                            if isinstance(node.right, Call):
+                                _, _, f2 = self._get_call_name(node.right)
+                                if f2 == 'math.log' and len(node.right.args) == 1:
+                                    val = self._get_const_val(node.right.args[0])
+                                    if val == 2 or node_to_string(node.right.args[0]) == "2":
+                                        is_log2 = True
 
-                    if is_safe:
-                        target_str = node_to_string(target)
-                        self.findings.append(Finding(
-                            pattern_name='algebraic_simplification',
-                            severity='GREEN',
-                            line_num=self._get_line(node),
-                            message=f'Algebraic simplification: {reason} -> {target_str}',
-                            details={
-                                'target_node': target,
-                                'node': node,
-                                'replacement': target_str
-                            },
-                            source_line=self._get_source_line(self._get_line(node)),
-                        ))
+                            if not is_log2:
+                                val = self._get_const_val(node.right)
+                                if val is not None and isinstance(val, (int, float)) and abs(val - 0.6931471805599453) < 1e-6:
+                                    is_log2 = True
+
+                            if is_log2:
+                                x_str = node_to_string(node.left.args[0])
+                                replacement = f"math.log({x_str}, 2)"
+                                self.findings.append(Finding(
+                                    pattern_name='algebraic_simplification',
+                                    severity='GREEN',
+                                    line_num=self._get_line(node),
+                                    message=f'math.log(x) / math.log(2) -> math.log(x, 2)',
+                                    details={'node': node, 'replacement': replacement},
+                                    source_line=self._get_source_line(self._get_line(node)),
+                                ))
+                                continue
+
+                # math.log identities (multiplication)
+                if isinstance(node, MultOp):
+                    log_node = None
+                    const_val = None
+
+                    if isinstance(node.left, Call):
+                        _, _, fn = self._get_call_name(node.left)
+                        if fn == 'math.log' and len(node.left.args) == 1:
+                            log_node = node.left
+                            const_val = self._get_const_val(node.right)
+
+                    if not log_node and isinstance(node.right, Call):
+                        _, _, fn = self._get_call_name(node.right)
+                        if fn == 'math.log' and len(node.right.args) == 1:
+                            log_node = node.right
+                            const_val = self._get_const_val(node.left)
+
+                    if log_node and const_val is not None:
+                        replacement = None
+                        reason = None
+
+                        if abs(const_val - 0.4342944819032518) < 1e-6:
+                            x_str = node_to_string(log_node.args[0])
+                            replacement = f"math.log10({x_str})"
+                            reason = f"math.log(x) * {const_val:.6g} -> math.log10(x)"
+                        elif abs(const_val - 1.4426950408889634) < 1e-6:
+                            x_str = node_to_string(log_node.args[0])
+                            replacement = f"math.log({x_str}, 2)"
+                            reason = f"math.log(x) * {const_val:.6g} -> math.log(x, 2)"
+
+                        if replacement:
+                            self.findings.append(Finding(
+                                pattern_name='algebraic_simplification',
+                                severity='GREEN',
+                                line_num=self._get_line(node),
+                                message=reason,
+                                details={'node': node, 'replacement': replacement},
+                                source_line=self._get_source_line(self._get_line(node)),
+                            ))
+                            continue
 
         # Check for table.concat(t, "") -> table.concat(t)
         for call in self.calls:
@@ -4234,12 +4289,12 @@ class ASTAnalyzer:
             return self._is_simple_expr(node.value) and self._is_simple_expr(node.idx)
         return False
 
-    def _is_guaranteed_truthy(self, node: Node) -> bool:
+    def _is_guaranteed_truthy(self, node: Node, scope: Optional[Scope] = None) -> bool:
         """Check if node is guaranteed to be truthy in Lua."""
         if isinstance(node, (Number, String, TrueExpr, Table, Function, LocalFunction)):
             return True
         # also check inferred type
-        inferred = self._infer_type(node)
+        inferred = self._infer_type(node, scope)
         if inferred in ('number', 'string', 'table', 'function'):
             return True
         return False
