@@ -247,6 +247,8 @@ class ASTTransformer:
             self._edit_table_emptiness_check(finding)
         elif pattern == 'loop_invariant_global':
             self._edit_loop_invariant_global(finding)
+        elif pattern == 'vector_mad':
+            self._edit_vector_mad(finding)
         elif pattern in ('table_clear_pattern', 'assignment_ternary_simplification', 'redundant_string_format'):
             self._edit_algebraic_simplification(finding)
 
@@ -1268,6 +1270,24 @@ class ASTTransformer:
             end_char=end,
             replacement=replacement,
             priority=priority,
+        ))
+
+    def _edit_vector_mad(self, finding: Finding):
+        """Replace v = v + v2 * s with v:mad(v2, s)."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=25 # Higher priority than general inplace_vector_op
         ))
 
     def _edit_algebraic_simplification(self, finding: Finding):

@@ -353,5 +353,20 @@ class TestNewOptimizations(unittest.TestCase):
         self.assertTrue(modified)
         self.assertIn('local s = "hela-b"', new_content)
 
+    def test_vector_mad(self):
+        script = "function test() local v = vector() local v2 = vector() v = v + v2 * 0.5 end"
+        path = self.test_dir / "mad.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("v:mad(v2, 0.5)", new_content)
+
+    def test_function_in_loop(self):
+        script = "for i=1, 10 do local function f() end end"
+        path = self.test_dir / "func_loop.lua"
+        path.write_text(script)
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'function_in_loop' for f in findings))
+
 if __name__ == "__main__":
     unittest.main()

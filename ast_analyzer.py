@@ -1565,6 +1565,80 @@ class ASTAnalyzer:
         self._analyze_loop_invariant_globals()
         self._analyze_table_clear_pattern()
         self._analyze_assignment_ternary()
+        self._analyze_function_in_loop()
+        self._analyze_vector_mad()
+
+    def _analyze_vector_mad(self):
+        """Find v = v + v2 * s and suggest v:mad(v2, s)."""
+        for assign in self.assigns:
+            if assign.value_type == 'other' and isinstance(assign.node, AddOp):
+                target = assign.target
+                op_node = assign.node
+
+                # Check for v = v + ...
+                if node_to_string(op_node.left) != target:
+                    continue
+
+                # Check if target is a vector
+                if self._infer_type(op_node.left, assign.scope) != 'vector':
+                    continue
+
+                # Check for v2 * s or v2 / s
+                inner = op_node.right
+                v2_str = None
+                s_str = None
+
+                if isinstance(inner, MultOp):
+                    # Check if one of them is a vector and other is a number
+                    t1 = self._infer_type(inner.left, assign.scope)
+                    t2 = self._infer_type(inner.right, assign.scope)
+
+                    if t1 == 'vector' and t2 == 'number':
+                        v2_str = node_to_string(inner.left)
+                        s_str = node_to_string(inner.right)
+                    elif t2 == 'vector' and t1 == 'number':
+                        v2_str = node_to_string(inner.right)
+                        s_str = node_to_string(inner.left)
+
+                if v2_str and s_str:
+                    full_assign = self.parent_map.get(id(op_node))
+                    if isinstance(full_assign, Assign):
+                        replacement = f"{target}:mad({v2_str}, {s_str})"
+                        self.findings.append(Finding(
+                            pattern_name='vector_mad',
+                            severity='YELLOW',
+                            line_num=assign.line,
+                            message=f'Vector Multiply-and-Add: {node_to_string(full_assign)} -> {replacement}',
+                            details={'node': full_assign, 'replacement': replacement},
+                            source_line=self._get_source_line(assign.line),
+                        ))
+
+    def _analyze_function_in_loop(self):
+        """Find function definitions inside loops."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (Function, LocalFunction)):
+                # check if any parent is a loop
+                curr = node
+                loop_node = None
+                while curr:
+                    curr = self.parent_map.get(id(curr))
+                    if isinstance(curr, (While, Repeat, Fornum, Forin)):
+                        loop_node = curr
+                        break
+                    # stop if we hit another function (nested functions are okay if outer is not in loop)
+                    if isinstance(curr, (Function, LocalFunction, Method)):
+                        break
+
+                if loop_node:
+                    self.findings.append(Finding(
+                        pattern_name='function_in_loop',
+                        severity='RED',
+                        line_num=self._get_line(node),
+                        message='Function defined inside loop - move outside to avoid redundant allocations',
+                        details={'node': node},
+                        source_line=self._get_source_line(self._get_line(node)),
+                    ))
 
     def _analyze_assignment_ternary(self):
         """Find if cond then x = a else x = b end and suggest ternary."""
