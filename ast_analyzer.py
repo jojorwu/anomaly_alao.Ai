@@ -1433,6 +1433,9 @@ class ASTAnalyzer:
 
     def _analyze_patterns(self):
         """Analyze collected data and generate findings."""
+        self._analyze_inplace_vector_ops()
+        self._analyze_string_concat_tostring()
+        self._analyze_string_byte_range()
         self._analyze_table_insert()
         self._analyze_table_remove()
         self._analyze_deprecated_funcs()
@@ -1494,12 +1497,68 @@ class ASTAnalyzer:
         self._analyze_bit_identity()
         self._analyze_string_find_args()
         self._analyze_math_sqrt_pow()
+        self._analyze_comparison_identities()
         self._analyze_table_concat_single()
         self._analyze_math_clamp()
         self._analyze_vector_arithmetic_in_loop()
         self._analyze_table_emptiness()
-        self._analyze_inplace_vector_ops()
         self._analyze_loop_invariant_globals()
+
+    def _analyze_string_concat_tostring(self):
+        """Find s .. tostring(n) and suggest s .. n for numbers."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, Concat):
+                target_arg = None
+                if isinstance(node.right, Call):
+                    _, _, fn = self._get_call_name(node.right)
+                    if fn == 'tostring' and len(node.right.args) == 1:
+                        target_arg = node.right.args[0]
+                        side = 'right'
+                elif isinstance(node.left, Call):
+                    _, _, fn = self._get_call_name(node.left)
+                    if fn == 'tostring' and len(node.left.args) == 1:
+                        target_arg = node.left.args[0]
+                        side = 'left'
+
+                if target_arg:
+                    if self._infer_type(target_arg, self.node_scopes.get(id(target_arg))) == 'number':
+                        arg_str = node_to_string(target_arg)
+                        other_side = node.left if side == 'right' else node.right
+                        other_str = node_to_string(other_side)
+
+                        if side == 'right':
+                            replacement = f"{other_str} .. {arg_str}"
+                        else:
+                            replacement = f"{arg_str} .. {other_str}"
+
+                        self.findings.append(Finding(
+                            pattern_name='string_concat_tostring',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Redundant tostring in concatenation: {node_to_string(node)} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_string_byte_range(self):
+        """Find string.byte(s, i, i) and suggest string.byte(s, i)."""
+        for call in self.calls:
+            if call.full_name == 'string.byte' and len(call.args) == 3:
+                i_str = node_to_string(call.args[1])
+                j_str = node_to_string(call.args[2])
+
+                if i_str == j_str:
+                    s_str = node_to_string(call.args[0])
+                    replacement = f"string.byte({s_str}, {i_str})"
+                    self.findings.append(Finding(
+                        pattern_name='string_byte_range',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message=f'Redundant range in string.byte: {node_to_string(call.node)} -> {replacement}',
+                        details={'node': call.node, 'replacement': replacement},
+                        source_line=self._get_source_line(call.line),
+                    ))
 
     def _analyze_table_emptiness(self):
         """Find #t == 0 and suggest next(t) == nil for general tables."""
@@ -1538,35 +1597,49 @@ class ASTAnalyzer:
     def _analyze_inplace_vector_ops(self):
         """Find v = v + d and suggest v:add(d) for vector performance."""
         for assign in self.assigns:
-            if assign.value_type == 'other' and isinstance(assign.node, (AddOp, SubOp, MultOp)):
+            if assign.value_type == 'other':
                 target = assign.target
                 op_node = assign.node
 
-                left_str = node_to_string(op_node.left)
-                if left_str == target and self._infer_type(op_node.left, assign.scope) == 'vector':
-                    method = None
-                    if isinstance(op_node, AddOp): method = "add"
-                    elif isinstance(op_node, SubOp): method = "sub"
-                    elif isinstance(op_node, MultOp): method = "mul"
+                replacement = None
+                reason = ""
 
-                    if method:
-                        arg_str = node_to_string(op_node.right)
-                        replacement = f"{target}:{method}({arg_str})"
+                if isinstance(op_node, (AddOp, SubOp, MultOp, FloatDivOp)):
+                    left_str = node_to_string(op_node.left)
+                    if left_str == target and self._infer_type(op_node.left, assign.scope) == 'vector':
+                        method = None
+                        if isinstance(op_node, AddOp): method = "add"
+                        elif isinstance(op_node, SubOp): method = "sub"
+                        elif isinstance(op_node, MultOp): method = "mul"
+                        elif isinstance(op_node, FloatDivOp): method = "div"
 
-                        # We need the full assignment node for replacement
-                        full_assign_node = self.parent_map.get(id(op_node))
-                        if full_assign_node and isinstance(full_assign_node, (Assign, LocalAssign)):
-                            # MARK AS YELLOW: in-place modification changes reference semantics!
-                            # Original: v = v + d (creates new vector, original v unchanged)
-                            # Replacement: v:add(d) (modifies v in-place, affecting all references to it)
-                            self.findings.append(Finding(
-                                pattern_name='inplace_vector_op',
-                                severity='YELLOW',
-                                line_num=assign.line,
-                                message=f'In-place vector operation: {target} = {target} {node_to_string(op_node).split()[1]} {arg_str} -> {replacement} (Note: modifies vector in-place)',
-                                details={'node': full_assign_node, 'replacement': replacement},
-                                source_line=self._get_source_line(assign.line),
-                            ))
+                        if method:
+                            arg_str = node_to_string(op_node.right)
+                            replacement = f"{target}:{method}({arg_str})"
+                            reason = f"{target} = {target} {node_to_string(op_node).split()[1]} {arg_str}"
+
+                elif isinstance(op_node, UMinusOp):
+                    operand_str = node_to_string(op_node.operand)
+                    if operand_str == target and self._infer_type(op_node.operand, assign.scope) == 'vector':
+                        replacement = f"{target}:mul(-1)"
+                        reason = f"{target} = -{target}"
+
+                if replacement:
+                    # We need the full assignment node for replacement
+                    full_assign_node = self.parent_map.get(id(op_node))
+                    # Only target Assign (not LocalAssign) to avoid scope breaks
+                    if full_assign_node and isinstance(full_assign_node, Assign):
+                        # MARK AS YELLOW: in-place modification changes reference semantics!
+                        # Original: v = v + d (creates new vector, original v unchanged)
+                        # Replacement: v:add(d) (modifies v in-place, affecting all references to it)
+                        self.findings.append(Finding(
+                            pattern_name='inplace_vector_op',
+                            severity='YELLOW',
+                            line_num=assign.line,
+                            message=f'In-place vector operation: {node_to_string(full_assign_node)} -> {replacement} (Note: modifies vector in-place)',
+                            details={'node': full_assign_node, 'replacement': replacement},
+                            source_line=self._get_source_line(assign.line),
+                        ))
 
     def _analyze_loop_invariant_globals(self):
         """Identify globals accessed in loops that could be hoisted."""
@@ -1657,6 +1730,19 @@ class ASTAnalyzer:
                     if self._find_local_key(local_name, loop_scope):
                         is_safe = False
 
+                    # Also check for redefinitions inside the loop body
+                    if is_safe:
+                        for inner_node in ast.walk(loop_node):
+                            if isinstance(inner_node, (Assign, LocalAssign)):
+                                for target in inner_node.targets:
+                                    if isinstance(target, Name) and target.id == local_name:
+                                        is_safe = False
+                                        break
+                            elif isinstance(inner_node, (Function, LocalFunction, Method)):
+                                # Skip nested functions
+                                continue
+                            if not is_safe: break
+
                 if is_safe:
                     self.findings.append(Finding(
                         pattern_name='loop_invariant_global',
@@ -1712,7 +1798,8 @@ class ASTAnalyzer:
                     ))
                     continue
 
-        # Detect math.sqrt(x) == 0 -> x == 0 and math.sqrt(x) > 0 -> x > 0
+    def _analyze_comparison_identities(self):
+        """Find redundant or simplifiable comparisons."""
         if not self._ast_tree: return
         for node in ast.walk(self._ast_tree):
             if isinstance(node, (EqToOp, NotEqToOp, GreaterThanOp, GreaterOrEqThanOp, LessThanOp, LessOrEqThanOp)):
@@ -1720,57 +1807,76 @@ class ASTAnalyzer:
                 const_val = None
                 op = type(node)
 
-                if isinstance(node.left, Call) and isinstance(node.right, Number):
+                l_val = self._get_const_val(node.left)
+                r_val = self._get_const_val(node.right)
+
+                if isinstance(node.left, Call) and r_val is not None and isinstance(r_val, (int, float)):
                     call = node.left
-                    const_val = node.right.n
-                elif isinstance(node.right, Call) and isinstance(node.left, Number):
+                    const_val = r_val
+                elif isinstance(node.right, Call) and l_val is not None and isinstance(l_val, (int, float)):
                     call = node.right
-                    const_val = node.left.n
+                    const_val = l_val
                     # Swap op for right-side calls
-                    if op == GreaterThanOp: op = LessThanOp
-                    elif op == LessThanOp: op = GreaterThanOp
-                    elif op == GreaterOrEqThanOp: op = LessOrEqThanOp
-                    elif op == LessOrEqThanOp: op = GreaterOrEqThanOp
+                    op_swap = {
+                        GreaterThanOp: LessThanOp,
+                        LessThanOp: GreaterThanOp,
+                        GreaterOrEqThanOp: LessOrEqThanOp,
+                        LessOrEqThanOp: GreaterOrEqThanOp,
+                        EqToOp: EqToOp,
+                        NotEqToOp: NotEqToOp
+                    }
+                    op = op_swap[op]
 
                 if call:
                     _, _, fn = self._get_call_name(call)
-                    if fn == 'math.sqrt' and len(call.args) == 1:
-                        x_str = node_to_string(call.args[0])
-                        replacement = None
+                    arg_node = call.args[0] if call.args else None
+                    if not arg_node: continue
+                    x_str = node_to_string(arg_node)
+
+                    replacement = None
+                    severity = 'GREEN'
+
+                    if fn == 'math.sqrt':
                         if const_val == 0:
                             if op in (EqToOp, LessOrEqThanOp): replacement = f"{x_str} == 0"
                             elif op in (NotEqToOp, GreaterThanOp): replacement = f"{x_str} > 0"
                             elif op == GreaterOrEqThanOp: replacement = f"{x_str} >= 0"
                             elif op == LessThanOp: replacement = "false"
                         elif const_val > 0:
-                            # math.sqrt(x) op c -> x op c*c
                             c2 = const_val * const_val
-                            if c2 == int(c2):
-                                c2_str = str(int(c2))
-                            else:
-                                c2_str = f"{c2:.6g}"
-
-                            op_map = {
-                                EqToOp: "==",
-                                NotEqToOp: "~=",
-                                LessThanOp: "<",
-                                LessOrEqThanOp: "<=",
-                                GreaterThanOp: ">",
-                                GreaterOrEqThanOp: ">="
-                            }
+                            c2_str = str(int(c2)) if c2 == int(c2) else f"{c2:.6g}"
+                            op_map = {EqToOp: "==", NotEqToOp: "~=", LessThanOp: "<", LessOrEqThanOp: "<=", GreaterThanOp: ">", GreaterOrEqThanOp: ">="}
                             replacement = f"{x_str} {op_map[op]} {c2_str}"
+                            severity = 'YELLOW'
 
-                        if replacement:
-                            # Use YELLOW severity for non-zero constants as it changes behavior for x < 0 (NaN)
-                            severity = 'GREEN' if const_val == 0 else 'YELLOW'
-                            self.findings.append(Finding(
-                                pattern_name='math_identity',
-                                severity=severity,
-                                line_num=self._get_line(node),
-                                message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
-                                details={'node': node, 'replacement': replacement},
-                                source_line=self._get_source_line(self._get_line(node)),
-                            ))
+                    elif fn == 'math.abs':
+                        if const_val == 0:
+                            if op == GreaterOrEqThanOp: replacement = "true"
+                            elif op == LessThanOp: replacement = "false"
+                            elif op in (GreaterThanOp, NotEqToOp): replacement = f"{x_str} ~= 0"
+                            elif op in (LessOrEqThanOp, EqToOp): replacement = f"{x_str} == 0"
+                        elif const_val < 0:
+                            if op in (GreaterThanOp, GreaterOrEqThanOp, NotEqToOp): replacement = "true"
+                            elif op in (LessThanOp, LessOrEqThanOp, EqToOp): replacement = "false"
+                        elif const_val > 0:
+                            # only for simple vars to avoid double eval
+                            if self._is_simple_expr(arg_node):
+                                if op == EqToOp: replacement = f"({x_str} == {const_val} or {x_str} == -{const_val})"
+                                elif op == NotEqToOp: replacement = f"({x_str} ~= {const_val} and {x_str} ~= -{const_val})"
+                                elif op == LessThanOp: replacement = f"({x_str} > -{const_val} and {x_str} < {const_val})"
+                                elif op == LessOrEqThanOp: replacement = f"({x_str} >= -{const_val} and {x_str} <= {const_val})"
+                                elif op == GreaterThanOp: replacement = f"({x_str} < -{const_val} or {x_str} > {const_val})"
+                                elif op == GreaterOrEqThanOp: replacement = f"({x_str} <= -{const_val} or {x_str} >= {const_val})"
+
+                    if replacement:
+                        self.findings.append(Finding(
+                            pattern_name='math_identity',
+                            severity=severity,
+                            line_num=self._get_line(node),
+                            message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
 
     def _analyze_table_concat_single(self):
         """Find table.concat(t, sep, i, i) and suggest tostring(t[i])."""
@@ -1959,87 +2065,6 @@ class ASTAnalyzer:
                         source_line=self._get_source_line(call.line),
                     ))
 
-        # Detect math.abs(x) >= 0 and similar
-        if not self._ast_tree: return
-        for node in ast.walk(self._ast_tree):
-            if isinstance(node, (LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp, EqToOp, NotEqToOp)):
-                call = None
-                const_val = None
-                op = type(node)
-
-                if isinstance(node.left, Call) and isinstance(node.right, Number):
-                    call = node.left
-                    const_val = node.right.n
-                elif isinstance(node.right, Call) and isinstance(node.left, Number):
-                    call = node.right
-                    const_val = node.left.n
-                    # Swap op for right-side calls
-                    if op == LessThanOp: op = GreaterThanOp
-                    elif op == GreaterThanOp: op = LessThanOp
-                    elif op == LessOrEqThanOp: op = GreaterOrEqThanOp
-                    elif op == GreaterOrEqThanOp: op = LessOrEqThanOp
-
-                if call:
-                    _, _, full_name = self._get_call_name(call)
-                    if full_name == 'math.abs' and const_val == 0:
-                        replacement = None
-                        if op == GreaterOrEqThanOp: replacement = "true"
-                        elif op == LessThanOp: replacement = "false"
-                        elif op == GreaterThanOp or op == NotEqToOp:
-                            # math.abs(x) > 0  or  math.abs(x) ~= 0  ->  x ~= 0
-                            arg_str = node_to_string(call.args[0]) if call.args else "x"
-                            replacement = f"{arg_str} ~= 0"
-                        elif op == LessOrEqThanOp or op == EqToOp:
-                            # math.abs(x) <= 0  or  math.abs(x) == 0  ->  x == 0
-                            arg_str = node_to_string(call.args[0]) if call.args else "x"
-                            replacement = f"{arg_str} == 0"
-
-                        if replacement:
-                            self.findings.append(Finding(
-                                pattern_name='logical_identity',
-                                severity='GREEN',
-                                line_num=self._get_line(node),
-                                message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
-                                details={
-                                    'node': node,
-                                    'replacement': replacement
-                                },
-                                source_line=self._get_source_line(self._get_line(node)),
-                            ))
-                            continue
-
-                    if full_name == 'math.abs' and const_val > 0:
-                        arg_str = node_to_string(call.args[0]) if call.args else "x"
-                        replacement = None
-                        if op == EqToOp:
-                            replacement = f"({arg_str} == {const_val} or {arg_str} == -{const_val})"
-                        elif op == NotEqToOp:
-                            replacement = f"({arg_str} ~= {const_val} and {arg_str} ~= -{const_val})"
-                        elif op == LessThanOp:
-                            replacement = f"({arg_str} > -{const_val} and {arg_str} < {const_val})"
-                        elif op == LessOrEqThanOp:
-                            replacement = f"({arg_str} >= -{const_val} and {arg_str} <= {const_val})"
-                        elif op == GreaterThanOp:
-                            replacement = f"({arg_str} < -{const_val} or {arg_str} > {const_val})"
-                        elif op == GreaterOrEqThanOp:
-                            replacement = f"({arg_str} <= -{const_val} or {arg_str} >= {const_val})"
-
-                        if replacement and not self._is_simple_expr(call.args[0]):
-                            # Only suggest if it's a simple variable to avoid double evaluation
-                            replacement = None
-
-                        if replacement:
-                            self.findings.append(Finding(
-                                pattern_name='logical_identity',
-                                severity='GREEN',
-                                line_num=self._get_line(node),
-                                message=f'Comparison simplification: {node_to_string(node)} -> {replacement}',
-                                details={
-                                    'node': node,
-                                    'replacement': replacement
-                                },
-                                source_line=self._get_source_line(self._get_line(node)),
-                            ))
 
     def _analyze_table_literal_indices(self):
         """Find table literals with explicit numeric indices { [1] = a } -> { a }."""
@@ -2537,25 +2562,26 @@ class ASTAnalyzer:
                     # x + -y -> x - y
                     elif isinstance(node.right, UMinusOp):
                         if not (isinstance(node.left, Number) and isinstance(node.right.operand, Number)):
-                            x_str = node_to_string(node.left)
-                            y_str = node_to_string(node.right.operand)
+                            x_str = self._get_guarded_str(node.left, 6)
+                            y_str = self._get_guarded_str(node.right.operand, 7) # y needs higher prec than SubOp
                             replacement = f"{x_str} - {y_str}"
                     # -y + x -> x - y
                     elif isinstance(node.left, UMinusOp):
                         if not (isinstance(node.right, Number) and isinstance(node.left.operand, Number)):
-                            x_str = node_to_string(node.right)
-                            y_str = node_to_string(node.left.operand)
+                            x_str = self._get_guarded_str(node.right, 6)
+                            y_str = self._get_guarded_str(node.left.operand, 7)
                             replacement = f"{x_str} - {y_str}"
                 elif isinstance(node, SubOp):
                     if right_val == 0: target = node.left; reason = "x - 0"
                     # x - -y -> x + y
                     elif isinstance(node.right, UMinusOp):
                         if not (isinstance(node.left, Number) and isinstance(node.right.operand, Number)):
-                            x_str = node_to_string(node.left)
-                            y_str = node_to_string(node.right.operand)
+                            x_str = self._get_guarded_str(node.left, 6)
+                            y_str = self._get_guarded_str(node.right.operand, 7)
                             replacement = f"{x_str} + {y_str}"
                     elif left_val == 0:
-                        target_str = node_to_string(node.right)
+                        # 0 - x -> - x
+                        target_str = self._get_guarded_str(node.right, 8) # x needs higher prec than unary minus
                         replacement = f"- {target_str}"
                         reason = f"0 - {target_str}"
                     else:
@@ -2572,11 +2598,11 @@ class ASTAnalyzer:
                     if right_val == 1: target = node.left; reason = "x * 1"
                     elif left_val == 1: target = node.right; reason = "1 * x"
                     elif right_val == -1 and not isinstance(node.left, Number):
-                        target_str = node_to_string(node.left)
+                        target_str = self._get_guarded_str(node.left, 8)
                         replacement = f"- {target_str}"
                         reason = f"{target_str} * -1"
                     elif left_val == -1 and not isinstance(node.right, Number):
-                        target_str = node_to_string(node.right)
+                        target_str = self._get_guarded_str(node.right, 8)
                         replacement = f"- {target_str}"
                         reason = f"-1 * {target_str}"
                     elif isinstance(node.left, Call) and isinstance(node.right, Call):
@@ -2597,7 +2623,7 @@ class ASTAnalyzer:
                 elif isinstance(node, FloatDivOp):
                     if right_val == 1: target = node.left; reason = "x / 1"
                     elif right_val == -1 and not isinstance(node.left, Number):
-                        target_str = node_to_string(node.left)
+                        target_str = self._get_guarded_str(node.left, 8)
                         replacement = f"- {target_str}"
                         reason = f"{target_str} / -1"
                     elif left_val == 0:
@@ -2929,6 +2955,9 @@ class ASTAnalyzer:
         if not self._ast_tree: return
         for node in ast.walk(self._ast_tree):
             if isinstance(node, FloatDivOp):
+                # Don't suggest for vector types
+                if self._infer_type(node.left, self.node_scopes.get(id(node))) == 'vector':
+                    continue
                 if isinstance(node.right, Number) and node.right.n != 0:
                     divisor = node.right.n
                     # suggest for common ones
@@ -3425,6 +3454,18 @@ class ASTAnalyzer:
         """Find arithmetic and string operations on constant values that can be folded."""
         if not self._ast_tree: return
 
+        # Don't fold tostring(number) if it's part of a Concat
+        folded_nodes_to_skip = set()
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, Concat):
+                for side in (node.left, node.right):
+                    if isinstance(side, Call):
+                        _, _, fn = self._get_call_name(side)
+                        if fn == 'tostring' and len(side.args) == 1:
+                            inf = self._infer_type(side.args[0], self.node_scopes.get(id(side.args[0])))
+                            if inf == 'number':
+                                folded_nodes_to_skip.add(id(side))
+
         # bit.bnot identities
         for call in self.calls:
             if call.full_name == 'bit.bnot' and len(call.args) == 1:
@@ -3450,6 +3491,9 @@ class ASTAnalyzer:
         for node in ast.walk(self._ast_tree):
             # Skip terminal nodes
             if isinstance(node, (Number, String, TrueExpr, FalseExpr, Nil, Name)):
+                continue
+
+            if id(node) in folded_nodes_to_skip:
                 continue
 
             # Skip Index nodes like math.huge, math.pi - they are more readable as is
@@ -3596,8 +3640,9 @@ class ASTAnalyzer:
                         break
 
                 if in_loop:
-                    l_type = self._infer_type(node.left)
-                    r_type = self._infer_type(node.right)
+                    scope = self.node_scopes.get(id(node))
+                    l_type = self._infer_type(node.left, scope)
+                    r_type = self._infer_type(node.right, scope)
 
                     if l_type == 'vector' or r_type == 'vector':
                         self.findings.append(Finding(
@@ -3830,7 +3875,10 @@ class ASTAnalyzer:
     def _analyze_table_insert(self):
         """Find table.insert(t, v) and table.insert(t, #t+1, v) patterns."""
         for call in self.calls:
-            if call.full_name == 'table.insert':
+            if call.full_name == 'table.insert' and len(call.args) >= 1:
+                if not self._is_simple_expr(call.args[0]):
+                    continue
+
                 if len(call.args) == 3:
                     # check for table.insert(t, #t+1, v)
                     pos_node = call.args[1]
@@ -3906,7 +3954,10 @@ class ASTAnalyzer:
     def _analyze_table_remove(self):
         """Find table.remove(t) or table.remove(t, #t) patterns that can be t[#t] = nil."""
         for call in self.calls:
-            if call.full_name == 'table.remove':
+            if call.full_name == 'table.remove' and len(call.args) >= 1:
+                if not self._is_simple_expr(call.args[0]):
+                    continue
+
                 is_last = False
                 if len(call.args) == 1:
                     is_last = True
@@ -4540,6 +4591,33 @@ class ASTAnalyzer:
         if isinstance(node, Index):
             return self._is_simple_expr(node.value) and self._is_simple_expr(node.idx)
         return False
+
+    def _get_guarded_str(self, node: Node, min_prec: int) -> str:
+        """Get node string, wrapping in parentheses if its precedence is lower than min_prec."""
+        # Precedence levels (simplified):
+        # 10: literals, names, calls, indexes
+        # 9: ^
+        # 8: not, #, - (unary)
+        # 7: *, /, %
+        # 6: +, -
+        # 5: ..
+        # 4: comparisons
+        # 3: and
+        # 2: or
+        prec = 10
+        if isinstance(node, ExpoOp): prec = 9
+        elif isinstance(node, (ULNotOp, ULengthOP, UMinusOp, UBNotOp)): prec = 8
+        elif isinstance(node, (MultOp, FloatDivOp, ModOp)): prec = 7
+        elif isinstance(node, (AddOp, SubOp)): prec = 6
+        elif isinstance(node, Concat): prec = 5
+        elif isinstance(node, (LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp, EqToOp, NotEqToOp)): prec = 4
+        elif isinstance(node, AndLoOp): prec = 3
+        elif isinstance(node, OrLoOp): prec = 2
+
+        s = node_to_string(node)
+        if prec < min_prec:
+            return f"({s})"
+        return s
 
     def _is_guaranteed_truthy(self, node: Node, scope: Optional[Scope] = None) -> bool:
         """Check if node is guaranteed to be truthy in Lua."""

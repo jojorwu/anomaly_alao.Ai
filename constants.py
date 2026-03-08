@@ -28,6 +28,7 @@ CACHEABLE_BARE_GLOBALS: Set[str] = frozenset({
     'pairs', 'ipairs', 'next', 'type', 'tostring', 'tonumber',
     'unpack', 'select', 'rawget', 'rawset',
     'clamp', 'vector', 'v2d', 'color', 'is_empty',
+    'SIMBOARD', 'axr_main',
 })
 
 # these are less beneficial to cache (error handling, output)

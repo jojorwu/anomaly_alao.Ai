@@ -213,6 +213,8 @@ class ASTTransformer:
             self._edit_redundant_type_conversion(finding)
         elif pattern == 'string_byte_1':
             self._edit_string_byte_1(finding)
+        elif pattern in ('string_concat_tostring', 'string_byte_range'):
+            self._edit_algebraic_simplification(finding)
         elif pattern == 'return_ternary_simplification':
             self._edit_return_ternary_simplification(finding)
         elif pattern == 'math_atan2_to_atan':

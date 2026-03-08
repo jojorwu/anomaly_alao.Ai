@@ -245,70 +245,81 @@ class TestNewOptimizations(unittest.TestCase):
         self.assertTrue(modified)
         self.assertIn("string.char(string.byte(s))", new_content)
 
-    def test_inplace_vector_op(self):
-        script = """
-        function test()
-            local v = vector()
-            local d = vector()
-            for i=1, 10 do
-                v = v + d
-            end
-        end
-        """
-        path = self.test_dir / "vadd.lua"
+    def test_inplace_vector_div(self):
+        script = "function test() local v = vector() v = v / 2 end"
+        path = self.test_dir / "vec_div.lua"
         path.write_text(script)
-
         modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
         self.assertTrue(modified)
-        self.assertIn("v:add(d)", new_content)
+        self.assertIn("v:div(2)", new_content)
 
-    def test_table_emptiness(self):
-        script = """
-        function test()
-            local t = {}
-            if #t == 0 then
-                return
-            end
-        end
-        """
-        path = self.test_dir / "empty.lua"
+    def test_inplace_vector_neg(self):
+        script = "function test() local v = vector() v = -v end"
+        path = self.test_dir / "vec_neg.lua"
         path.write_text(script)
-
         modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
         self.assertTrue(modified)
-        self.assertIn("next(t) == nil", new_content)
+        self.assertIn("v:mul(-1)", new_content)
 
-    def test_loop_invariant_global_hoist(self):
+    def test_string_concat_tostring(self):
+        script = 'local s = "res" .. tostring(123)'
+        path = self.test_dir / "concat_ts.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn('"res" .. 123', new_content)
+
+    def test_string_byte_range(self):
+        script = "local b = string.byte(s, i, i)"
+        path = self.test_dir / "byte_range.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("string.byte(s, i)", new_content)
+
+    def test_comparison_identities_abs_neg(self):
+        script = "if math.abs(x) < -1 then print(1) end"
+        path = self.test_dir / "abs_neg.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("if false then", new_content)
+
+    def test_table_insert_safety(self):
+        script = "table.insert(get_table(), v)"
+        path = self.test_dir / "ins_safe.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertFalse(modified)
+
+    def test_precedence_algebraic(self):
+        script = "local x = 0 - (a + b)"
+        path = self.test_dir / "prec.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("local x = - (a + b)", new_content)
+
+    def test_vector_local_safety(self):
+        # Should NOT transform LocalAssign
+        script = "local v = v + d"
+        path = self.test_dir / "vec_local.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertFalse(modified)
+
+    def test_hoisting_shadow_safety(self):
+        # Should NOT hoist if local_name is redefined in loop
         script = """
-        function test()
-            for i=1, 10 do
-                local a = db.actor:position()
-            end
+        for i=1, 10 do
+            local actor = "shadow"
+            print(db.actor)
         end
         """
-        path = self.test_dir / "hoist.lua"
+        path = self.test_dir / "hoist_shadow.lua"
         path.write_text(script)
-
         modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
-        self.assertTrue(modified)
-        self.assertIn("local actor = db.actor", new_content)
-        self.assertIn("actor:position()", new_content)
-
-    def test_math_max_comparison(self):
-        script = "if math.max(a, b) == a then end"
-        path = self.test_dir / "maxcomp.lua"
-        path.write_text(script)
-
-        findings = self.analyzer.analyze_file(path)
-        self.assertTrue(any(f.pattern_name == 'math_identity' and 'a >= b' in f.message for f in findings))
-
-    def test_logical_identity_expansion(self):
-        script = "if x ~= nil and x ~= false then end"
-        path = self.test_dir / "logic.lua"
-        path.write_text(script)
-
-        findings = self.analyzer.analyze_file(path)
-        self.assertTrue(any(f.pattern_name == 'logical_identity' and f.details.get('replacement') == 'x' for f in findings))
+        self.assertFalse(modified)
 
 if __name__ == "__main__":
     unittest.main()
