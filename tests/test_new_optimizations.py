@@ -262,12 +262,13 @@ class TestNewOptimizations(unittest.TestCase):
         self.assertIn("v:mul(-1)", new_content)
 
     def test_string_concat_tostring(self):
-        script = 'local s = "res" .. tostring(123)'
+        # Use a non-constant number (from math.random) to avoid full folding into a single string literal
+        script = 'local n = math.random() local s = "res" .. tostring(n)'
         path = self.test_dir / "concat_ts.lua"
         path.write_text(script)
         modified, new_content, _ = self.transformer.transform_file(path, backup=False)
         self.assertTrue(modified)
-        self.assertIn('"res" .. 123', new_content)
+        self.assertIn('"res" .. n', new_content)
 
     def test_string_byte_range(self):
         script = "local b = string.byte(s, i, i)"
@@ -320,6 +321,37 @@ class TestNewOptimizations(unittest.TestCase):
         path.write_text(script)
         modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
         self.assertFalse(modified)
+
+    def test_table_clear_pattern(self):
+        script = "for k,v in pairs(t) do t[k] = nil end"
+        path = self.test_dir / "clear.lua"
+        path.write_text(script)
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'table_clear_pattern' for f in findings))
+
+    def test_assignment_ternary(self):
+        script = "if cond then x = 1 else x = 2 end"
+        path = self.test_dir / "ternary.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("x = cond and 1 or 2", new_content)
+
+    def test_redundant_string_format(self):
+        script = 'local s = string.format("%s", x)'
+        path = self.test_dir / "fmt_red.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("tostring(x)", new_content)
+
+    def test_constant_folding_extended(self):
+        script = 'local s = string.sub("hello", 1, 3) .. table.concat({"a", "b"}, "-")'
+        path = self.test_dir / "fold_ext.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn('local s = "hela-b"', new_content)
 
 if __name__ == "__main__":
     unittest.main()

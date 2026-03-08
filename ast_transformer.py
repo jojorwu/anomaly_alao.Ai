@@ -247,6 +247,8 @@ class ASTTransformer:
             self._edit_table_emptiness_check(finding)
         elif pattern == 'loop_invariant_global':
             self._edit_loop_invariant_global(finding)
+        elif pattern in ('table_clear_pattern', 'assignment_ternary_simplification', 'redundant_string_format'):
+            self._edit_algebraic_simplification(finding)
 
 
     # Edit methods using AST positions
@@ -270,7 +272,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10 # Higher priority than simple constant folding
+            priority=20 # Higher priority than constant folding
         ))
 
     def _edit_unpack_to_indexing(self, finding: Finding):
@@ -376,12 +378,8 @@ class ASTTransformer:
         if start is None:
             return
 
-        # Compound identities (like math.sqrt(x*x)) should have higher priority than
-        # simple ones (like math.pow(x, 2)) to avoid partial transformations blocking
-        # the better ones.
-        priority = 10
-        if finding.pattern_name in ('math_identity', 'string_sub_negative_index'):
-            priority = 20
+        # Identities and structural simplifications have high priority
+        priority = 20
 
         self.edits.append(SourceEdit(
             start_char=start,
@@ -490,7 +488,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=f'math.atan({y_str})'
+            replacement=f'math.atan({y_str})',
+            priority=20
         ))
 
     def _edit_return_ternary_simplification(self, finding: Finding):
@@ -514,7 +513,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_if_nil_assign(self, finding: Finding):
@@ -536,7 +535,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_redundant_boolean_comp(self, finding: Finding):
@@ -578,7 +577,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_loop_invariant_global(self, finding: Finding):
@@ -655,11 +654,16 @@ class ASTTransformer:
         if start is None:
             return
 
+        # Special priority for table_clear_pattern which might overlap with algebraic simplifications
+        priority = 20
+        if finding.pattern_name == 'table_clear_pattern':
+            priority = 25
+
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=20
+            priority=priority
         ))
 
     def _edit_table_literal_indices(self, finding: Finding):
@@ -696,7 +700,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_logical_identity(self, finding: Finding):
@@ -714,7 +718,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_string_starts_with(self, finding: Finding):
@@ -732,25 +736,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
-        ))
-
-    def _edit_algebraic_simplification(self, finding: Finding):
-        """Replace redundant algebraic operation with the target expression."""
-        node = finding.details.get('node')
-        replacement = finding.details.get('replacement')
-        if not node or replacement is None:
-            return
-
-        start, end = self._get_node_span(node)
-        if start is None:
-            return
-
-        self.edits.append(SourceEdit(
-            start_char=start,
-            end_char=end,
-            replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_table_remove_last(self, finding: Finding):
@@ -912,7 +898,7 @@ class ASTTransformer:
             start_char=replace_start,
             end_char=replace_end,
             replacement=f' {k_var} = 1, #{table_name} ',
-            priority=10
+            priority=20
         ))
 
         # 2. Insert "local v = table[k]" at the beginning of the body
@@ -999,9 +985,9 @@ class ASTTransformer:
         if start is None:
             return
 
-        # Give Call folding higher priority than nested expression folding
-        from luaparser.astnodes import Call
-        priority = 10 if isinstance(node, Call) else 0
+        # Give constant folding lower priority than structural identities (20)
+        # to ensure identities like math.abs(x) < -1 take precedence over folding -1.
+        priority = 15
 
         self.edits.append(SourceEdit(
             start_char=start,
@@ -1271,14 +1257,35 @@ class ASTTransformer:
             if not isinstance(node.args[1], (Name, Number, Call, Invoke, Index)):
                 exp_str = f'({exp_str})'
             replacement = f'{base} ^ {exp_str}'
+
         else:
+            return
+
+        priority = 20
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=priority,
+        ))
+
+    def _edit_algebraic_simplification(self, finding: Finding):
+        """Replace redundant algebraic operation with the target expression."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
             return
 
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10 if finding.pattern_name == 'math_pow_to_expo' else 5,
+            priority=20
         ))
 
     def _edit_distance_to_comparison(self, finding: Finding):
@@ -2738,8 +2745,9 @@ class ASTTransformer:
 
         from bisect import bisect_left, bisect_right
 
-        # sort by priority descending, then position descending
-        self.edits.sort(key=lambda e: (-e.priority, -e.start_char))
+        # sort by priority descending, then position ascending, then end_char descending
+        # this ensures that for same priority, the outer-most (earliest and longest) edit wins
+        self.edits.sort(key=lambda e: (-e.priority, e.start_char, -e.end_char))
 
         filtered = []
         # sorted list of (start, end) for accepted non-insertion edits
