@@ -346,7 +346,10 @@ class ASTAnalyzer:
                     if j > len(t): j = len(t)
                     if i > j: return ""
 
-                    return sep.join(str(x).lower() if isinstance(x, bool) else str(x) for x in t[i-1:j])
+                    # table.concat in Lua only allows strings and numbers
+                    if any(isinstance(x, bool) or x is None for x in t[i-1:j]):
+                        return None
+                    return sep.join(str(x) for x in t[i-1:j])
 
                 if full_name == 'tonumber':
                     try: return float(args[0])
@@ -1527,6 +1530,7 @@ class ASTAnalyzer:
         self._analyze_dead_code()
         self._analyze_per_frame_callbacks()
         self._analyze_metric_comparisons()
+        self._analyze_metric_direct_access()
         self._analyze_vector_allocations_in_loops()
         self._analyze_plain_string_find()
         self._analyze_pairs_on_array()
@@ -1578,28 +1582,57 @@ class ASTAnalyzer:
         self._analyze_assignment_ternary()
         self._analyze_function_in_loop()
         self._analyze_vector_mad()
-        self._analyze_vector_set_simplification()
+        self._analyze_vector_simplification()
         self._analyze_redundant_nil_assignment()
 
-    def _analyze_vector_set_simplification(self):
-        """Find v:set(0,0,0) and v:set(v2.x, v2.y, v2.z) and suggest simpler versions."""
+    def _analyze_vector_simplification(self):
+        """Find simplifiable vector operations like v:set(0,0,0) or v:add(x,x,x)."""
         for call in self.calls:
-            if call.func == 'set' and ':' in call.full_name:
-                # v:set(0,0,0) -> v:set(0)
-                if len(call.args) == 3:
-                    vals = [self._get_const_val(a) for a in call.args]
-                    if all(v == 0 for v in vals):
+            # v:method(x, y, z)
+            if call.func in ('set', 'add', 'sub', 'mul', 'div') and ':' in call.full_name:
+                # Redundant single-argument operations
+                if len(call.args) == 1:
+                    val = self._get_const_val(call.args[0])
+                    if (call.func in ('add', 'sub') and val == 0) or \
+                       (call.func in ('mul', 'div') and val == 1):
                         self.findings.append(Finding(
-                            pattern_name='vector_set_zero',
+                            pattern_name='vector_redundant_op',
                             severity='GREEN',
                             line_num=call.line,
-                            message=f'Simplify vector set: {call.full_name}(0,0,0) -> {call.module}:set(0)',
-                            details={'node': call.node, 'replacement': f'{call.module}:set(0)'},
+                            message=f'Redundant vector operation: {call.full_name}({val}) is a no-op',
+                            details={'node': call.node, 'replacement': call.module},
                             source_line=self._get_source_line(call.line),
                         ))
                         continue
 
-                    # v:set(v2.x, v2.y, v2.z) -> v:set(v2)
+                    if call.func == 'mul' and val == 0:
+                        replacement = f"{call.module}:set(0)"
+                        self.findings.append(Finding(
+                            pattern_name='vector_mul_zero',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'Simplify vector mul: {call.full_name}(0) -> {replacement}',
+                            details={'node': call.node, 'replacement': replacement},
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
+
+                if len(call.args) == 3:
+                    # v:method(x, x, x) -> v:method(x)
+                    arg_strs = [node_to_string(a) for a in call.args]
+                    if len(set(arg_strs)) == 1:
+                        val_str = arg_strs[0]
+                        self.findings.append(Finding(
+                            pattern_name='vector_method_single_arg',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'Simplify vector {call.func}: {call.full_name}({val_str}, {val_str}, {val_str}) -> {call.module}:{call.func}({val_str})',
+                            details={'node': call.node, 'replacement': f'{call.module}:{call.func}({val_str})'},
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
+
+                    # v:method(v2.x, v2.y, v2.z) -> v:method(v2)
                     if all(isinstance(a, Index) for a in call.args):
                         bases = []
                         idxs = []
@@ -1610,13 +1643,27 @@ class ASTAnalyzer:
                         if len(set(bases)) == 1 and idxs == ['x', 'y', 'z']:
                             v2_str = bases[0]
                             self.findings.append(Finding(
-                                pattern_name='vector_set_copy',
+                                pattern_name='vector_method_copy',
                                 severity='GREEN',
                                 line_num=call.line,
-                                message=f'Simplify vector set: {call.full_name}({v2_str}.x, {v2_str}.y, {v2_str}.z) -> {call.module}:set({v2_str})',
-                                details={'node': call.node, 'replacement': f'{call.module}:set({v2_str})'},
+                                message=f'Simplify vector {call.func}: {call.full_name}({v2_str}.x, {v2_str}.y, {v2_str}.z) -> {call.module}:{call.func}({v2_str})',
+                                details={'node': call.node, 'replacement': f'{call.module}:{call.func}({v2_str})'},
                                 source_line=self._get_source_line(call.line),
                             ))
+                            continue
+
+            # vector(0, 0, 0) -> vector()
+            if call.full_name == 'vector' and len(call.args) == 3:
+                vals = [self._get_const_val(a) for a in call.args]
+                if all(v == 0 for v in vals):
+                    self.findings.append(Finding(
+                        pattern_name='vector_init_zero',
+                        severity='GREEN',
+                        line_num=call.line,
+                        message='Simplify vector initialization: vector(0,0,0) -> vector()',
+                        details={'node': call.node, 'replacement': 'vector()'},
+                        source_line=self._get_source_line(call.line),
+                    ))
 
     def _analyze_redundant_nil_assignment(self):
         """Find local x = nil and suggest local x."""
@@ -1692,6 +1739,59 @@ class ASTAnalyzer:
                 },
                 source_line=self._get_source_line(comp.line),
             ))
+
+        # Support for comparisons between two metric calls: a:distance_to(b) < a:distance_to(c)
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, (EqToOp, NotEqToOp, LessThanOp, GreaterThanOp, LessOrEqThanOp, GreaterOrEqThanOp)):
+                if isinstance(node.left, Invoke) and isinstance(node.right, Invoke):
+                    l_func = node.left.func.id if isinstance(node.left.func, Name) else None
+                    r_func = node.right.func.id if isinstance(node.right.func, Name) else None
+                    if l_func in metric_map and r_func in metric_map:
+                        l_new = metric_map[l_func]
+                        r_new = metric_map[r_func]
+
+                        l_str = node_to_string(node.left).replace(f':{l_func}', f':{l_new}')
+                        r_str = node_to_string(node.right).replace(f':{r_func}', f':{r_new}')
+
+                        op_str = node_to_string(node).split(' ', 1)[1].split(' ', 1)[0] # inaccurate but usually ok
+                        # better way to get op
+                        op_map = {EqToOp: '==', NotEqToOp: '~=', LessThanOp: '<', GreaterThanOp: '>', LessOrEqThanOp: '<=', GreaterOrEqThanOp: '>='}
+                        op_str = op_map[type(node)]
+
+                        replacement = f"{l_str} {op_str} {r_str}"
+
+                        self.findings.append(Finding(
+                            pattern_name='metric_comparison_sqr',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Use sqr variants for comparison between metrics: {node_to_string(node)} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    def _analyze_metric_direct_access(self):
+        """Find obj1:position():distance_to(obj2:position()) and suggest obj1:distance_to(obj2)."""
+        for call in self.calls:
+            if call.func == 'distance_to' and ':' in call.full_name:
+                if isinstance(call.node, Invoke) and isinstance(call.node.source, Invoke):
+                    l_inner = call.node.source
+                    if isinstance(l_inner.func, Name) and l_inner.func.id == 'position':
+                        # Check arg
+                        if len(call.node.args) == 1 and isinstance(call.node.args[0], Invoke):
+                            r_inner = call.node.args[0]
+                            if isinstance(r_inner.func, Name) and r_inner.func.id == 'position':
+                                obj1 = node_to_string(l_inner.source)
+                                obj2 = node_to_string(r_inner.source)
+                                replacement = f"{obj1}:distance_to({obj2})"
+                                self.findings.append(Finding(
+                                    pattern_name='metric_direct_access',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'Use direct distance_to: {call.full_name} -> {replacement}',
+                                    details={'node': call.node, 'replacement': replacement},
+                                    source_line=self._get_source_line(call.line),
+                                ))
 
     def _analyze_vector_mad(self):
         """Find v = v + v2 * s and suggest v:mad(v2, s)."""
@@ -2331,115 +2431,191 @@ class ASTAnalyzer:
     def _analyze_bit_identity(self):
         """Find redundant bitwise operations like bit.band(x, 0)."""
         for call in self.calls:
-            if call.full_name in ('bit.band', 'bit.bor', 'bit.bxor', 'bit.lshift', 'bit.rshift', 'bit.arshift') and len(call.args) == 2:
-                arg1 = call.args[0]
-                arg2 = call.args[1]
-                val1 = self._get_const_val(arg1)
-                val2 = self._get_const_val(arg2)
+            if call.full_name in ('bit.band', 'bit.bor', 'bit.bxor', 'bit.lshift', 'bit.rshift', 'bit.arshift'):
+                if len(call.args) == 2:
+                    arg1 = call.args[0]
+                    arg2 = call.args[1]
+                    val1 = self._get_const_val(arg1)
+                    val2 = self._get_const_val(arg2)
 
-                target = None
-                replacement = None
-                reason = None
+                    target = None
+                    replacement = None
+                    reason = None
 
-                s1 = node_to_string(arg1)
-                s2 = node_to_string(arg2)
-                is_same = (s1 == s2) and self._is_simple_expr(arg1)
+                    s1 = node_to_string(arg1)
+                    s2 = node_to_string(arg2)
+                    is_same = (s1 == s2) and self._is_simple_expr(arg1)
 
-                is_ones1 = val1 in (-1, 0xFFFFFFFF, 4294967295)
-                is_ones2 = val2 in (-1, 0xFFFFFFFF, 4294967295)
+                    is_ones1 = val1 in (-1, 0xFFFFFFFF, 4294967295)
+                    is_ones2 = val2 in (-1, 0xFFFFFFFF, 4294967295)
 
-                # Check if one is bnot of another
-                def is_bnot_of(n1, n2):
-                    if isinstance(n1, Call):
-                        _, _, fn = self._get_call_name(n1)
-                        if fn == 'bit.bnot' and len(n1.args) == 1:
-                            return node_to_string(n1.args[0]) == node_to_string(n2)
-                    return False
+                    # Check if one is bnot of another
+                    def is_bnot_of(n1, n2):
+                        if isinstance(n1, Call):
+                            _, _, fn = self._get_call_name(n1)
+                            if fn == 'bit.bnot' and len(n1.args) == 1:
+                                return node_to_string(n1.args[0]) == node_to_string(n2)
+                        return False
 
-                is_complement = (is_bnot_of(arg1, arg2) or is_bnot_of(arg2, arg1))
+                    is_complement = (is_bnot_of(arg1, arg2) or is_bnot_of(arg2, arg1))
 
-                # Absorption laws
-                if call.full_name == 'bit.bor':
-                    inner_band = None
-                    other_arg = None
-                    if isinstance(arg1, Call):
-                        _, _, fn = self._get_call_name(arg1)
-                        if fn == 'bit.band':
-                            inner_band = arg1
-                            other_arg = arg2
-                    if not inner_band and isinstance(arg2, Call):
-                        _, _, fn = self._get_call_name(arg2)
-                        if fn == 'bit.band':
-                            inner_band = arg2
-                            other_arg = arg1
+                    # Absorption laws
+                    if call.full_name == 'bit.bor':
+                        inner_band = None
+                        other_arg = None
+                        if isinstance(arg1, Call):
+                            _, _, fn = self._get_call_name(arg1)
+                            if fn == 'bit.band':
+                                inner_band = arg1
+                                other_arg = arg2
+                        if not inner_band and isinstance(arg2, Call):
+                            _, _, fn = self._get_call_name(arg2)
+                            if fn == 'bit.band':
+                                inner_band = arg2
+                                other_arg = arg1
 
-                    if inner_band and len(inner_band.args) == 2:
-                        b1 = node_to_string(inner_band.args[0])
-                        b2 = node_to_string(inner_band.args[1])
-                        oa = node_to_string(other_arg)
-                        if (b1 == oa or b2 == oa) and self._is_simple_expr(other_arg):
-                            target = other_arg
-                            reason = "bit.bor(bit.band(x, y), x)"
+                        if inner_band and len(inner_band.args) == 2:
+                            b1 = node_to_string(inner_band.args[0])
+                            b2 = node_to_string(inner_band.args[1])
+                            oa = node_to_string(other_arg)
+                            if (b1 == oa or b2 == oa) and self._is_simple_expr(other_arg):
+                                target = other_arg
+                                reason = "bit.bor(bit.band(x, y), x)"
 
-                elif call.full_name == 'bit.band':
-                    inner_bor = None
-                    other_arg = None
-                    if isinstance(arg1, Call):
-                        _, _, fn = self._get_call_name(arg1)
-                        if fn == 'bit.bor':
-                            inner_bor = arg1
-                            other_arg = arg2
-                    if not inner_bor and isinstance(arg2, Call):
-                        _, _, fn = self._get_call_name(arg2)
-                        if fn == 'bit.bor':
-                            inner_bor = arg2
-                            other_arg = arg1
+                    elif call.full_name == 'bit.band':
+                        inner_bor = None
+                        other_arg = None
+                        if isinstance(arg1, Call):
+                            _, _, fn = self._get_call_name(arg1)
+                            if fn == 'bit.bor':
+                                inner_bor = arg1
+                                other_arg = arg2
+                        if not inner_bor and isinstance(arg2, Call):
+                            _, _, fn = self._get_call_name(arg2)
+                            if fn == 'bit.bor':
+                                inner_bor = arg2
+                                other_arg = arg1
 
-                    if inner_bor and len(inner_bor.args) == 2:
-                        b1 = node_to_string(inner_bor.args[0])
-                        b2 = node_to_string(inner_bor.args[1])
-                        oa = node_to_string(other_arg)
-                        if (b1 == oa or b2 == oa) and self._is_simple_expr(other_arg):
-                            target = other_arg
-                            reason = "bit.band(bit.bor(x, y), x)"
+                        if inner_bor and len(inner_bor.args) == 2:
+                            b1 = node_to_string(inner_bor.args[0])
+                            b2 = node_to_string(inner_bor.args[1])
+                            oa = node_to_string(other_arg)
+                            if (b1 == oa or b2 == oa) and self._is_simple_expr(other_arg):
+                                target = other_arg
+                                reason = "bit.band(bit.bor(x, y), x)"
 
-                if call.full_name == 'bit.band':
-                    if is_same: target = arg1; reason = "bit.band(x, x)"
-                    elif val2 == 0 or val1 == 0: replacement = "0"; reason = "bit.band(x, 0)"
-                    elif is_ones2: target = arg1; reason = "bit.band(x, -1)"
-                    elif is_ones1: target = arg2; reason = "bit.band(-1, x)"
-                    elif is_complement: replacement = "0"; reason = "bit.band(x, bit.bnot(x))"
-                elif call.full_name == 'bit.bor':
-                    if is_same: target = arg1; reason = "bit.bor(x, x)"
-                    elif val2 == 0: target = arg1; reason = "bit.bor(x, 0)"
-                    elif val1 == 0: target = arg2; reason = "bit.bor(0, x)"
-                    elif is_ones2 or is_ones1: replacement = "-1"; reason = "bit.bor(x, -1)"
-                    elif is_complement: replacement = "-1"; reason = "bit.bor(x, bit.bnot(x))"
-                elif call.full_name == 'bit.bxor':
-                    if is_same: replacement = "0"; reason = "bit.bxor(x, x)"
-                    elif val2 == 0: target = arg1; reason = "bit.bxor(x, 0)"
-                    elif val1 == 0: target = arg2; reason = "bit.bxor(0, x)"
-                    elif is_ones2: replacement = f"bit.bnot({s1})"; reason = "bit.bxor(x, -1)"
-                    elif is_ones1: replacement = f"bit.bnot({s2})"; reason = "bit.bxor(-1, x)"
-                    elif is_complement: replacement = "-1"; reason = "bit.bxor(x, bit.bnot(x))"
-                elif call.full_name in ('bit.lshift', 'bit.rshift', 'bit.arshift'):
-                    if val2 == 0: target = arg1; reason = f"{call.full_name}(x, 0)"
+                    if call.full_name == 'bit.band':
+                        if is_same: target = arg1; reason = "bit.band(x, x)"
+                        elif val2 == 0 or val1 == 0: replacement = "0"; reason = "bit.band(x, 0)"
+                        elif is_ones2: target = arg1; reason = "bit.band(x, -1)"
+                        elif is_ones1: target = arg2; reason = "bit.band(-1, x)"
+                        elif is_complement: replacement = "0"; reason = "bit.band(x, bit.bnot(x))"
+                    elif call.full_name == 'bit.bor':
+                        if is_same: target = arg1; reason = "bit.bor(x, x)"
+                        elif val2 == 0: target = arg1; reason = "bit.bor(x, 0)"
+                        elif val1 == 0: target = arg2; reason = "bit.bor(0, x)"
+                        elif is_ones2 or is_ones1: replacement = "-1"; reason = "bit.bor(x, -1)"
+                        elif is_complement: replacement = "-1"; reason = "bit.bor(x, bit.bnot(x))"
+                    elif call.full_name == 'bit.bxor':
+                        if is_same: replacement = "0"; reason = "bit.bxor(x, x)"
+                        elif val2 == 0: target = arg1; reason = "bit.bxor(x, 0)"
+                        elif val1 == 0: target = arg2; reason = "bit.bxor(0, x)"
+                        elif is_ones2: replacement = f"bit.bnot({s1})"; reason = "bit.bxor(x, -1)"
+                        elif is_ones1: replacement = f"bit.bnot({s2})"; reason = "bit.bxor(-1, x)"
+                        elif is_complement: replacement = "-1"; reason = "bit.bxor(x, bit.bnot(x))"
+                    elif call.full_name in ('bit.lshift', 'bit.rshift', 'bit.arshift'):
+                        if val2 == 0: target = arg1; reason = f"{call.full_name}(x, 0)"
 
-                if target or replacement:
-                    if target:
-                        replacement = node_to_string(target)
+                    if target or replacement:
+                        if target:
+                            replacement = node_to_string(target)
 
-                    self.findings.append(Finding(
-                        pattern_name='bitwise_identity',
-                        severity='GREEN',
-                        line_num=call.line,
-                        message=f'Bitwise identity simplification: {reason} -> {replacement}',
-                        details={
-                            'node': call.node,
-                            'replacement': replacement
-                        },
-                        source_line=self._get_source_line(call.line),
-                    ))
+                        self.findings.append(Finding(
+                            pattern_name='bitwise_identity',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'Bitwise identity simplification: {reason} -> {replacement}',
+                            details={
+                                'node': call.node,
+                                'replacement': replacement
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+                elif len(call.args) > 2 and call.full_name in ('bit.band', 'bit.bor', 'bit.bxor'):
+                    # Handle multiple arguments
+                    args = call.args
+                    arg_strs = [node_to_string(a) for a in args]
+
+                    target_replacement = None
+                    reason = None
+
+                    if call.full_name == 'bit.band':
+                        # If any arg is 0, entire result is 0
+                        if any(self._get_const_val(a) == 0 for a in args):
+                            target_replacement = "0"
+                            reason = "bit.band(..., 0, ...)"
+                    elif call.full_name == 'bit.bor':
+                        # If any arg is -1, entire result is -1
+                        if any(self._get_const_val(a) in (-1, 0xFFFFFFFF, 4294967295) for a in args):
+                            target_replacement = "-1"
+                            reason = "bit.bor(..., -1, ...)"
+
+                    if not target_replacement:
+                        if call.full_name in ('bit.band', 'bit.bor'):
+                            # Check for identical arguments (deduplicate)
+                            unique_arg_strs = []
+                            seen = set()
+                            changed = False
+                            for s in arg_strs:
+                                if s not in seen:
+                                    unique_arg_strs.append(s)
+                                    seen.add(s)
+                                else:
+                                    changed = True
+
+                            if changed:
+                                if len(unique_arg_strs) == 1:
+                                    target_replacement = unique_arg_strs[0]
+                                else:
+                                    target_replacement = f"{call.full_name}({', '.join(unique_arg_strs)})"
+                                reason = f"deduplicate {call.full_name} arguments"
+
+                        elif call.full_name == 'bit.bxor':
+                            # Cancel identical pairs (x ^ x = 0)
+                            from collections import Counter
+                            counts = Counter(arg_strs)
+                            remaining = [s for s, count in counts.items() if count % 2 == 1]
+
+                            if len(remaining) < len(arg_strs):
+                                if not remaining:
+                                    target_replacement = "0"
+                                elif len(remaining) == 1:
+                                    target_replacement = remaining[0]
+                                else:
+                                    # Preserve original order for remaining args if possible
+                                    ordered_remaining = []
+                                    seen_rem = set(remaining)
+                                    added = set()
+                                    for s in arg_strs:
+                                        if s in seen_rem and s not in added:
+                                            ordered_remaining.append(s)
+                                            added.add(s)
+                                    target_replacement = f"bit.bxor({', '.join(ordered_remaining)})"
+                                reason = "cancel identical pairs in bit.bxor"
+
+                    if target_replacement:
+                        self.findings.append(Finding(
+                            pattern_name='bitwise_identity',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'Bitwise identity simplification: {reason} -> {target_replacement}',
+                            details={
+                                'node': call.node,
+                                'replacement': target_replacement
+                            },
+                            source_line=self._get_source_line(call.line),
+                        ))
 
 
     def _analyze_table_literal_indices(self):
@@ -2520,6 +2696,8 @@ class ASTAnalyzer:
             ('bit.bnot', 'bit.bnot'): 'inverse',
             ('string.byte', 'string.char'): 'inverse',
             ('string.char', 'string.byte'): 'inverse',
+            ('tonumber', 'tostring'): 'redundant_inner',
+            ('tostring', 'tonumber'): 'redundant_inner',
         }
 
         for call in self.calls:
@@ -2598,6 +2776,9 @@ class ASTAnalyzer:
                 if pattern_type == 'redundant':
                     replacement = f'{inner_full_name}({inner_arg_str})'
                     message = f'Nested redundant call: {call.full_name}({inner_full_name}(x)) -> {inner_full_name}(x)'
+                elif pattern_type == 'redundant_inner':
+                    replacement = f'{call.full_name}({inner_arg_str})'
+                    message = f'Nested redundant call: {call.full_name}({inner_full_name}(x)) -> {call.full_name}(x)'
                 else: # inverse
                     replacement = inner_arg_str
                     message = f'Inverse operations: {call.full_name}({inner_full_name}(x)) -> x'
@@ -4035,47 +4216,53 @@ class ASTAnalyzer:
                     ))
 
     def _analyze_math_clamp(self):
-        """Find math.min(math.max(x, min_val), max_val) and suggest clamp(x, min_val, max_val)."""
+        """Find math.min(math.max(x, min_val), max_val) or math.max(math.min(x, max_val), min_val) and suggest clamp."""
         for call in self.calls:
-            if call.full_name == 'math.min' and len(call.args) == 2:
+            if call.full_name in ('math.min', 'math.max') and len(call.args) == 2:
+                outer_fn = call.func
+                inner_fn_name = 'math.max' if outer_fn == 'min' else 'math.min'
+
                 arg1 = call.args[0]
                 arg2 = call.args[1]
 
-                # Check for math.min(math.max(x, min), max)
                 inner_call = None
-                max_val = None
+                outer_arg_str = None
 
                 if isinstance(arg1, Call):
                     _, _, fn = self._get_call_name(arg1)
-                    if fn == 'math.max' and len(arg1.args) == 2:
+                    if fn == inner_fn_name and len(arg1.args) == 2:
                         inner_call = arg1
-                        max_val = node_to_string(arg2)
+                        outer_arg_str = node_to_string(arg2)
 
                 if not inner_call and isinstance(arg2, Call):
                     _, _, fn = self._get_call_name(arg2)
-                    if fn == 'math.max' and len(arg2.args) == 2:
+                    if fn == inner_fn_name and len(arg2.args) == 2:
                         inner_call = arg2
-                        max_val = node_to_string(arg1)
+                        outer_arg_str = node_to_string(arg1)
 
                 if inner_call:
                     a = inner_call.args[0]
                     b = inner_call.args[1]
 
-                    # Try to identify which one is the value and which is the min_val
-                    # If one is a number, it's likely the min_val
+                    # Try to identify which one is the value and which is the inner_arg
                     if isinstance(a, Number) and not isinstance(b, Number):
-                        min_val = node_to_string(a)
-                        x = node_to_string(b)
+                        inner_arg_str = node_to_string(a)
+                        x_str = node_to_string(b)
                     else:
-                        x = node_to_string(a)
-                        min_val = node_to_string(b)
+                        x_str = node_to_string(a)
+                        inner_arg_str = node_to_string(b)
 
-                    replacement = f"clamp({x}, {min_val}, {max_val})"
+                    if outer_fn == 'min':
+                        min_val, max_val = inner_arg_str, outer_arg_str
+                    else:
+                        max_val, min_val = inner_arg_str, outer_arg_str
+
+                    replacement = f"clamp({x_str}, {min_val}, {max_val})"
                     self.findings.append(Finding(
                         pattern_name='math_clamp_suggestion',
                         severity='GREEN',
                         line_num=call.line,
-                        message=f'Suggest using clamp: math.min(math.max({x}, {min_val}), {max_val}) -> {replacement}',
+                        message=f'Suggest using clamp: {node_to_string(call.node)} -> {replacement}',
                         details={
                             'node': call.node,
                             'replacement': replacement
