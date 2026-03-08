@@ -30,7 +30,7 @@ import math as py_math
 from models import (
     Finding, detect_file_encoding, Scope, CallInfo, AssignInfo,
     ConcatInfo, NilSourceInfo, NilAccessInfo, DeadCodeInfo,
-    LocalVarInfo, PerFrameCallbackInfo, DistanceComparisonInfo,
+    LocalVarInfo, PerFrameCallbackInfo, MetricComparisonInfo,
     VectorAllocationInfo, Assignment
 )
 from utils import node_to_string, iter_children
@@ -82,7 +82,7 @@ class ASTAnalyzer:
         self.local_funcs: Dict[Tuple[int, str], LocalVarInfo] = {}
         self.callback_registrations: Set[str] = set()
         self.per_frame_callbacks: List[PerFrameCallbackInfo] = []
-        self.distance_comparisons: List[DistanceComparisonInfo] = []
+        self.metric_comparisons: List[MetricComparisonInfo] = []
         self.vector_allocations: List[VectorAllocationInfo] = []
         self.assignment_target_ids: Set[int] = set()
 
@@ -1376,50 +1376,59 @@ class ASTAnalyzer:
     def _visit_ExpoOp(self, node: ExpoOp): self._visit(node.left); self._visit(node.right)
     def _visit_AndLoOp(self, node: AndLoOp): self._visit(node.left); self._visit(node.right)
     def _visit_OrLoOp(self, node: OrLoOp): self._visit(node.left); self._visit(node.right)
-    def _visit_EqToOp(self, node: EqToOp): self._visit(node.left); self._visit(node.right)
-    def _visit_NotEqToOp(self, node: NotEqToOp): self._visit(node.left); self._visit(node.right)
+    def _visit_EqToOp(self, node: EqToOp):
+        self._check_metric_comparison(node, '==')
+        self._visit(node.left)
+        self._visit(node.right)
+
+    def _visit_NotEqToOp(self, node: NotEqToOp):
+        self._check_metric_comparison(node, '~=')
+        self._visit(node.left)
+        self._visit(node.right)
     
     def _visit_LessThanOp(self, node: LessThanOp):
-        self._check_distance_comparison(node, '<')
+        self._check_metric_comparison(node, '<')
         self._visit(node.left)
         self._visit(node.right)
 
     def _visit_GreaterThanOp(self, node: GreaterThanOp):
-        self._check_distance_comparison(node, '>')
+        self._check_metric_comparison(node, '>')
         self._visit(node.left)
         self._visit(node.right)
 
     def _visit_LessOrEqThanOp(self, node: LessOrEqThanOp):
-        self._check_distance_comparison(node, '<=')
+        self._check_metric_comparison(node, '<=')
         self._visit(node.left)
         self._visit(node.right)
 
     def _visit_GreaterOrEqThanOp(self, node: GreaterOrEqThanOp):
-        self._check_distance_comparison(node, '>=')
+        self._check_metric_comparison(node, '>=')
         self._visit(node.left)
         self._visit(node.right)
     
-    def _check_distance_comparison(self, node, op: str):
-        """Check if this comparison involves distance_to() that could use distance_to_sqr()."""
-        # Pattern: obj:distance_to(target) < N  or  N > obj:distance_to(target)
+    def _check_metric_comparison(self, node, op: str):
+        """Check if this comparison involves distance_to/magnitude/etc that could use sqr version."""
+        metrics = {"distance_to", "magnitude", "magnitude_xz", "distance_to_xz"}
+
         invoke_node = None
         threshold_node = None
         
-        # check left side for distance_to invoke
+        # check left side
         if isinstance(node.left, Invoke):
             func_name = node.left.func.id if isinstance(node.left.func, Name) else None
-            if func_name == 'distance_to':
+            if func_name in metrics:
                 invoke_node = node.left
                 threshold_node = node.right
         
-        # check right side for distance_to invoke (reversed comparison)
+        # check right side (reversed comparison)
         if invoke_node is None and isinstance(node.right, Invoke):
             func_name = node.right.func.id if isinstance(node.right.func, Name) else None
-            if func_name == 'distance_to':
+            if func_name in metrics:
                 invoke_node = node.right
                 threshold_node = node.left
                 # Reverse the operator for analysis
-                op = {'<': '>', '>': '<', '<=': '>=', '>=': '<='}[op]
+                rev_map = {'<': '>', '>': '<', '<=': '>=', '>=': '<=', '==': '==', '~=': '~='}
+                op = rev_map[op]
         
         if invoke_node is None:
             return
@@ -1429,13 +1438,15 @@ class ASTAnalyzer:
             return
         
         threshold_value = threshold_node.n
+        metric_name = invoke_node.func.id
         
         # extract source and target
         source_obj = node_to_string(invoke_node.source)
-        target_obj = node_to_string(invoke_node.args[0]) if invoke_node.args else ""
+        target_obj = node_to_string(invoke_node.args[0]) if invoke_node.args else None
         
-        self.distance_comparisons.append(DistanceComparisonInfo(
+        self.metric_comparisons.append(MetricComparisonInfo(
             line=self._get_line(node),
+            metric_name=metric_name,
             source_obj=source_obj,
             target_obj=target_obj,
             comparison_op=op,
@@ -1515,7 +1526,7 @@ class ASTAnalyzer:
         self._analyze_nil_access()
         self._analyze_dead_code()
         self._analyze_per_frame_callbacks()
-        self._analyze_distance_to_comparisons()
+        self._analyze_metric_comparisons()
         self._analyze_vector_allocations_in_loops()
         self._analyze_plain_string_find()
         self._analyze_pairs_on_array()
@@ -1567,6 +1578,120 @@ class ASTAnalyzer:
         self._analyze_assignment_ternary()
         self._analyze_function_in_loop()
         self._analyze_vector_mad()
+        self._analyze_vector_set_simplification()
+        self._analyze_redundant_nil_assignment()
+
+    def _analyze_vector_set_simplification(self):
+        """Find v:set(0,0,0) and v:set(v2.x, v2.y, v2.z) and suggest simpler versions."""
+        for call in self.calls:
+            if call.func == 'set' and ':' in call.full_name:
+                # v:set(0,0,0) -> v:set(0)
+                if len(call.args) == 3:
+                    vals = [self._get_const_val(a) for a in call.args]
+                    if all(v == 0 for v in vals):
+                        self.findings.append(Finding(
+                            pattern_name='vector_set_zero',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'Simplify vector set: {call.full_name}(0,0,0) -> {call.module}:set(0)',
+                            details={'node': call.node, 'replacement': f'{call.module}:set(0)'},
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
+
+                    # v:set(v2.x, v2.y, v2.z) -> v:set(v2)
+                    if all(isinstance(a, Index) for a in call.args):
+                        bases = []
+                        idxs = []
+                        for a in call.args:
+                            bases.append(node_to_string(a.value))
+                            idxs.append(node_to_string(a.idx))
+
+                        if len(set(bases)) == 1 and idxs == ['x', 'y', 'z']:
+                            v2_str = bases[0]
+                            self.findings.append(Finding(
+                                pattern_name='vector_set_copy',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Simplify vector set: {call.full_name}({v2_str}.x, {v2_str}.y, {v2_str}.z) -> {call.module}:set({v2_str})',
+                                details={'node': call.node, 'replacement': f'{call.module}:set({v2_str})'},
+                                source_line=self._get_source_line(call.line),
+                            ))
+
+    def _analyze_redundant_nil_assignment(self):
+        """Find local x = nil and suggest local x."""
+        if not self._ast_tree: return
+        for node in ast.walk(self._ast_tree):
+            # Only handle simple single-variable local assignment for now to be safe with commas/formatting
+            if isinstance(node, LocalAssign) and len(node.targets) == 1 and len(node.values) == 1:
+                val = node.values[0]
+                if isinstance(val, Nil):
+                    target = node.targets[0]
+                    if isinstance(target, Name):
+                        self.findings.append(Finding(
+                            pattern_name='redundant_nil_assignment',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Redundant nil assignment: local {target.id} = nil -> local {target.id}',
+                            details={'node': node, 'target_idx': 0, 'var_name': target.id},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+
+    # @TODO: Check distance_to() implementation in xray source code more thoroughly
+    def _analyze_metric_comparisons(self):
+        """
+        Find metric calls (distance_to, magnitude, etc) in comparisons that can use sqr versions instead.
+        Should replace compared value with its square too.
+
+        This is auto-fixable and provides performance improvement
+        since metric functions require a square root operation.
+        """
+        metric_map = {
+            "distance_to": "distance_to_sqr",
+            "distance_to_xz": "distance_to_sqr_xz",
+            "magnitude": "magnitude_sqr",
+            "magnitude_xz": "magnitude_sqr_xz",
+        }
+
+        for comp in self.metric_comparisons:
+            squared_threshold = comp.threshold_value ** 2
+
+            # format the squared value nicely
+            if squared_threshold == int(squared_threshold):
+                squared_str = str(int(squared_threshold))
+            else:
+                squared_str = f"{squared_threshold:.6g}"
+
+            new_metric = metric_map.get(comp.metric_name)
+            if not new_metric: continue
+
+            if comp.target_obj:
+                original = f"{comp.source_obj}:{comp.metric_name}({comp.target_obj}) {comp.comparison_op} {comp.threshold_value}"
+                optimized = f"{comp.source_obj}:{new_metric}({comp.target_obj}) {comp.comparison_op} {squared_str}"
+            else:
+                original = f"{comp.source_obj}:{comp.metric_name}() {comp.comparison_op} {comp.threshold_value}"
+                optimized = f"{comp.source_obj}:{new_metric}() {comp.comparison_op} {squared_str}"
+
+            self.findings.append(Finding(
+                pattern_name='metric_sqr_optimization',
+                severity='GREEN',  # Auto-fixable
+                line_num=comp.line,
+                message=f'Use {new_metric}() to avoid sqrt: {original} -> {optimized}',
+                details={
+                    'metric_name': comp.metric_name,
+                    'new_metric': new_metric,
+                    'source_obj': comp.source_obj,
+                    'target_obj': comp.target_obj,
+                    'comparison_op': comp.comparison_op,
+                    'original_threshold': comp.threshold_value,
+                    'squared_threshold': squared_threshold,
+                    'squared_threshold_str': squared_str,
+                    'invoke_node': comp.invoke_node,
+                    'threshold_node': comp.threshold_node,
+                    'full_node': comp.full_node,
+                },
+                source_line=self._get_source_line(comp.line),
+            ))
 
     def _analyze_vector_mad(self):
         """Find v = v + v2 * s and suggest v:mad(v2, s)."""
