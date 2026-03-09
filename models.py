@@ -187,16 +187,17 @@ class PerFrameCallbackInfo:
 
 
 @dataclass
-class DistanceComparisonInfo:
-    """Information about distance_to() used in comparison (can be optimized to distance_to_sqr())."""
+class MetricComparisonInfo:
+    """Information about a metric (distance, magnitude) used in comparison (can be optimized to sqr version)."""
     line: int
-    source_obj: str          # the object calling distance_to (e.g., "pos", "actor:position()")
-    target_obj: str          # the argument to distance_to (e.g., "target_pos")
-    comparison_op: str       # '<', '<=', '>', '>='
-    threshold_value: float   # the numeric threshold (e.g., 10)
-    threshold_node: Node     # the AST node for the threshold (for replacement)
+    metric_name: str         # "distance_to", "magnitude", "magnitude_xz", "distance_to_xz"
+    source_obj: str          # the object calling the metric
+    target_obj: Optional[str] # the argument (if any)
+    comparison_op: str       # '<', '<=', '>', '>=', '==', '~='
+    threshold_value: float   # the numeric threshold
+    threshold_node: Node     # the AST node for the threshold
     full_node: Node          # the full comparison node
-    invoke_node: Node        # the distance_to invoke node
+    invoke_node: Node        # the invoke/call node
 
 
 @dataclass

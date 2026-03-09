@@ -31,7 +31,7 @@ PERFORMANCE_IMPACT = {
     'string_concat_in_loop': 'critical',
 
     # HIGH - moderate to high impact in tight loops
-    'distance_to_comparison': 'high',
+    'metric_sqr_optimization': 'high',
     'table_insert_append': 'high',
     'math_pow_simple': 'high',
     'string_format_in_loop': 'high',

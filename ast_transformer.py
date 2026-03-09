@@ -169,8 +169,10 @@ class ASTTransformer:
                 self._edit_dead_code(finding)
         elif pattern.startswith('repeated_'):
             self._edit_repeated_calls(finding)
-        elif pattern == 'distance_to_comparison':
-            self._edit_distance_to_comparison(finding)
+        elif pattern in ('metric_comparison_sqr', 'metric_direct_access'):
+            self._edit_algebraic_simplification(finding)
+        elif pattern == 'metric_sqr_optimization':
+            self._edit_metric_sqr_optimization(finding)
         elif pattern == 'string_find_plain':
             self._edit_string_find_plain(finding)
         elif pattern == 'table_remove_last':
@@ -213,6 +215,10 @@ class ASTTransformer:
             self._edit_redundant_type_conversion(finding)
         elif pattern == 'string_byte_1':
             self._edit_string_byte_1(finding)
+        elif pattern == 'pairs_to_next':
+            self._edit_algebraic_simplification(finding)
+        elif pattern in ('string_concat_tostring', 'string_byte_range'):
+            self._edit_algebraic_simplification(finding)
         elif pattern == 'return_ternary_simplification':
             self._edit_return_ternary_simplification(finding)
         elif pattern == 'math_atan2_to_atan':
@@ -227,7 +233,7 @@ class ASTTransformer:
             self._edit_math_random_0_1(finding)
         elif pattern == 'string_rep_simple':
             self._edit_string_rep_simple(finding)
-        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index', 'string_empty_check'):
+        elif pattern in ('algebraic_simplification', 'bitwise_identity', 'string_sub_identity', 'string_identity', 'math_identity', 'string_sub_negative_index', 'string_empty_check', 'math_clamp_suggestion', 'comparison_identity'):
             self._edit_algebraic_simplification(finding)
         elif pattern in ('string_starts_with_sub', 'string_starts_with_byte'):
             self._edit_string_starts_with(finding)
@@ -239,6 +245,18 @@ class ASTTransformer:
             self._edit_table_concat_default_sep(finding)
         elif pattern == 'table_literal_indices':
             self._edit_table_literal_indices(finding)
+        elif pattern == 'inplace_vector_op':
+            self._edit_inplace_vector_op(finding)
+        elif pattern == 'table_emptiness_check':
+            self._edit_table_emptiness_check(finding)
+        elif pattern == 'loop_invariant_global':
+            self._edit_loop_invariant_global(finding)
+        elif pattern == 'vector_mad':
+            self._edit_vector_mad(finding)
+        elif pattern in ('table_clear_pattern', 'assignment_ternary_simplification', 'bool_assignment_simplification', 'redundant_string_format', 'vector_method_single_arg', 'vector_method_copy', 'vector_init_zero', 'vector_redundant_op', 'vector_mul_zero', 'vector_set_chain', 'vector_copy_identity', 'vector_constructor_copy', 'vector_set_vector'):
+            self._edit_algebraic_simplification(finding)
+        elif pattern == 'redundant_nil_assignment':
+            self._edit_redundant_nil_assignment(finding)
 
 
     # Edit methods using AST positions
@@ -262,7 +280,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10 # Higher priority than simple constant folding
+            priority=20 # Higher priority than constant folding
         ))
 
     def _edit_unpack_to_indexing(self, finding: Finding):
@@ -368,12 +386,8 @@ class ASTTransformer:
         if start is None:
             return
 
-        # Compound identities (like math.sqrt(x*x)) should have higher priority than
-        # simple ones (like math.pow(x, 2)) to avoid partial transformations blocking
-        # the better ones.
-        priority = 10
-        if finding.pattern_name in ('math_identity', 'string_sub_negative_index'):
-            priority = 20
+        # Identities and structural simplifications have high priority
+        priority = 20
 
         self.edits.append(SourceEdit(
             start_char=start,
@@ -482,7 +496,8 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
-            replacement=f'math.atan({y_str})'
+            replacement=f'math.atan({y_str})',
+            priority=20
         ))
 
     def _edit_return_ternary_simplification(self, finding: Finding):
@@ -506,7 +521,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_if_nil_assign(self, finding: Finding):
@@ -528,7 +543,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_redundant_boolean_comp(self, finding: Finding):
@@ -570,7 +585,93 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
+        ))
+
+    def _edit_loop_invariant_global(self, finding: Finding):
+        """Hoist loop-invariant global access outside of the loop."""
+        loop_node = finding.details.get('loop_node')
+        name = finding.details.get('name')
+        usage_nodes = finding.details.get('nodes', [])
+        is_call = finding.details.get('is_call', False)
+        local_name = finding.details.get('local_name')
+
+        if not loop_node or not name or not usage_nodes or not local_name:
+            return
+
+        # 2. Insert local declaration before the loop
+        loop_start = self._get_line_start(self.analyzer._get_line(loop_node))
+        if loop_start is None:
+            return
+
+        indent = self._get_indent_at_line(self.analyzer._get_line(loop_node))
+
+        rhs = name
+        if is_call:
+            rhs = f'{name}()'
+
+        # Check if already cached in parent scope (simplified check)
+        # We don't want to shadow if the parent already has this local
+        declaration = f'local {local_name} = {rhs}\n{indent}'
+
+        self.edits.append(SourceEdit(
+            start_char=loop_start,
+            end_char=loop_start,
+            replacement=declaration,
+            priority=100
+        ))
+
+        # 3. Replace all usages inside the loop
+        for node in usage_nodes:
+            start, end = self._get_node_span(node)
+            if start is not None:
+                self.edits.append(SourceEdit(
+                    start_char=start,
+                    end_char=end,
+                    replacement=local_name,
+                    priority=50
+                ))
+
+    def _edit_table_emptiness_check(self, finding: Finding):
+        """Replace #t == 0 with next(t) == nil."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Lower priority so string_empty_check (priority 10) takes precedence if ambiguous
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=5
+        ))
+
+    def _edit_inplace_vector_op(self, finding: Finding):
+        """Replace v = v + d with v:add(d)."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        # Special priority for table_clear_pattern which might overlap with algebraic simplifications
+        priority = 20
+        if finding.pattern_name == 'table_clear_pattern':
+            priority = 25
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=priority
         ))
 
     def _edit_table_literal_indices(self, finding: Finding):
@@ -607,7 +708,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_logical_identity(self, finding: Finding):
@@ -625,7 +726,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_string_starts_with(self, finding: Finding):
@@ -643,25 +744,7 @@ class ASTTransformer:
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10
-        ))
-
-    def _edit_algebraic_simplification(self, finding: Finding):
-        """Replace redundant algebraic operation with the target expression."""
-        node = finding.details.get('node')
-        replacement = finding.details.get('replacement')
-        if not node or replacement is None:
-            return
-
-        start, end = self._get_node_span(node)
-        if start is None:
-            return
-
-        self.edits.append(SourceEdit(
-            start_char=start,
-            end_char=end,
-            replacement=replacement,
-            priority=10
+            priority=20
         ))
 
     def _edit_table_remove_last(self, finding: Finding):
@@ -823,7 +906,7 @@ class ASTTransformer:
             start_char=replace_start,
             end_char=replace_end,
             replacement=f' {k_var} = 1, #{table_name} ',
-            priority=10
+            priority=20
         ))
 
         # 2. Insert "local v = table[k]" at the beginning of the body
@@ -910,9 +993,9 @@ class ASTTransformer:
         if start is None:
             return
 
-        # Give Call folding higher priority than nested expression folding
-        from luaparser.astnodes import Call
-        priority = 10 if isinstance(node, Call) else 0
+        # Give constant folding lower priority than structural identities (20)
+        # to ensure identities like math.abs(x) < -1 take precedence over folding -1.
+        priority = 15
 
         self.edits.append(SourceEdit(
             start_char=start,
@@ -1182,62 +1265,122 @@ class ASTTransformer:
             if not isinstance(node.args[1], (Name, Number, Call, Invoke, Index)):
                 exp_str = f'({exp_str})'
             replacement = f'{base} ^ {exp_str}'
+
         else:
+            return
+
+        priority = 20
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=priority,
+        ))
+
+    def _edit_vector_mad(self, finding: Finding):
+        """Replace v = v + v2 * s with v:mad(v2, s)."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or not replacement:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
             return
 
         self.edits.append(SourceEdit(
             start_char=start,
             end_char=end,
             replacement=replacement,
-            priority=10 if finding.pattern_name == 'math_pow_to_expo' else 5,
+            priority=25 # Higher priority than general inplace_vector_op
         ))
 
-    def _edit_distance_to_comparison(self, finding: Finding):
+    def _edit_redundant_nil_assignment(self, finding: Finding):
+        """Convert local x = nil to local x."""
+        node = finding.details.get('node')
+        target_idx = finding.details.get('target_idx')
+
+        if not node or target_idx is None:
+            return
+
+        # Find the nil value in node.values
+        val_node = node.values[target_idx]
+        start, end = self._get_node_span(val_node)
+
+        if start is None:
+            return
+
+        # Search backwards for the '='
+        pos = start - 1
+        while pos >= 0 and self.source[pos] in ' \t':
+            pos -= 1
+
+        if pos >= 0 and self.source[pos] == '=':
+            # We want to remove from the '=' to the end of 'nil'
+            self.edits.append(SourceEdit(
+                start_char=pos,
+                end_char=end,
+                replacement=''
+            ))
+
+    def _edit_algebraic_simplification(self, finding: Finding):
+        """Replace redundant algebraic operation with the target expression."""
+        node = finding.details.get('node')
+        replacement = finding.details.get('replacement')
+        if not node or replacement is None:
+            return
+
+        start, end = self._get_node_span(node)
+        if start is None:
+            return
+
+        self.edits.append(SourceEdit(
+            start_char=start,
+            end_char=end,
+            replacement=replacement,
+            priority=20
+        ))
+
+    def _edit_metric_sqr_optimization(self, finding: Finding):
         """
-        Convert distance_to() comparison to distance_to_sqr().
+        Convert metric calls to sqr versions.
         Compared values should be replaced with square.
-        
-        Example:
-            pos:distance_to(target) < 10
-        Becomes:
-            pos:distance_to_sqr(target) < 100
-        
-        This avoids the sqrt operation inside distance_to().
         """
         invoke_node = finding.details.get('invoke_node')
         threshold_node = finding.details.get('threshold_node')
         squared_threshold_str = finding.details.get('squared_threshold_str', '')
+        metric_name = finding.details.get('metric_name')
+        new_metric = finding.details.get('new_metric')
         
-        if not invoke_node or not threshold_node or not squared_threshold_str:
+        if not invoke_node or not threshold_node or not squared_threshold_str or not metric_name or not new_metric:
             return
         
-        # edit 1: change distance_to to distance_to_sqr in the method name
-        # get the span of the invoke node and find "distance_to" within it
+        # edit 1: change metric to sqr version
         invoke_start, invoke_end = self._get_node_span(invoke_node)
         if invoke_start is not None:
             invoke_text = self.source[invoke_start:invoke_end]
-            # find ":distance_to(" pattern
-            method_idx = invoke_text.find(':distance_to(')
+            # find the metric name in the invoke text (e.g. ":magnitude")
+            method_idx = invoke_text.find(f':{metric_name}')
             if method_idx != -1:
-                # position of "distance_to" (after the colon)
-                method_name_start = invoke_start + method_idx + 1  # +1 to skip ':'
-                method_name_end = method_name_start + len('distance_to')
+                method_name_start = invoke_start + method_idx + 1
+                method_name_end = method_name_start + len(metric_name)
                 
                 self.edits.append(SourceEdit(
                     start_char=method_name_start,
                     end_char=method_name_end,
-                    replacement='distance_to_sqr',
-                    priority=1,  # apply method name change first
+                    replacement=new_metric,
+                    priority=20
                 ))
         
-        # edit 2: change the threshold value to its squared version
+        # edit 2: change the threshold value
         threshold_start, threshold_end = self._get_node_span(threshold_node)
         if threshold_start is not None:
             self.edits.append(SourceEdit(
                 start_char=threshold_start,
                 end_char=threshold_end,
                 replacement=squared_threshold_str,
-                priority=0,
+                priority=20
             ))
 
     @staticmethod
@@ -2039,13 +2182,14 @@ class ASTTransformer:
             new_name = 'level_name'
             call_pattern = 'level.name()'
             call_pattern_re = re.compile(r'\blevel\.name\s*\(')
-        elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
+        elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()') or \
+             pattern.endswith('_position()') or pattern.endswith('_direction()') or pattern.endswith('_level_vertex_id()') or pattern.endswith('_game_vertex_id()'):
             # dynamic method caching: repeated_obj_section(), repeated_item_id(), etc
             # extract object name and method from pattern: repeated_obj_section() -> obj, section
             # pattern format: repeated_{objname}_{method}()
             # NOTE: story_id must be checked before id since _id() is suffix of _story_id()
             # NOTE: Use non-greedy (.+?) to avoid capturing part of method name
-            match = re.match(r'repeated_(.+?)_(story_id|section|clsid|id)\(\)$', pattern)
+            match = re.match(r'repeated_(.+?)_(story_id|section|clsid|id|position|direction|level_vertex_id|game_vertex_id)\(\)$', pattern)
             if not match:
                 return
             sanitized_obj_name = match.group(1)
@@ -2077,6 +2221,14 @@ class ASTTransformer:
                 new_name = f'{sanitized_obj_name}_cls'
             elif method_name == 'story_id':
                 new_name = f'{sanitized_obj_name}_sid'
+            elif method_name == 'position':
+                new_name = f'{sanitized_obj_name}_pos'
+            elif method_name == 'direction':
+                new_name = f'{sanitized_obj_name}_dir'
+            elif method_name == 'level_vertex_id':
+                new_name = f'{sanitized_obj_name}_lvid'
+            elif method_name == 'game_vertex_id':
+                new_name = f'{sanitized_obj_name}_gvid'
             else:
                 new_name = f'{sanitized_obj_name}_{method_name}'
             
@@ -2640,8 +2792,9 @@ class ASTTransformer:
 
         from bisect import bisect_left, bisect_right
 
-        # sort by priority descending, then position descending
-        self.edits.sort(key=lambda e: (-e.priority, -e.start_char))
+        # sort by priority descending, then position ascending, then end_char descending
+        # this ensures that for same priority, the outer-most (earliest and longest) edit wins
+        self.edits.sort(key=lambda e: (-e.priority, e.start_char, -e.end_char))
 
         filtered = []
         # sorted list of (start, end) for accepted non-insertion edits

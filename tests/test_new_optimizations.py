@@ -245,5 +245,128 @@ class TestNewOptimizations(unittest.TestCase):
         self.assertTrue(modified)
         self.assertIn("string.char(string.byte(s))", new_content)
 
+    def test_inplace_vector_div(self):
+        script = "function test() local v = vector() v = v / 2 end"
+        path = self.test_dir / "vec_div.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("v:div(2)", new_content)
+
+    def test_inplace_vector_neg(self):
+        script = "function test() local v = vector() v = -v end"
+        path = self.test_dir / "vec_neg.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("v:mul(-1)", new_content)
+
+    def test_string_concat_tostring(self):
+        # Use a non-constant number (from math.random) to avoid full folding into a single string literal
+        script = 'local n = math.random() local s = "res" .. tostring(n)'
+        path = self.test_dir / "concat_ts.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn('"res" .. n', new_content)
+
+    def test_string_byte_range(self):
+        script = "local b = string.byte(s, i, i)"
+        path = self.test_dir / "byte_range.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("string.byte(s, i)", new_content)
+
+    def test_comparison_identities_abs_neg(self):
+        script = "if math.abs(x) < -1 then print(1) end"
+        path = self.test_dir / "abs_neg.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("if false then", new_content)
+
+    def test_table_insert_safety(self):
+        script = "table.insert(get_table(), v)"
+        path = self.test_dir / "ins_safe.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertFalse(modified)
+
+    def test_precedence_algebraic(self):
+        script = "local x = 0 - (a + b)"
+        path = self.test_dir / "prec.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("local x = - (a + b)", new_content)
+
+    def test_vector_local_safety(self):
+        # Should NOT transform LocalAssign
+        script = "local v = v + d"
+        path = self.test_dir / "vec_local.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertFalse(modified)
+
+    def test_hoisting_shadow_safety(self):
+        # Should NOT hoist if local_name is redefined in loop
+        script = """
+        for i=1, 10 do
+            local actor = "shadow"
+            print(db.actor)
+        end
+        """
+        path = self.test_dir / "hoist_shadow.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertFalse(modified)
+
+    def test_table_clear_pattern(self):
+        script = "for k,v in pairs(t) do t[k] = nil end"
+        path = self.test_dir / "clear.lua"
+        path.write_text(script)
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'table_clear_pattern' for f in findings))
+
+    def test_assignment_ternary(self):
+        script = "if cond then x = 1 else x = 2 end"
+        path = self.test_dir / "ternary.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("x = cond and 1 or 2", new_content)
+
+    def test_redundant_string_format(self):
+        script = 'local s = string.format("%s", x)'
+        path = self.test_dir / "fmt_red.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn("tostring(x)", new_content)
+
+    def test_constant_folding_extended(self):
+        script = 'local s = string.sub("hello", 1, 3) .. table.concat({"a", "b"}, "-")'
+        path = self.test_dir / "fold_ext.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False)
+        self.assertTrue(modified)
+        self.assertIn('local s = "hela-b"', new_content)
+
+    def test_vector_mad(self):
+        script = "function test() local v = vector() local v2 = vector() v = v + v2 * 0.5 end"
+        path = self.test_dir / "mad.lua"
+        path.write_text(script)
+        modified, new_content, _ = self.transformer.transform_file(path, backup=False, fix_yellow=True)
+        self.assertTrue(modified)
+        self.assertIn("v:mad(v2, 0.5)", new_content)
+
+    def test_function_in_loop(self):
+        script = "for i=1, 10 do local function f() end end"
+        path = self.test_dir / "func_loop.lua"
+        path.write_text(script)
+        findings = self.analyzer.analyze_file(path)
+        self.assertTrue(any(f.pattern_name == 'function_in_loop' for f in findings))
+
 if __name__ == "__main__":
     unittest.main()
