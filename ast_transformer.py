@@ -243,9 +243,11 @@ class ASTTransformer:
             self._edit_nested_redundant_call(finding)
         elif pattern == 'table_concat_default_sep':
             self._edit_table_concat_default_sep(finding)
+        elif pattern == 'table_sort_redundant_comparator':
+            self._edit_algebraic_simplification(finding)
         elif pattern == 'table_literal_indices':
             self._edit_table_literal_indices(finding)
-        elif pattern == 'inplace_vector_op':
+        elif pattern in ('inplace_vector_op', 'vector_inverse_chain'):
             self._edit_inplace_vector_op(finding)
         elif pattern == 'table_emptiness_check':
             self._edit_table_emptiness_check(finding)

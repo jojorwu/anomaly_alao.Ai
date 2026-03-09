@@ -11,6 +11,7 @@ from luaparser.astnodes import (
     If, ElseIf,
     Call, Invoke,
     Index, Name, String, Number, Nil, TrueExpr, FalseExpr,
+    AnonymousFunction,
     Table, Field,
     Concat, AddOp, SubOp, MultOp, FloatDivOp, ModOp, ExpoOp,
     Return, Break,
@@ -1508,6 +1509,7 @@ class ASTAnalyzer:
         self._analyze_inplace_vector_ops()
         self._analyze_string_concat_tostring()
         self._analyze_string_byte_range()
+        self._analyze_table_sort()
         self._analyze_table_insert()
         self._analyze_table_remove()
         self._analyze_deprecated_funcs()
@@ -1582,8 +1584,89 @@ class ASTAnalyzer:
         self._analyze_assignment_ternary()
         self._analyze_function_in_loop()
         self._analyze_vector_mad()
+        self._analyze_vector_inverse_chain()
         self._analyze_vector_simplification()
         self._analyze_redundant_nil_assignment()
+
+    def _analyze_vector_inverse_chain(self):
+        """Find inverse vector operations like v:add(v2):sub(v2) and suggest v."""
+        for call in self.calls:
+            # Check for v:sub(v2) where v is v:add(v2)
+            if call.func == 'sub' and ':' in call.full_name and len(call.args) == 1:
+                if isinstance(call.node, Invoke) and isinstance(call.node.source, Invoke):
+                    inner_invoke = call.node.source
+                    if inner_invoke.func.id == 'add' and len(inner_invoke.args) == 1:
+                        # Check if args are same
+                        arg_outer = node_to_string(call.args[0])
+                        arg_inner = node_to_string(inner_invoke.args[0])
+                        if arg_outer == arg_inner and self._is_simple_expr(call.args[0]):
+                            replacement = node_to_string(inner_invoke.source)
+                            self.findings.append(Finding(
+                                pattern_name='vector_inverse_chain',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Inverse vector operations: {call.full_name}({arg_outer}) cancels {inner_invoke.func.id}({arg_inner})',
+                                details={'node': call.node, 'replacement': replacement},
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
+
+            # Check for v:add(v2) where v is v:sub(v2)
+            if call.func == 'add' and ':' in call.full_name and len(call.args) == 1:
+                if isinstance(call.node, Invoke) and isinstance(call.node.source, Invoke):
+                    inner_invoke = call.node.source
+                    if inner_invoke.func.id == 'sub' and len(inner_invoke.args) == 1:
+                        arg_outer = node_to_string(call.args[0])
+                        arg_inner = node_to_string(inner_invoke.args[0])
+                        if arg_outer == arg_inner and self._is_simple_expr(call.args[0]):
+                            replacement = node_to_string(inner_invoke.source)
+                            self.findings.append(Finding(
+                                pattern_name='vector_inverse_chain',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Inverse vector operations: {call.full_name}({arg_outer}) cancels {inner_invoke.func.id}({arg_inner})',
+                                details={'node': call.node, 'replacement': replacement},
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
+
+            # Check for v:div(s) where v is v:mul(s)
+            if call.func == 'div' and ':' in call.full_name and len(call.args) == 1:
+                if isinstance(call.node, Invoke) and isinstance(call.node.source, Invoke):
+                    inner_invoke = call.node.source
+                    if inner_invoke.func.id == 'mul' and len(inner_invoke.args) == 1:
+                        arg_outer = node_to_string(call.args[0])
+                        arg_inner = node_to_string(inner_invoke.args[0])
+                        if arg_outer == arg_inner and self._is_simple_expr(call.args[0]):
+                            replacement = node_to_string(inner_invoke.source)
+                            self.findings.append(Finding(
+                                pattern_name='vector_inverse_chain',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Inverse vector operations: {call.full_name}({arg_outer}) cancels {inner_invoke.func.id}({arg_inner})',
+                                details={'node': call.node, 'replacement': replacement},
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
+
+            # Check for v:mul(s) where v is v:div(s)
+            if call.func == 'mul' and ':' in call.full_name and len(call.args) == 1:
+                if isinstance(call.node, Invoke) and isinstance(call.node.source, Invoke):
+                    inner_invoke = call.node.source
+                    if inner_invoke.func.id == 'div' and len(inner_invoke.args) == 1:
+                        arg_outer = node_to_string(call.args[0])
+                        arg_inner = node_to_string(inner_invoke.args[0])
+                        if arg_outer == arg_inner and self._is_simple_expr(call.args[0]):
+                            replacement = node_to_string(inner_invoke.source)
+                            self.findings.append(Finding(
+                                pattern_name='vector_inverse_chain',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Inverse vector operations: {call.full_name}({arg_outer}) cancels {inner_invoke.func.id}({arg_inner})',
+                                details={'node': call.node, 'replacement': replacement},
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
 
     def _analyze_vector_simplification(self):
         """Find simplifiable vector operations like v:set(0,0,0) or v:add(x,x,x)."""
@@ -3143,7 +3226,47 @@ class ASTAnalyzer:
                     if target:
                         replacement = node_to_string(target)
 
-                    if replacement:
+                if not replacement:
+                    # check for absorption laws: (a and b) or a -> a
+                    a_str = None
+                    left = node.left
+                    right = node.right
+
+                    def strip_parens(s):
+                        while s.startswith('(') and s.endswith(')'):
+                            s = s[1:-1].strip()
+                        return s
+
+                    l_str = strip_parens(node_to_string(left))
+                    r_str = strip_parens(node_to_string(right))
+
+                    if isinstance(node, OrLoOp):
+                        if isinstance(left, AndLoOp):
+                            if strip_parens(node_to_string(left.left)) == r_str or \
+                               strip_parens(node_to_string(left.right)) == r_str:
+                                a_str = r_str
+                                reason = "(a and b) or a"
+                        elif isinstance(right, AndLoOp):
+                            if strip_parens(node_to_string(right.left)) == l_str or \
+                               strip_parens(node_to_string(right.right)) == l_str:
+                                a_str = l_str
+                                reason = "a or (a and b)"
+                    elif isinstance(node, AndLoOp):
+                        if isinstance(left, OrLoOp):
+                            if strip_parens(node_to_string(left.left)) == r_str or \
+                               strip_parens(node_to_string(left.right)) == r_str:
+                                a_str = r_str
+                                reason = "(a or b) and a"
+                        elif isinstance(right, OrLoOp):
+                            if strip_parens(node_to_string(right.left)) == l_str or \
+                               strip_parens(node_to_string(right.right)) == l_str:
+                                a_str = l_str
+                                reason = "a and (a or b)"
+
+                    if a_str:
+                        replacement = a_str
+
+                if replacement:
                         self.findings.append(Finding(
                             pattern_name='logical_identity',
                             severity='GREEN',
@@ -4734,6 +4857,39 @@ class ASTAnalyzer:
                     },
                     source_line=self._get_source_line(call.line),
                 ))
+
+    def _analyze_table_sort(self):
+        """Find table.sort(t, function(a,b) return a < b end) and suggest table.sort(t)."""
+        for call in self.calls:
+            if call.full_name == 'table.sort' and len(call.args) == 2:
+                comparator = call.args[1]
+                if isinstance(comparator, AnonymousFunction) and len(comparator.args) == 2:
+                    # Check for simple return a < b
+                    body = comparator.body.body
+                    if len(body) == 1 and isinstance(body[0], Return):
+                        ret_vals = body[0].values
+                        if len(ret_vals) == 1 and isinstance(ret_vals[0], LessThanOp):
+                            lt = ret_vals[0]
+                            # Check if operands match parameters
+                            arg1 = comparator.args[0].id if isinstance(comparator.args[0], Name) else None
+                            arg2 = comparator.args[1].id if isinstance(comparator.args[1], Name) else None
+
+                            if arg1 and arg2 and \
+                               isinstance(lt.left, Name) and lt.left.id == arg1 and \
+                               isinstance(lt.right, Name) and lt.right.id == arg2:
+
+                                table_str = node_to_string(call.args[0])
+                                self.findings.append(Finding(
+                                    pattern_name='table_sort_redundant_comparator',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'Redundant table.sort comparator: table.sort({table_str}, function({arg1},{arg2}) return {arg1} < {arg2} end) -> table.sort({table_str})',
+                                    details={
+                                        'node': call.node,
+                                        'replacement': f'table.sort({table_str})'
+                                    },
+                                    source_line=self._get_source_line(call.line),
+                                ))
 
     def _analyze_table_insert(self):
         """Find table.insert(t, v) and table.insert(t, #t+1, v) patterns."""
