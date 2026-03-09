@@ -1572,7 +1572,6 @@ class ASTAnalyzer:
         self._analyze_bit_identity()
         self._analyze_string_find_args()
         self._analyze_math_sqrt_pow()
-        self._analyze_math_tan_atan_identity()
         self._analyze_comparison_identities()
         self._analyze_table_concat_single()
         self._analyze_math_clamp()
@@ -1963,24 +1962,38 @@ class ASTAnalyzer:
                             v2 = stmt2.values[0]
 
                             if node_to_string(t1) == node_to_string(t2) and \
-                               self._is_simple_expr(v1) and self._is_simple_expr(v2) and \
-                               self._is_guaranteed_truthy(v1):
+                               self._is_simple_expr(v1) and self._is_simple_expr(v2):
 
                                 target_str = node_to_string(t1)
                                 cond_str = node_to_string(node.test)
                                 v1_str = node_to_string(v1)
                                 v2_str = node_to_string(v2)
 
-                                replacement = f"{target_str} = {cond_str} and {v1_str} or {v2_str}"
+                                replacement = None
+                                severity = 'YELLOW'
+                                pattern_name = 'assignment_ternary_simplification'
 
-                                self.findings.append(Finding(
-                                    pattern_name='assignment_ternary_simplification',
-                                    severity='YELLOW',
-                                    line_num=self._get_line(node),
-                                    message=f'if {cond_str} then {target_str} = {v1_str} else {target_str} = {v2_str} end -> {replacement}',
-                                    details={'node': node, 'replacement': replacement},
-                                    source_line=self._get_source_line(self._get_line(node)),
-                                ))
+                                # special case for booleans
+                                if isinstance(v1, TrueExpr) and isinstance(v2, FalseExpr):
+                                    replacement = f"{target_str} = not not ({cond_str})"
+                                    severity = 'GREEN'
+                                    pattern_name = 'bool_assignment_simplification'
+                                elif isinstance(v1, FalseExpr) and isinstance(v2, TrueExpr):
+                                    replacement = f"{target_str} = not ({cond_str})"
+                                    severity = 'GREEN'
+                                    pattern_name = 'bool_assignment_simplification'
+                                elif self._is_guaranteed_truthy(v1):
+                                    replacement = f"{target_str} = {cond_str} and {v1_str} or {v2_str}"
+
+                                if replacement:
+                                    self.findings.append(Finding(
+                                        pattern_name=pattern_name,
+                                        severity=severity,
+                                        line_num=self._get_line(node),
+                                        message=f'Simplify assignment: if {cond_str} then {target_str} = {v1_str} else {target_str} = {v2_str} end -> {replacement}',
+                                        details={'node': node, 'replacement': replacement},
+                                        source_line=self._get_source_line(self._get_line(node)),
+                                    ))
 
     def _analyze_table_clear_pattern(self):
         """Detect loops that manually clear tables and suggest table.clear()."""
@@ -2420,6 +2433,9 @@ class ASTAnalyzer:
                             elif op in (NotEqToOp, GreaterThanOp): replacement = f"{x_str} > 0"
                             elif op == GreaterOrEqThanOp: replacement = f"{x_str} >= 0"
                             elif op == LessThanOp: replacement = "false"
+                        elif const_val < 0:
+                            if op in (EqToOp, LessThanOp, LessOrEqThanOp): replacement = "false"
+                            elif op in (NotEqToOp, GreaterThanOp, GreaterOrEqThanOp): replacement = "true"
                         elif const_val > 0:
                             c2 = const_val * const_val
                             c2_str = str(int(c2)) if c2 == int(c2) else f"{c2:.6g}"
@@ -2434,8 +2450,8 @@ class ASTAnalyzer:
                             elif op in (GreaterThanOp, NotEqToOp): replacement = f"{x_str} ~= 0"
                             elif op in (LessOrEqThanOp, EqToOp): replacement = f"{x_str} == 0"
                         elif const_val < 0:
-                            if op in (GreaterThanOp, GreaterOrEqThanOp, NotEqToOp): replacement = "true"
-                            elif op in (LessThanOp, LessOrEqThanOp, EqToOp): replacement = "false"
+                            if op in (EqToOp, LessThanOp, LessOrEqThanOp): replacement = "false"
+                            elif op in (NotEqToOp, GreaterThanOp, GreaterOrEqThanOp): replacement = "true"
                         elif const_val > 0:
                             # only for simple vars to avoid double eval
                             if self._is_simple_expr(arg_node):
@@ -2820,6 +2836,9 @@ class ASTAnalyzer:
             ('string.char', 'string.byte'): 'inverse',
             ('tonumber', 'tostring'): 'redundant_inner',
             ('tostring', 'tonumber'): 'redundant_inner',
+            ('math.asin', 'math.sin'): 'inverse',
+            ('math.acos', 'math.cos'): 'inverse',
+            ('math.atan', 'math.tan'): 'inverse',
         }
 
         for call in self.calls:
@@ -3602,16 +3621,32 @@ class ASTAnalyzer:
     def _analyze_pairs_to_next(self):
         """Suggest next, t instead of pairs(t) in hot loops for LuaJIT."""
         for call in self.calls:
-            if call.full_name == 'pairs' and (call.scope.is_hot_callback or call.in_loop):
-                table_name = node_to_string(call.args[0]) if call.args else "t"
+            if call.full_name == 'pairs':
+                # only relevant if it's used in a for-in loop header
+                is_for_iter = False
+                parent = self.parent_map.get(id(call.node))
+                if isinstance(parent, Forin) and call.node in parent.iter:
+                    is_for_iter = True
+
+                if not is_for_iter:
+                    continue
+
+                table_node = call.args[0] if call.args else None
+                table_name = node_to_string(table_node) if table_node else "t"
+
+                # only auto-fix if table is a simple variable (to avoid double evaluation)
+                is_simple_table = self._is_simple_expr(table_node) if table_node else False
+                severity = 'GREEN' if is_simple_table else 'YELLOW'
+
                 self.findings.append(Finding(
                     pattern_name='pairs_to_next',
-                    severity='YELLOW',
+                    severity=severity,
                     line_num=call.line,
                     message=f'pairs({table_name}) in hot loop -> next, {table_name}, nil is faster in LuaJIT',
                     details={
                         'table': table_name,
                         'node': call.node,
+                        'replacement': f'next, {table_name}, nil'
                     },
                     source_line=self._get_source_line(call.line),
                 ))
@@ -4017,22 +4052,33 @@ class ASTAnalyzer:
                 arg2 = call.args[1]
                 arg3 = call.args[2] if len(call.args) > 2 else None
 
-                # Identity: string.sub(s, 1) -> s
-                if len(call.args) == 2 and isinstance(arg2, Number) and arg2.n == 1:
+                # Identity: string.sub(s, 1) -> s, string.sub(s, 1, -1) -> s, string.sub(s, 1, #s) -> s
+                if len(call.args) >= 2 and isinstance(arg2, Number) and arg2.n == 1:
                     if self._infer_type(arg1) == 'string':
                         s_str = node_to_string(arg1)
-                        self.findings.append(Finding(
-                            pattern_name='string_identity',
-                            severity='GREEN',
-                            line_num=call.line,
-                            message=f'String identity: string.sub({s_str}, 1) -> {s_str}',
-                            details={
-                                'node': call.node,
-                                'replacement': s_str
-                            },
-                            source_line=self._get_source_line(call.line),
-                        ))
-                        continue
+                        is_identity = False
+                        if len(call.args) == 2:
+                            is_identity = True
+                        else:
+                            arg3_val = self._get_const_val(call.args[2])
+                            if arg3_val == -1:
+                                is_identity = True
+                            elif isinstance(call.args[2], ULengthOP) and node_to_string(call.args[2].operand) == s_str:
+                                is_identity = True
+
+                        if is_identity:
+                            self.findings.append(Finding(
+                                pattern_name='string_identity',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'String identity: {node_to_string(call.node)} -> {s_str}',
+                                details={
+                                    'node': call.node,
+                                    'replacement': s_str
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
 
                 # string.sub(s, i, i)
                 is_single_char = False

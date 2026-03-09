@@ -215,6 +215,8 @@ class ASTTransformer:
             self._edit_redundant_type_conversion(finding)
         elif pattern == 'string_byte_1':
             self._edit_string_byte_1(finding)
+        elif pattern == 'pairs_to_next':
+            self._edit_algebraic_simplification(finding)
         elif pattern in ('string_concat_tostring', 'string_byte_range'):
             self._edit_algebraic_simplification(finding)
         elif pattern == 'return_ternary_simplification':
@@ -251,7 +253,7 @@ class ASTTransformer:
             self._edit_loop_invariant_global(finding)
         elif pattern == 'vector_mad':
             self._edit_vector_mad(finding)
-        elif pattern in ('table_clear_pattern', 'assignment_ternary_simplification', 'redundant_string_format', 'vector_method_single_arg', 'vector_method_copy', 'vector_init_zero', 'vector_redundant_op', 'vector_mul_zero', 'vector_set_chain', 'vector_copy_identity', 'vector_constructor_copy', 'vector_set_vector'):
+        elif pattern in ('table_clear_pattern', 'assignment_ternary_simplification', 'bool_assignment_simplification', 'redundant_string_format', 'vector_method_single_arg', 'vector_method_copy', 'vector_init_zero', 'vector_redundant_op', 'vector_mul_zero', 'vector_set_chain', 'vector_copy_identity', 'vector_constructor_copy', 'vector_set_vector'):
             self._edit_algebraic_simplification(finding)
         elif pattern == 'redundant_nil_assignment':
             self._edit_redundant_nil_assignment(finding)
