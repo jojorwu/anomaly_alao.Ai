@@ -1572,6 +1572,7 @@ class ASTAnalyzer:
         self._analyze_bit_identity()
         self._analyze_string_find_args()
         self._analyze_math_sqrt_pow()
+        self._analyze_math_tan_atan_identity()
         self._analyze_comparison_identities()
         self._analyze_table_concat_single()
         self._analyze_math_clamp()
@@ -1642,28 +1643,72 @@ class ASTAnalyzer:
 
                         if len(set(bases)) == 1 and idxs == ['x', 'y', 'z']:
                             v2_str = bases[0]
-                            self.findings.append(Finding(
-                                pattern_name='vector_method_copy',
-                                severity='GREEN',
-                                line_num=call.line,
-                                message=f'Simplify vector {call.func}: {call.full_name}({v2_str}.x, {v2_str}.y, {v2_str}.z) -> {call.module}:{call.func}({v2_str})',
-                                details={'node': call.node, 'replacement': f'{call.module}:{call.func}({v2_str})'},
-                                source_line=self._get_source_line(call.line),
-                            ))
+                            if v2_str == call.module:
+                                # v:set(v.x, v.y, v.z) is redundant
+                                self.findings.append(Finding(
+                                    pattern_name='vector_copy_identity',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'Redundant vector {call.func}: {call.full_name}({v2_str}.x, {v2_str}.y, {v2_str}.z) is a no-op',
+                                    details={'node': call.node, 'replacement': call.module},
+                                    source_line=self._get_source_line(call.line),
+                                ))
+                            else:
+                                self.findings.append(Finding(
+                                    pattern_name='vector_method_copy',
+                                    severity='GREEN',
+                                    line_num=call.line,
+                                    message=f'Simplify vector {call.func}: {call.full_name}({v2_str}.x, {v2_str}.y, {v2_str}.z) -> {call.module}:{call.func}({v2_str})',
+                                    details={'node': call.node, 'replacement': f'{call.module}:{call.func}({v2_str})'},
+                                    source_line=self._get_source_line(call.line),
+                                ))
                             continue
 
             # vector(0, 0, 0) -> vector()
-            if call.full_name == 'vector' and len(call.args) == 3:
-                vals = [self._get_const_val(a) for a in call.args]
-                if all(v == 0 for v in vals):
-                    self.findings.append(Finding(
-                        pattern_name='vector_init_zero',
-                        severity='GREEN',
-                        line_num=call.line,
-                        message='Simplify vector initialization: vector(0,0,0) -> vector()',
-                        details={'node': call.node, 'replacement': 'vector()'},
-                        source_line=self._get_source_line(call.line),
-                    ))
+            if call.full_name == 'vector':
+                if len(call.args) == 3:
+                    vals = [self._get_const_val(a) for a in call.args]
+                    if all(v == 0 for v in vals):
+                        self.findings.append(Finding(
+                            pattern_name='vector_init_zero',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message='Simplify vector initialization: vector(0,0,0) -> vector()',
+                            details={'node': call.node, 'replacement': 'vector()'},
+                            source_line=self._get_source_line(call.line),
+                        ))
+
+            # vector():set(...) -> vector(...)
+            if call.func == 'set' and ':' in call.full_name:
+                if isinstance(call.node, Invoke) and isinstance(call.node.source, Call):
+                    src_call = call.node.source
+                    _, _, src_fn = self._get_call_name(src_call)
+                    if src_fn == 'vector' and len(src_call.args) == 0:
+                        args_str = ", ".join(node_to_string(a) for a in call.args)
+                        replacement = f"vector({args_str})"
+                        self.findings.append(Finding(
+                            pattern_name='vector_set_chain',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'Simplify vector set chain: vector():set({args_str}) -> {replacement}',
+                            details={'node': call.node, 'replacement': replacement},
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
+
+                # v:set(v) -> redundant
+                if len(call.args) == 1:
+                    arg_str = node_to_string(call.args[0])
+                    if arg_str == call.module and self._is_simple_expr(call.args[0]):
+                        self.findings.append(Finding(
+                            pattern_name='vector_copy_identity',
+                            severity='GREEN',
+                            line_num=call.line,
+                            message=f'Redundant vector copy: {call.full_name}({arg_str}) is a no-op',
+                            details={'node': call.node, 'replacement': call.module},
+                            source_line=self._get_source_line(call.line),
+                        ))
+                        continue
 
     def _analyze_redundant_nil_assignment(self):
         """Find local x = nil and suggest local x."""
@@ -2216,6 +2261,28 @@ class ASTAnalyzer:
                         source_line=self._get_source_line(line),
                     ))
 
+    def _analyze_math_tan_atan_identity(self):
+        """Find math.atan(math.tan(x)) and suggest x."""
+        for call in self.calls:
+            if call.full_name == 'math.atan' and len(call.args) == 1:
+                arg = call.args[0]
+                if isinstance(arg, Call):
+                    _, _, fn = self._get_call_name(arg)
+                    if fn == 'math.tan' and len(arg.args) == 1:
+                        x_str = node_to_string(arg.args[0])
+                        if self._is_simple_expr(arg.args[0]):
+                            self.findings.append(Finding(
+                                pattern_name='math_identity',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'math.atan(math.tan({x_str})) -> {x_str}',
+                                details={
+                                    'node': call.node,
+                                    'replacement': x_str
+                                },
+                                source_line=self._get_source_line(call.line),
+                            ))
+
     def _analyze_math_sqrt_pow(self):
         """Find math.sqrt(x*x) or math.sqrt(x^2) and suggest math.abs(x)."""
         for call in self.calls:
@@ -2260,6 +2327,27 @@ class ASTAnalyzer:
         if not self._ast_tree: return
         for node in ast.walk(self._ast_tree):
             if isinstance(node, (EqToOp, NotEqToOp, GreaterThanOp, GreaterOrEqThanOp, LessThanOp, LessOrEqThanOp)):
+                # Identity check: x == x
+                s1 = node_to_string(node.left)
+                s2 = node_to_string(node.right)
+                if s1 == s2 and self._is_simple_expr(node.left):
+                    replacement = None
+                    if isinstance(node, (EqToOp, LessOrEqThanOp, GreaterOrEqThanOp)):
+                        replacement = "true"
+                    else:
+                        replacement = "false"
+
+                    if replacement:
+                        self.findings.append(Finding(
+                            pattern_name='comparison_identity',
+                            severity='GREEN',
+                            line_num=self._get_line(node),
+                            message=f'Comparison identity: {node_to_string(node)} -> {replacement}',
+                            details={'node': node, 'replacement': replacement},
+                            source_line=self._get_source_line(self._get_line(node)),
+                        ))
+                        continue
+
                 call = None
                 const_val = None
                 replacement = None
@@ -3263,6 +3351,18 @@ class ASTAnalyzer:
                             if val != 0:
                                 replacement = '1'
                                 reason = f"{s1} / {s1}"
+
+                        # math.sin(x) / math.cos(x) -> math.tan(x)
+                        if not replacement and isinstance(node.left, Call) and isinstance(node.right, Call):
+                            _, _, f1 = self._get_call_name(node.left)
+                            _, _, f2 = self._get_call_name(node.right)
+                            if f1 == 'math.sin' and f2 == 'math.cos' and \
+                               len(node.left.args) == 1 and len(node.right.args) == 1:
+                                x1 = node_to_string(node.left.args[0])
+                                x2 = node_to_string(node.right.args[0])
+                                if x1 == x2 and self._is_simple_expr(node.left.args[0]):
+                                    replacement = f"math.tan({x1})"
+                                    reason = f"math.sin({x1}) / math.cos({x1})"
 
                 elif isinstance(node, ExpoOp):
                     if right_val == 1: target = node.left; reason = "x ^ 1"
@@ -4862,12 +4962,14 @@ class ASTAnalyzer:
     def _analyze_string_empty(self):
         """Find #s == 0 or string.len(s) == 0 and suggest s == ''."""
         for node in ast.walk(self._ast_tree):
-            if isinstance(node, (EqToOp, NotEqToOp)):
+            if isinstance(node, (EqToOp, NotEqToOp, GreaterThanOp, GreaterOrEqThanOp, LessThanOp, LessOrEqThanOp)):
                 # If already constant folded, skip
                 if self._get_const_val(node) is not None:
                     continue
+
                 call = None
                 val = None
+                op_type = type(node)
 
                 if isinstance(node.left, (ULengthOP, Call)) and isinstance(node.right, Number):
                     call = node.left
@@ -4875,26 +4977,43 @@ class ASTAnalyzer:
                 elif isinstance(node.right, (ULengthOP, Call)) and isinstance(node.left, Number):
                     call = node.right
                     val = node.left.n
+                    # swap op type
+                    swap = {
+                        GreaterThanOp: LessThanOp,
+                        LessThanOp: GreaterThanOp,
+                        GreaterOrEqThanOp: LessOrEqThanOp,
+                        LessOrEqThanOp: GreaterOrEqThanOp,
+                        EqToOp: EqToOp,
+                        NotEqToOp: NotEqToOp
+                    }
+                    op_type = swap[op_type]
 
-                if val == 0:
+                if call:
                     s_str = None
                     if isinstance(call, ULengthOP):
                         s_str = node_to_string(call.operand)
+                        target_node = call.operand
                     elif isinstance(call, Call):
                         _, _, fn = self._get_call_name(call)
                         if fn == 'string.len' and len(call.args) == 1:
                             s_str = node_to_string(call.args[0])
+                            target_node = call.args[0]
 
                     if s_str:
-                        # For strings, we can be more lenient because s == "" is safe even for tables
-                        # (it just returns false), whereas next(s) crashes for strings.
-                        # So we trigger string_empty_check unless we know it's NOT a string.
-                        inf = self._infer_type(call.operand if isinstance(call, ULengthOP) else call.args[0], self.node_scopes.get(id(node)))
+                        inf = self._infer_type(target_node, self.node_scopes.get(id(node)))
                         if inf is not None and inf != 'string':
                             continue
 
-                        op = '==' if isinstance(node, EqToOp) else '~='
-                        replacement = f"{s_str} {op} ''"
+                        op = None
+                        if val == 0:
+                            if op_type in (EqToOp, LessOrEqThanOp): op = "=="
+                            elif op_type in (NotEqToOp, GreaterThanOp): op = "~="
+                        elif val == 1:
+                            if op_type == LessThanOp: op = "=="
+                            elif op_type == GreaterOrEqThanOp: op = "~="
+
+                        if op:
+                            replacement = f"{s_str} {op} ''"
                         self.findings.append(Finding(
                             pattern_name='string_empty_check',
                             severity='GREEN',
