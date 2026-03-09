@@ -251,7 +251,7 @@ class ASTTransformer:
             self._edit_loop_invariant_global(finding)
         elif pattern == 'vector_mad':
             self._edit_vector_mad(finding)
-        elif pattern in ('table_clear_pattern', 'assignment_ternary_simplification', 'redundant_string_format', 'vector_method_single_arg', 'vector_method_copy', 'vector_init_zero', 'vector_redundant_op', 'vector_mul_zero', 'vector_set_chain', 'vector_copy_identity'):
+        elif pattern in ('table_clear_pattern', 'assignment_ternary_simplification', 'redundant_string_format', 'vector_method_single_arg', 'vector_method_copy', 'vector_init_zero', 'vector_redundant_op', 'vector_mul_zero', 'vector_set_chain', 'vector_copy_identity', 'vector_constructor_copy', 'vector_set_vector'):
             self._edit_algebraic_simplification(finding)
         elif pattern == 'redundant_nil_assignment':
             self._edit_redundant_nil_assignment(finding)

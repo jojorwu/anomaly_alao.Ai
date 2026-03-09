@@ -82,5 +82,15 @@ class TestV16Optimizations(unittest.TestCase):
         new_code = self.transform(code)
         self.assertIn("if false then", new_code)
 
+    def test_vector_constructor_copy(self):
+        code = "local v = vector(v2.x, v2.y, v2.z)"
+        new_code = self.transform(code)
+        self.assertIn("vector(v2)", new_code)
+
+    def test_vector_set_vector(self):
+        code = "v1:set(vector(1, 2, 3))"
+        new_code = self.transform(code)
+        self.assertIn("v1:set(1, 2, 3)", new_code)
+
 if __name__ == '__main__':
     unittest.main()

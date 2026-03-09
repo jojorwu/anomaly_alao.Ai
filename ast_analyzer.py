@@ -1678,6 +1678,21 @@ class ASTAnalyzer:
                             source_line=self._get_source_line(call.line),
                         ))
 
+                    # vector(v.x, v.y, v.z) -> vector(v)
+                    if all(isinstance(a, Index) for a in call.args):
+                        bases = [node_to_string(a.value) for a in call.args]
+                        idxs = [node_to_string(a.idx) for a in call.args]
+                        if len(set(bases)) == 1 and idxs == ['x', 'y', 'z']:
+                            v_str = bases[0]
+                            self.findings.append(Finding(
+                                pattern_name='vector_constructor_copy',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Simplify vector constructor: vector({v_str}.x, {v_str}.y, {v_str}.z) -> vector({v_str})',
+                                details={'node': call.node, 'replacement': f'vector({v_str})'},
+                                source_line=self._get_source_line(call.line),
+                            ))
+
             # vector():set(...) -> vector(...)
             if call.func == 'set' and ':' in call.full_name:
                 if isinstance(call.node, Invoke) and isinstance(call.node.source, Call):
@@ -1695,6 +1710,25 @@ class ASTAnalyzer:
                             source_line=self._get_source_line(call.line),
                         ))
                         continue
+
+                # v:set(vector(x, y, z)) -> v:set(x, y, z)
+                if len(call.args) == 1:
+                    arg = call.args[0]
+                    if isinstance(arg, Call):
+                        _, _, fn = self._get_call_name(arg)
+                        if fn == 'vector':
+                            v_args = ", ".join(node_to_string(a) for a in arg.args)
+                            if not v_args: v_args = "0" # vector() -> 0
+                            replacement = f"{call.module}:set({v_args})"
+                            self.findings.append(Finding(
+                                pattern_name='vector_set_vector',
+                                severity='GREEN',
+                                line_num=call.line,
+                                message=f'Simplify vector set: {call.full_name}(vector({v_args})) -> {replacement}',
+                                details={'node': call.node, 'replacement': replacement},
+                                source_line=self._get_source_line(call.line),
+                            ))
+                            continue
 
                 # v:set(v) -> redundant
                 if len(call.args) == 1:
